@@ -1,0 +1,14 @@
+.{
+    .name = .atproto,
+    .version = "0.1.0",
+    .fingerprint = 0xcd2f1306d6f05843,
+    .minimum_zig_version = "0.15.0",
+    .dependencies = .{
+        .zat = .{ .path = "../zat" },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
