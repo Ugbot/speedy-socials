@@ -1,5 +1,6 @@
 const std = @import("std");
 const http = std.http;
+const compat = @import("../compat.zig");
 const database = @import("../database.zig");
 
 // Admin API endpoints for moderation and instance management
@@ -46,8 +47,8 @@ pub const AdminAPI = struct {
         var json_buf = std.array_list.Managed(u8).init(self.allocator);
         defer json_buf.deinit();
 
-        try std.json.stringify(accounts, .{}, json_buf.writer());
-        try response.writer().writeAll(json_buf.items);
+        try compat.jsonStringify(accounts, .{}, json_buf.writer());
+        try response.writer.writeAll(json_buf.items);
     }
 
     // Get admin instance statistics
@@ -64,37 +65,37 @@ pub const AdminAPI = struct {
         var json_buf = std.array_list.Managed(u8).init(self.allocator);
         defer json_buf.deinit();
 
-        try std.json.stringify(stats, .{}, json_buf.writer());
-        try response.writer().writeAll(json_buf.items);
+        try compat.jsonStringify(stats, .{}, json_buf.writer());
+        try response.writer.writeAll(json_buf.items);
     }
 
     // Suspend an account
     pub fn handleSuspendAccount(_: *AdminAPI, _: *database.Database, response: anytype, method: http.Method, _: i64) !void {
         if (method != .POST) {
-            response.status = .method_not_allowed;
-            try response.writer().writeAll("{\"error\": \"Method not allowed\"}");
+            // Note: status cannot be changed after respondStreaming in Zig 0.15
+            try response.writer.writeAll("{\"error\": \"Method not allowed\"}");
             return;
         }
 
         // TODO: Implement account suspension
         // This would involve setting a suspended flag and preventing login/actions
 
-        response.status = .ok;
-        try response.writer().writeAll("{}");
+        // status already committed via respondStreaming
+        try response.writer.writeAll("{}");
     }
 
     // Unsuspend an account
     pub fn handleUnsuspendAccount(_: *AdminAPI, _: *database.Database, response: anytype, method: http.Method, _: i64) !void {
         if (method != .POST) {
-            response.status = .method_not_allowed;
-            try response.writer().writeAll("{\"error\": \"Method not allowed\"}");
+            // Note: status cannot be changed after respondStreaming in Zig 0.15
+            try response.writer.writeAll("{\"error\": \"Method not allowed\"}");
             return;
         }
 
         // TODO: Implement account unsuspension
 
-        response.status = .ok;
-        try response.writer().writeAll("{}");
+        // status already committed via respondStreaming
+        try response.writer.writeAll("{}");
     }
 
     // Get reports
@@ -164,28 +165,28 @@ pub const AdminAPI = struct {
         var json_buf = std.array_list.Managed(u8).init(self.allocator);
         defer json_buf.deinit();
 
-        try std.json.stringify(admin_reports.items, .{}, json_buf.writer());
-        try response.writer().writeAll(json_buf.items);
+        try compat.jsonStringify(admin_reports.items, .{}, json_buf.writer());
+        try response.writer.writeAll(json_buf.items);
     }
 
     // Resolve a report
     pub fn handleResolveReport(_: *AdminAPI, db: *database.Database, response: anytype, method: http.Method, report_id: i64) !void {
         if (method != .POST) {
-            response.status = .method_not_allowed;
-            try response.writer().writeAll("{\"error\": \"Method not allowed\"}");
+            // Note: status cannot be changed after respondStreaming in Zig 0.15
+            try response.writer.writeAll("{\"error\": \"Method not allowed\"}");
             return;
         }
 
         try database.resolveReport(db, report_id);
-        response.status = .ok;
-        try response.writer().writeAll("{}");
+        // status already committed via respondStreaming
+        try response.writer.writeAll("{}");
     }
 
     // Handle user blocking
     pub fn handleBlockAccount(_: *AdminAPI, db: *database.Database, response: anytype, method: http.Method, target_account_id: i64) !void {
         if (method != .POST) {
-            response.status = .method_not_allowed;
-            try response.writer().writeAll("{\"error\": \"Method not allowed\"}");
+            // Note: status cannot be changed after respondStreaming in Zig 0.15
+            try response.writer.writeAll("{\"error\": \"Method not allowed\"}");
             return;
         }
 
@@ -193,15 +194,15 @@ pub const AdminAPI = struct {
         const blocker_id: i64 = 1;
 
         try database.blockUser(db, blocker_id, target_account_id);
-        response.status = .ok;
-        try response.writer().writeAll("{}");
+        // status already committed via respondStreaming
+        try response.writer.writeAll("{}");
     }
 
     // Handle user unblocking
     pub fn handleUnblockAccount(_: *AdminAPI, db: *database.Database, response: anytype, method: http.Method, target_account_id: i64) !void {
         if (method != .POST) {
-            response.status = .method_not_allowed;
-            try response.writer().writeAll("{\"error\": \"Method not allowed\"}");
+            // Note: status cannot be changed after respondStreaming in Zig 0.15
+            try response.writer.writeAll("{\"error\": \"Method not allowed\"}");
             return;
         }
 
@@ -209,15 +210,15 @@ pub const AdminAPI = struct {
         const blocker_id: i64 = 1;
 
         try database.unblockUser(db, blocker_id, target_account_id);
-        response.status = .ok;
-        try response.writer().writeAll("{}");
+        // status already committed via respondStreaming
+        try response.writer.writeAll("{}");
     }
 
     // Handle user muting
     pub fn handleMuteAccount(_: *AdminAPI, db: *database.Database, response: anytype, method: http.Method, target_account_id: i64) !void {
         if (method != .POST) {
-            response.status = .method_not_allowed;
-            try response.writer().writeAll("{\"error\": \"Method not allowed\"}");
+            // Note: status cannot be changed after respondStreaming in Zig 0.15
+            try response.writer.writeAll("{\"error\": \"Method not allowed\"}");
             return;
         }
 
@@ -225,15 +226,15 @@ pub const AdminAPI = struct {
         const muter_id: i64 = 1;
 
         try database.muteUser(db, muter_id, target_account_id);
-        response.status = .ok;
-        try response.writer().writeAll("{}");
+        // status already committed via respondStreaming
+        try response.writer.writeAll("{}");
     }
 
     // Handle user unmuting
     pub fn handleUnmuteAccount(_: *AdminAPI, db: *database.Database, response: anytype, method: http.Method, target_account_id: i64) !void {
         if (method != .POST) {
-            response.status = .method_not_allowed;
-            try response.writer().writeAll("{\"error\": \"Method not allowed\"}");
+            // Note: status cannot be changed after respondStreaming in Zig 0.15
+            try response.writer.writeAll("{\"error\": \"Method not allowed\"}");
             return;
         }
 
@@ -241,8 +242,8 @@ pub const AdminAPI = struct {
         const muter_id: i64 = 1;
 
         try database.unmuteUser(db, muter_id, target_account_id);
-        response.status = .ok;
-        try response.writer().writeAll("{}");
+        // status already committed via respondStreaming
+        try response.writer.writeAll("{}");
     }
 
     // Handle creating a report
@@ -288,7 +289,7 @@ pub const AdminAPI = struct {
 
         if (account_id == null and status_ids == null) {
             response.status = .bad_request;
-            try response.writer().writeAll("{\"error\": \"Either account_id or status_ids must be provided\"}");
+            try response.writer.writeAll("{\"error\": \"Either account_id or status_ids must be provided\"}");
             return;
         }
 
@@ -308,9 +309,9 @@ pub const AdminAPI = struct {
         var json_buf = std.array_list.Managed(u8).init(self.allocator);
         defer json_buf.deinit();
 
-        try std.json.stringify(report_response, .{}, json_buf.writer());
-        response.status = .ok;
-        try response.writer().writeAll(json_buf.items);
+        try compat.jsonStringify(report_response, .{}, json_buf.writer());
+        // status already committed via respondStreaming
+        try response.writer.writeAll(json_buf.items);
     }
 
     // Handle trending tags
@@ -349,14 +350,14 @@ pub const AdminAPI = struct {
         var json_buf = std.array_list.Managed(u8).init(self.allocator);
         defer json_buf.deinit();
 
-        try std.json.stringify(mastodon_tags, .{}, json_buf.writer());
-        try response.writer().writeAll(json_buf.items);
+        try compat.jsonStringify(mastodon_tags, .{}, json_buf.writer());
+        try response.writer.writeAll(json_buf.items);
     }
 };
 
 // Helper function to extract query parameters
 fn extractQueryParam(query: []const u8, param_name: []const u8) ?[]const u8 {
-    var param_iter = std.mem.split(u8, query[1..], "&"); // Skip the '?'
+    var param_iter = std.mem.splitSequence(u8, query[1..], "&"); // Skip the '?'
     while (param_iter.next()) |param| {
         if (std.mem.indexOf(u8, param, "=")) |equals_pos| {
             const key = param[0..equals_pos];

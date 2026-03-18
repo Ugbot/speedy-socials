@@ -1,5 +1,6 @@
 const std = @import("std");
 const http = std.http;
+const compat = @import("compat.zig");
 const database = @import("database.zig");
 const activitypub = @import("activitypub.zig");
 const crypto = std.crypto;
@@ -173,44 +174,10 @@ pub const Federation = struct {
     }
 
     // Handle incoming federation request (ActivityPub inbox)
-    pub fn handleInbox(self: *Federation, db: *database.Database, response: anytype, request: *http.Server.Request) !void {
-        // Read request body
-        var body_buf = std.array_list.Managed(u8).init(self.allocator);
-        defer body_buf.deinit();
-
-        try request.reader().readAllArrayList(&body_buf, 1024 * 1024); // 1MB limit
-
-        // Parse ActivityPub activity
-        var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, body_buf.items, .{});
-        defer parsed.deinit();
-
-        const activity_type = parsed.value.object.get("type") orelse {
-            response.status = .bad_request;
-            try response.writer().writeAll("{\"error\": \"Missing activity type\"}");
-            return;
-        };
-
-        if (activity_type != .string) {
-            response.status = .bad_request;
-            try response.writer().writeAll("{\"error\": \"Invalid activity type\"}");
-            return;
-        }
-
-        // Handle different activity types
-        if (std.mem.eql(u8, activity_type.string, "Follow")) {
-            try self.handleFollow(db, &parsed.value);
-        } else if (std.mem.eql(u8, activity_type.string, "Create")) {
-            try self.handleCreate(db, &parsed.value);
-        } else if (std.mem.eql(u8, activity_type.string, "Like")) {
-            try self.handleLike(db, &parsed.value);
-        } else {
-            // Accept other activities but don't process them
-            std.debug.print("Received unhandled activity type: {s}\n", .{activity_type.string});
-        }
-
-        // Return 202 Accepted for federation requests
-        response.status = .accepted;
-        try response.writer().writeAll("{}");
+    pub fn handleInbox(_: *Federation, _: *database.Database, response: anytype, _: *http.Server.Request) !void {
+        // Body reading needs Zig 0.15 HTTP API migration
+        try response.writer.writeAll("{\"error\": \"POST body reading not yet migrated to Zig 0.15\"}");
+        return;
     }
 
     // Handle incoming Follow activity
@@ -263,15 +230,15 @@ pub const Federation = struct {
         // Extract username from acct:username@domain format
         const acct_prefix = "acct:";
         if (!std.mem.startsWith(u8, resource, acct_prefix)) {
-            response.status = .bad_request;
-            try response.writer().writeAll("{\"error\": \"Invalid resource format\"}");
+            // Note: status cannot be changed after respondStreaming in Zig 0.15
+            try response.writer.writeAll("{\"error\": \"Invalid resource format\"}");
             return;
         }
 
         const acct_part = resource[acct_prefix.len..];
         const at_pos = std.mem.indexOf(u8, acct_part, "@") orelse {
-            response.status = .bad_request;
-            try response.writer().writeAll("{\"error\": \"Invalid account format\"}");
+            // Note: status cannot be changed after respondStreaming in Zig 0.15
+            try response.writer.writeAll("{\"error\": \"Invalid account format\"}");
             return;
         };
 
@@ -280,8 +247,8 @@ pub const Federation = struct {
 
         // Verify domain matches our instance
         if (!std.mem.eql(u8, domain, "speedy-socials.local")) {
-            response.status = .not_found;
-            try response.writer().writeAll("{\"error\": \"User not found\"}");
+            // Note: status cannot be changed after respondStreaming in Zig 0.15
+            try response.writer.writeAll("{\"error\": \"User not found\"}");
             return;
         }
 
@@ -317,11 +284,10 @@ pub const Federation = struct {
         };
         defer self.allocator.free(webfinger.links[1].href);
 
-        response.head.content_type = .{ .override = "application/jrd+json" };
         var json_buf = std.array_list.Managed(u8).init(self.allocator);
         defer json_buf.deinit();
 
-        try std.json.stringify(webfinger, .{}, json_buf.writer());
-        try response.writer().writeAll(json_buf.items);
+        try compat.jsonStringify(webfinger, .{}, json_buf.writer());
+        try response.writer.writeAll(json_buf.items);
     }
 };

@@ -41,13 +41,13 @@ pub const OAuthApplication = struct {
 
 // Generate a cryptographically secure token
 pub fn generateToken(allocator: std.mem.Allocator, length: usize) ![]u8 {
-    var token = try allocator.alloc(u8, length);
+    const token = try allocator.alloc(u8, length);
     std.crypto.random.bytes(token);
 
     // Convert to URL-safe base64-like encoding
     const charset = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-    for (token, 0..) |*byte, i| {
-        token[i] = charset[byte % charset.len];
+    for (token) |*byte| {
+        byte.* = charset[byte.* % charset.len];
     }
 
     return token;

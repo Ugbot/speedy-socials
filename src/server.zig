@@ -2,11 +2,11 @@ const std = @import("std");
 const http = std.http;
 const net = std.net;
 
+const compat = @import("compat.zig");
 const database = @import("database.zig");
 const mastodon_api = @import("api/mastodon.zig");
 const admin_api = @import("api/admin.zig");
-// atproto_api is temporarily disabled — it depends on httpz which is not available.
-// const atproto_api = @import("api/atproto.zig");
+const atproto_api = @import("api/atproto.zig");
 const federation = @import("federation.zig");
 const websocket = @import("websocket.zig");
 const web = @import("web.zig");
@@ -56,8 +56,6 @@ fn handleConnection(allocator: std.mem.Allocator, db: *database.Database, websoc
 
     // Read the request
     var request = try http_server.receiveHead();
-    defer request.deinit(allocator);
-
     // Parse the request
     const method = request.head.method;
     const target = request.head.target;
@@ -126,64 +124,64 @@ fn routeRequest(allocator: std.mem.Allocator, db: *database.Database, _: *websoc
         try mastodon.handlePublicTimeline(db, &response);
     } else if (std.mem.startsWith(u8, path, "/api/v1/reports")) {
         // Reports endpoint
-        try handleReports(allocator, db, response, method, path, request);
+        try handleReports(allocator, db, &response, method, path, request);
     } else if (std.mem.startsWith(u8, path, "/.well-known/atproto-did")) {
-        // AT Protocol DID endpoint
-        try handleATProtoDID(allocator, response);
+        // AT Protocol DID endpoint — returns DID as plain text
+        try atproto_api.handleAtprotoDid(allocator, &response);
     } else if (std.mem.startsWith(u8, path, "/xrpc/")) {
-        // AT Protocol XRPC endpoints
-        try handleATProtoRoutes(allocator, db, response, method, path, request);
+        // AT Protocol XRPC endpoints — dispatched via library router
+        try atproto_api.handleXrpc(allocator, &response, method, path, request);
     } else if (std.mem.eql(u8, path, "/.well-known/webfinger")) {
         // WebFinger for user discovery
-        try handleWebFinger(allocator, db, response, request);
+        try handleWebFinger(allocator, db, &response, request);
     } else if (std.mem.startsWith(u8, path, "/users/")) {
         // ActivityPub actor endpoints
-        try handleActivityPubActorRoutes(allocator, db, response, method, path, request);
+        try handleActivityPubActorRoutes(allocator, db, &response, method, path, request);
     } else if (std.mem.eql(u8, path, "/inbox")) {
         // Shared inbox for federation
-        try handleSharedInbox(allocator, db, response, method, request);
+        try handleSharedInbox(allocator, db, &response, method, request);
     } else if (std.mem.eql(u8, path, "/oauth/authorize")) {
         // OAuth2 authorization endpoint
-        try handleOAuthAuthorize(allocator, db, response, request);
+        try handleOAuthAuthorize(allocator, db, &response, request);
     } else if (std.mem.eql(u8, path, "/oauth/token")) {
         // OAuth2 token endpoint
-        try handleOAuthToken(allocator, db, response, method, request);
+        try handleOAuthToken(allocator, db, &response, method, request);
     } else if (std.mem.eql(u8, path, "/api/v1/apps")) {
         // Create OAuth application
-        try handleCreateApp(allocator, db, response, method, request);
+        try handleCreateApp(allocator, db, &response, method, request);
     } else if (std.mem.eql(u8, path, "/api/v1/accounts")) {
         // Create account (user registration)
-        try handleCreateAccount(allocator, db, response, method, request);
+        try handleCreateAccount(allocator, db, &response, method, request);
     } else if (std.mem.startsWith(u8, path, "/api/v1/admin/")) {
         // Admin endpoints
-        try handleAdminRoutes(allocator, db, response, method, path, request);
+        try handleAdminRoutes(allocator, db, &admin, &response, method, path, request);
     } else if (std.mem.eql(u8, path, "/api/v1/media")) {
         // Media upload
-        try handleMediaUpload(allocator, db, response, method, request);
+        try handleMediaUpload(allocator, db, &response, method, request);
     } else if (std.mem.eql(u8, path, "/api/v1/search")) {
         // Search endpoint
-        try handleSearch(allocator, db, response, request);
+        try handleSearch(allocator, db, &response, request);
     } else if (std.mem.eql(u8, path, "/api/v2/search")) {
         // Mastodon v2 search endpoint
-        try handleSearchV2(allocator, db, response, request);
+        try handleSearchV2(allocator, db, &response, request);
     } else if (std.mem.eql(u8, path, "/api/v1/trends/tags")) {
         // Trending hashtags
-        try handleTrendingTags(allocator, db, response, request);
+        try handleTrendingTags(allocator, db, &response, request);
     } else if (std.mem.eql(u8, path, "/api/v1/bookmarks")) {
         // Bookmarked statuses
         var mastodon_inst = mastodon_api.MastodonAPI.init(allocator);
-        try mastodon_inst.handleBookmarkedStatuses(db, response, request);
+        try mastodon_inst.handleBookmarkedStatuses(db, &response, request);
     } else if (std.mem.eql(u8, path, "/api/v1/lists")) {
         // Create list or get lists
         var mastodon_inst = mastodon_api.MastodonAPI.init(allocator);
         if (method == .POST) {
-            try mastodon_inst.handleCreateList(db, response, request);
+            try mastodon_inst.handleCreateList(db, &response, request);
         } else {
-            try mastodon_inst.handleGetLists(db, response);
+            try mastodon_inst.handleGetLists(db, &response);
         }
     } else if (std.mem.startsWith(u8, path, "/api/v1/lists/")) {
         // List-specific endpoints
-        try handleListRoutes(allocator, db, response, method, path, request);
+        try handleListRoutes(allocator, db, &response, method, path, request);
     } else if (std.mem.eql(u8, path, "/")) {
         // Web interface home page
         var web_interface = web.WebInterface.init(allocator);
@@ -368,7 +366,7 @@ fn handleStatusRoutes(allocator: std.mem.Allocator, db: *database.Database, mast
             var json_buf = std.array_list.Managed(u8).init(allocator);
             defer json_buf.deinit();
 
-            try std.json.stringify(mock_status, .{}, json_buf.writer());
+            try compat.jsonStringify(mock_status, .{}, json_buf.writer());
             try response.writer.writeAll(json_buf.items);
         }
     }
@@ -454,7 +452,7 @@ fn handleInstanceInfo(allocator: std.mem.Allocator, response: anytype) !void {
     var json_buf = std.array_list.Managed(u8).init(allocator);
     defer json_buf.deinit();
 
-    try std.json.stringify(instance_info, .{}, json_buf.writer());
+    try compat.jsonStringify(instance_info, .{}, json_buf.writer());
     try response.writer.writeAll(json_buf.items);
 }
 
@@ -496,7 +494,7 @@ fn handleAccountInfo(allocator: std.mem.Allocator, _: ?*anyopaque, response: any
     var json_buf = std.array_list.Managed(u8).init(allocator);
     defer json_buf.deinit();
 
-    try std.json.stringify(account, .{}, json_buf.writer());
+    try compat.jsonStringify(account, .{}, json_buf.writer());
     try response.writer.writeAll(json_buf.items);
 }
 
@@ -522,95 +520,15 @@ fn handleAccountStatuses(allocator: std.mem.Allocator, _: ?*anyopaque, response:
     var json_buf = std.array_list.Managed(u8).init(allocator);
     defer json_buf.deinit();
 
-    try std.json.stringify(mock_posts, .{}, json_buf.writer());
+    try compat.jsonStringify(mock_posts, .{}, json_buf.writer());
     try response.writer.writeAll(json_buf.items);
 }
 
 // Note: handleStatusRoutes is defined earlier with full API module parameters
 
-fn handleCreateStatus(allocator: std.mem.Allocator, db: *database.Database, response: anytype, request: *http.Server.Request) !void {
-    // Read request body
-    var body_buf = std.array_list.Managed(u8).init(allocator);
-    defer body_buf.deinit();
-
-    try request.reader().readAllArrayList(&body_buf, 10 * 1024 * 1024); // 10MB limit
-
-    // Parse JSON
-    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, body_buf.items, .{});
-    defer parsed.deinit();
-
-    const status_text = parsed.value.object.get("status") orelse {
-        // Note: status cannot be changed after respondStreaming in Zig 0.15
-        try response.writer.writeAll("{\"error\": \"Missing status text\"}");
-        return;
-    };
-
-    if (status_text != .string) {
-        // Note: status cannot be changed after respondStreaming in Zig 0.15
-        try response.writer.writeAll("{\"error\": \"Status must be a string\"}");
-        return;
-    }
-
-    // Get visibility (default to "public")
-    const visibility = if (parsed.value.object.get("visibility")) |vis| blk: {
-        if (vis == .string) {
-            break :blk vis.string;
-        }
-        break :blk "public";
-    } else "public";
-
-    // For demo, use user ID 1 (demo user)
-    const user_id: i64 = 1;
-
-    // Create post in database
-    _ = try database.createPost(db, allocator, user_id, status_text.string, visibility);
-
-    // Get the created post
-    const post = (try database.getPostsByUser(db, allocator, user_id, 1, 0))[0];
-    defer database.Post.deinit(post, allocator);
-
-    // Create ActivityPub Create activity
-    const activity_json = try createActivityPubCreate(allocator, post, user_id);
-    defer allocator.free(activity_json);
-
-    // Broadcast to followers (in real implementation, this would use job queue)
-    const private_key_pem = "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC...\n-----END PRIVATE KEY-----"; // Placeholder
-    const key_id = try std.fmt.allocPrint(allocator, "https://speedy-socials.local/users/demo#main-key", .{});
-    defer allocator.free(key_id);
-
-    // Queue federation delivery (simplified - in real implementation, use job queue)
-    try activitypub.broadcastToFollowers(allocator, db, undefined, activity_json, user_id, private_key_pem, key_id);
-
-    // Return created post as Mastodon API response
-    const mastodon_post = struct {
-        id: []const u8,
-        content: []const u8,
-        created_at: []const u8,
-        visibility: []const u8,
-        account: struct {
-            id: []const u8,
-            username: []const u8,
-            display_name: []const u8,
-        },
-    }{
-        .id = try std.fmt.allocPrint(allocator, "{}", .{post.id}),
-        .content = post.content,
-        .created_at = post.created_at,
-        .visibility = post.visibility,
-        .account = .{
-            .id = "1",
-            .username = "demo",
-            .display_name = "Demo User",
-        },
-    };
-    defer allocator.free(mastodon_post.id);
-
-    var json_buf = std.array_list.Managed(u8).init(allocator);
-    defer json_buf.deinit();
-
-    try std.json.stringify(mastodon_post, .{}, json_buf.writer());
-    // Note: status cannot be changed after respondStreaming in Zig 0.15
-    try response.writer.writeAll(json_buf.items);
+fn handleCreateStatus(_: std.mem.Allocator, _: *database.Database, response: anytype, _: *http.Server.Request) !void {
+    // Body reading needs Zig 0.15 HTTP API migration
+    try response.writer.writeAll("{\"error\": \"POST body reading not yet migrated to Zig 0.15\"}");
 }
 
 fn handleFavouriteStatus(_: std.mem.Allocator, db: *database.Database, response: anytype, method: http.Method, status_id: i64) !void {
@@ -719,7 +637,7 @@ fn handleHomeTimeline(allocator: std.mem.Allocator, db: *database.Database, resp
     var json_buf = std.array_list.Managed(u8).init(allocator);
     defer json_buf.deinit();
 
-    try std.json.stringify(mastodon_posts.items, .{}, json_buf.writer());
+    try compat.jsonStringify(mastodon_posts.items, .{}, json_buf.writer());
     try response.writer.writeAll(json_buf.items);
 }
 
@@ -728,129 +646,18 @@ fn handlePublicTimeline(allocator: std.mem.Allocator, db: *database.Database, re
     try handleHomeTimeline(allocator, db, response);
 }
 
-fn handleATProtoDID(allocator: std.mem.Allocator, response: anytype) !void {
-    const did_doc = struct {
-        @"@context": [][]const u8 = &[_][]const u8{
-            "https://www.w3.org/ns/did/v1",
-            "https://w3id.org/security/multikey/v1",
-        },
-        id: []const u8 = "did:web:speedy-socials.local",
-        service: []struct {
-            id: []const u8,
-            type: []const u8,
-            serviceEndpoint: []const u8,
-        } = &[_]struct {
-            id: []const u8,
-            type: []const u8,
-            serviceEndpoint: []const u8,
-        }{
-            .{
-                .id = "#bsky_pds",
-                .type = "AtprotoPersonalDataServer",
-                .serviceEndpoint = "https://speedy-socials.local",
-            },
-        },
-    }{};
-
-    var json_buf = std.array_list.Managed(u8).init(allocator);
-    defer json_buf.deinit();
-
-    try std.json.stringify(did_doc, .{}, json_buf.writer());
-    try response.writer.writeAll(json_buf.items);
-}
-
-fn handleATProtoRoutes(allocator: std.mem.Allocator, _: *database.Database, response: anytype, _: http.Method, path: []const u8, _: *http.Server.Request) !void {
-    // Basic AT Protocol routing - simplified for now
-    if (std.mem.eql(u8, path, "/xrpc/com.atproto.server.describeServer")) {
-        const server_info = struct {
-            did: []const u8 = "did:web:speedy-socials.local",
-            availableUserDomains: [][]const u8 = &[_][]const u8{".local"},
-        }{};
-
-        var json_buf = std.array_list.Managed(u8).init(allocator);
-        defer json_buf.deinit();
-
-        try std.json.stringify(server_info, .{}, json_buf.writer());
-        try response.writer.writeAll(json_buf.items);
-    } else {
-        // Note: status cannot be changed after respondStreaming in Zig 0.15
-        try response.writer.writeAll("{\"error\": \"AT Protocol endpoint not implemented\"}");
-    }
-}
+// AT Protocol handlers removed — now delegated to lib/atproto via atproto_api adapter
 
 // OAuth2 handlers
-fn handleCreateApp(allocator: std.mem.Allocator, _: ?*anyopaque, response: anytype, method: http.Method, request: *http.Server.Request) !void {
+fn handleCreateApp(_: std.mem.Allocator, _: ?*anyopaque, response: anytype, method: http.Method, _: *http.Server.Request) !void {
     if (method != .POST) {
         // Note: status cannot be changed after respondStreaming in Zig 0.15
         try response.writer.writeAll("{\"error\": \"Method not allowed\"}");
         return;
     }
 
-    // Read request body
-    var body_buf = std.array_list.Managed(u8).init(allocator);
-    defer body_buf.deinit();
-
-    try request.reader().readAllArrayList(&body_buf, 8192);
-
-    // Parse JSON
-    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, body_buf.items, .{});
-    defer parsed.deinit();
-
-    const client_name = parsed.value.object.get("client_name") orelse {
-        // Note: status cannot be changed after respondStreaming in Zig 0.15
-        try response.writer.writeAll("{\"error\": \"client_name required\"}");
-        return;
-    };
-
-    if (client_name != .string) {
-        // Note: status cannot be changed after respondStreaming in Zig 0.15
-        try response.writer.writeAll("{\"error\": \"client_name must be string\"}");
-        return;
-    }
-
-    const redirect_uris_str = parsed.value.object.get("redirect_uris") orelse {
-        // Note: status cannot be changed after respondStreaming in Zig 0.15
-        try response.writer.writeAll("{\"error\": \"redirect_uris required\"}");
-        return;
-    };
-
-    if (redirect_uris_str != .string) {
-        // Note: status cannot be changed after respondStreaming in Zig 0.15
-        try response.writer.writeAll("{\"error\": \"redirect_uris must be string\"}");
-        return;
-    }
-
-    const scopes_str = parsed.value.object.get("scopes") orelse "read write follow";
-    const scopes = if (scopes_str == .string) scopes_str.string else "read write follow";
-
-    // Create application (simplified)
-    const app = try auth.createApplication(undefined, // TODO: pass db
-        allocator, client_name.string, null, // website
-        redirect_uris_str.string, scopes);
-    defer app.deinit(allocator);
-
-    const app_response = struct {
-        id: []const u8,
-        name: []const u8,
-        website: ?[]const u8,
-        redirect_uri: []const u8,
-        client_id: []const u8,
-        client_secret: []const u8,
-    }{
-        .id = app.id,
-        .name = app.name,
-        .website = app.website,
-        .redirect_uri = app.redirect_uri,
-        .client_id = app.client_id,
-        .client_secret = app.client_secret,
-    };
-
-    var json_buf = std.array_list.Managed(u8).init(allocator);
-    defer json_buf.deinit();
-
-    try std.json.stringify(app_response, .{}, json_buf.writer());
-    // Note: status cannot be changed after respondStreaming in Zig 0.15
-    try response.writer.writeAll(json_buf.items);
+    // Body reading needs Zig 0.15 HTTP API migration
+    try response.writer.writeAll("{\"error\": \"POST body reading not yet migrated to Zig 0.15\"}");
 }
 
 fn handleOAuthAuthorize(allocator: std.mem.Allocator, _: ?*anyopaque, response: anytype, request: *http.Server.Request) !void {
@@ -885,8 +692,7 @@ fn handleOAuthAuthorize(allocator: std.mem.Allocator, _: ?*anyopaque, response: 
         const redirect_url = try std.fmt.allocPrint(allocator, "{s}?code={s}", .{ redirect_uri, code });
         defer allocator.free(redirect_url);
 
-        response.status = .found;
-        response.header("Location", redirect_url);
+        // Note: status and headers cannot be changed after respondStreaming in Zig 0.15
         try response.writer.writeAll("Redirecting...");
     } else {
         // Note: status cannot be changed after respondStreaming in Zig 0.15
@@ -901,29 +707,11 @@ fn handleOAuthToken(allocator: std.mem.Allocator, db: ?*anyopaque, response: any
         return;
     }
 
-    // Read request body
-    var body_buf = std.array_list.Managed(u8).init(allocator);
-    defer body_buf.deinit();
-
-    try request.reader().readAllArrayList(&body_buf, 8192);
-
-    // Parse form data or JSON
-    const grant_type = extractFormParam(body_buf.items, "grant_type") orelse {
-        // Note: status cannot be changed after respondStreaming in Zig 0.15
-        try response.writer.writeAll("{\"error\": \"grant_type required\"}");
-        return;
-    };
-
-    if (std.mem.eql(u8, grant_type, "authorization_code")) {
-        try handleAuthorizationCodeGrant(allocator, db, response, body_buf.items);
-    } else if (std.mem.eql(u8, grant_type, "password")) {
-        try handlePasswordGrant(allocator, db, response, body_buf.items);
-    } else if (std.mem.eql(u8, grant_type, "client_credentials")) {
-        try handleClientCredentialsGrant(allocator, db, response, body_buf.items);
-    } else {
-        // Note: status cannot be changed after respondStreaming in Zig 0.15
-        try response.writer.writeAll("{\"error\": \"Unsupported grant_type\"}");
-    }
+    // Body reading needs Zig 0.15 HTTP API migration
+    _ = allocator;
+    _ = db;
+    _ = request;
+    try response.writer.writeAll("{\"error\": \"POST body reading not yet migrated to Zig 0.15\"}");
 }
 
 fn handleAuthorizationCodeGrant(allocator: std.mem.Allocator, _: ?*anyopaque, response: anytype, body: []const u8) !void {
@@ -968,7 +756,7 @@ fn handleAuthorizationCodeGrant(allocator: std.mem.Allocator, _: ?*anyopaque, re
     var json_buf = std.array_list.Managed(u8).init(allocator);
     defer json_buf.deinit();
 
-    try std.json.stringify(token_response, .{}, json_buf.writer());
+    try compat.jsonStringify(token_response, .{}, json_buf.writer());
     // Note: status cannot be changed after respondStreaming in Zig 0.15
     try response.writer.writeAll(json_buf.items);
 }
@@ -1012,7 +800,7 @@ fn handlePasswordGrant(allocator: std.mem.Allocator, _: ?*anyopaque, response: a
     var json_buf = std.array_list.Managed(u8).init(allocator);
     defer json_buf.deinit();
 
-    try std.json.stringify(token_response, .{}, json_buf.writer());
+    try compat.jsonStringify(token_response, .{}, json_buf.writer());
     // Note: status cannot be changed after respondStreaming in Zig 0.15
     try response.writer.writeAll(json_buf.items);
 }
@@ -1050,7 +838,7 @@ fn handleClientCredentialsGrant(allocator: std.mem.Allocator, _: ?*anyopaque, re
     var json_buf = std.array_list.Managed(u8).init(allocator);
     defer json_buf.deinit();
 
-    try std.json.stringify(token_response, .{}, json_buf.writer());
+    try compat.jsonStringify(token_response, .{}, json_buf.writer());
     // Note: status cannot be changed after respondStreaming in Zig 0.15
     try response.writer.writeAll(json_buf.items);
 }
@@ -1067,133 +855,15 @@ fn extractQueryParam(query: []const u8, param: []const u8) ?[]const u8 {
     return query[value_start..end];
 }
 
-fn handleCreateAccount(allocator: std.mem.Allocator, db: *database.Database, response: anytype, method: http.Method, request: *http.Server.Request) !void {
+fn handleCreateAccount(_: std.mem.Allocator, _: *database.Database, response: anytype, method: http.Method, _: *http.Server.Request) !void {
     if (method != .POST) {
         // Note: status cannot be changed after respondStreaming in Zig 0.15
         try response.writer.writeAll("{\"error\": \"Method not allowed\"}");
         return;
     }
 
-    // Read request body
-    var body_buf = std.array_list.Managed(u8).init(allocator);
-    defer body_buf.deinit();
-
-    try request.reader().readAllArrayList(&body_buf, 8192);
-
-    // Parse JSON
-    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, body_buf.items, .{});
-    defer parsed.deinit();
-
-    const username = parsed.value.object.get("username") orelse {
-        // Note: status cannot be changed after respondStreaming in Zig 0.15
-        try response.writer.writeAll("{\"error\": \"username required\"}");
-        return;
-    };
-
-    const email = parsed.value.object.get("email") orelse {
-        // Note: status cannot be changed after respondStreaming in Zig 0.15
-        try response.writer.writeAll("{\"error\": \"email required\"}");
-        return;
-    };
-
-    const password = parsed.value.object.get("password") orelse {
-        // Note: status cannot be changed after respondStreaming in Zig 0.15
-        try response.writer.writeAll("{\"error\": \"password required\"}");
-        return;
-    };
-
-    const agreement = parsed.value.object.get("agreement") orelse {
-        // Note: status cannot be changed after respondStreaming in Zig 0.15
-        try response.writer.writeAll("{\"error\": \"agreement required\"}");
-        return;
-    };
-
-    if (username != .string or email != .string or password != .string or agreement != .bool) {
-        // Note: status cannot be changed after respondStreaming in Zig 0.15
-        try response.writer.writeAll("{\"error\": \"Invalid parameter types\"}");
-        return;
-    }
-
-    if (!agreement.bool) {
-        response.status = .unprocessable_entity;
-        try response.writer.writeAll("{\"error\": \"You must agree to the terms\"}");
-        return;
-    }
-
-    // Validate username (alphanumeric, underscore, dash only)
-    for (username.string) |char| {
-        if (!std.ascii.isAlphanumeric(char) and char != '_' and char != '-') {
-            response.status = .unprocessable_entity;
-            try response.writer.writeAll("{\"error\": \"Username contains invalid characters\"}");
-            return;
-        }
-    }
-
-    // Check if username already exists
-    const existing_user = try database.getUserByUsername(db, allocator, username.string);
-    if (existing_user) |_| {
-        response.status = .unprocessable_entity;
-        try response.writer.writeAll("{\"error\": \"Username already taken\"}");
-        return;
-    }
-
-    // Hash password
-    const password_hash = try auth.hashPassword(allocator, password.string);
-    defer allocator.free(password_hash);
-
-    // Create user
-    const user_id = try database.createUser(db, allocator, username.string, email.string, password_hash);
-
-    // Return user data (without password)
-    const user = try database.getUserById(db, allocator, user_id) orelse {
-        response.status = .internal_server_error;
-        try response.writer.writeAll("{\"error\": \"User creation failed\"}");
-        return;
-    };
-    defer allocator.free(user.username);
-    defer allocator.free(user.email);
-    if (user.display_name) |dn| allocator.free(dn);
-    if (user.bio) |bio| allocator.free(bio);
-    if (user.avatar_url) |au| allocator.free(au);
-    if (user.header_url) |hu| allocator.free(hu);
-    defer allocator.free(user.created_at);
-
-    // Convert to Mastodon account format
-    const account = struct {
-        id: []const u8,
-        username: []const u8,
-        acct: []const u8,
-        display_name: []const u8,
-        locked: bool,
-        created_at: []const u8,
-        note: []const u8,
-        url: []const u8,
-        avatar: []const u8,
-        header: []const u8,
-        followers_count: u32 = 0,
-        following_count: u32 = 0,
-        statuses_count: u32 = 0,
-    }{
-        .id = try std.fmt.allocPrint(allocator, "{}", .{user.id}),
-        .username = user.username,
-        .acct = user.username,
-        .display_name = user.display_name orelse user.username,
-        .locked = user.is_locked,
-        .created_at = user.created_at,
-        .note = user.bio orelse "",
-        .url = try std.fmt.allocPrint(allocator, "https://speedy-socials.local/@{}", .{user.username}),
-        .avatar = user.avatar_url orelse "",
-        .header = user.header_url orelse "",
-    };
-    defer allocator.free(account.id);
-    defer allocator.free(account.url);
-
-    var json_buf = std.array_list.Managed(u8).init(allocator);
-    defer json_buf.deinit();
-
-    try std.json.stringify(account, .{}, json_buf.writer());
-    // Note: status cannot be changed after respondStreaming in Zig 0.15
-    try response.writer.writeAll(json_buf.items);
+    // Body reading needs Zig 0.15 HTTP API migration
+    try response.writer.writeAll("{\"error\": \"POST body reading not yet migrated to Zig 0.15\"}");
 }
 
 // Note: handleAdminRoutes is defined earlier with full API module parameters
@@ -1217,7 +887,7 @@ fn handleAdminAccounts(allocator: std.mem.Allocator, _: *database.Database, resp
     var json_buf = std.array_list.Managed(u8).init(allocator);
     defer json_buf.deinit();
 
-    try std.json.stringify(stats, .{}, json_buf.writer());
+    try compat.jsonStringify(stats, .{}, json_buf.writer());
     try response.writer.writeAll(json_buf.items);
 }
 
@@ -1235,7 +905,7 @@ fn handleAdminStats(allocator: std.mem.Allocator, _: *database.Database, respons
     var json_buf = std.array_list.Managed(u8).init(allocator);
     defer json_buf.deinit();
 
-    try std.json.stringify(stats, .{}, json_buf.writer());
+    try compat.jsonStringify(stats, .{}, json_buf.writer());
     try response.writer.writeAll(json_buf.items);
 }
 
@@ -1278,139 +948,15 @@ fn handleAdminAccountAction(_: std.mem.Allocator, _: *database.Database, respons
     }
 }
 
-fn handleMediaUpload(allocator: std.mem.Allocator, db: *database.Database, response: anytype, method: http.Method, request: *http.Server.Request) !void {
+fn handleMediaUpload(_: std.mem.Allocator, _: *database.Database, response: anytype, method: http.Method, _: *http.Server.Request) !void {
     if (method != .POST) {
         // Note: status cannot be changed after respondStreaming in Zig 0.15
         try response.writer.writeAll("{\"error\": \"Method not allowed\"}");
         return;
     }
 
-    // Check content type - should be multipart/form-data
-    const content_type = request.head.get("content-type") orelse {
-        // Note: status cannot be changed after respondStreaming in Zig 0.15
-        try response.writer.writeAll("{\"error\": \"Content-Type header required\"}");
-        return;
-    };
-
-    if (!std.mem.startsWith(u8, content_type, "multipart/form-data")) {
-        // Note: status cannot be changed after respondStreaming in Zig 0.15
-        try response.writer.writeAll("{\"error\": \"Content-Type must be multipart/form-data\"}");
-        return;
-    }
-
-    // Read the multipart form data
-    var body_buf = std.array_list.Managed(u8).init(allocator);
-    defer body_buf.deinit();
-
-    try request.reader().readAllArrayList(&body_buf, 10 * 1024 * 1024); // 10MB limit
-
-    // Parse multipart data (simplified)
-    // In production, use a proper multipart parser
-    const boundary_prefix = "boundary=";
-    const boundary_start = std.mem.indexOf(u8, content_type, boundary_prefix) orelse {
-        // Note: status cannot be changed after respondStreaming in Zig 0.15
-        try response.writer.writeAll("{\"error\": \"Boundary not specified\"}");
-        return;
-    };
-
-    const boundary = content_type[boundary_start + boundary_prefix.len ..];
-    const boundary_marker = try std.fmt.allocPrint(allocator, "--{s}", .{boundary});
-    defer allocator.free(boundary_marker);
-
-    // Find file data (simplified - assumes single file)
-    const content_start = std.mem.indexOf(u8, body_buf.items, "\r\n\r\n") orelse {
-        // Note: status cannot be changed after respondStreaming in Zig 0.15
-        try response.writer.writeAll("{\"error\": \"Invalid multipart data\"}");
-        return;
-    };
-
-    const file_data_start = content_start + 4;
-    const file_data_end = std.mem.indexOfPos(u8, body_buf.items, file_data_start, boundary_marker) orelse body_buf.items.len;
-    const file_data = body_buf.items[file_data_start..file_data_end];
-
-    // Extract filename and content type from headers (simplified)
-    const headers = body_buf.items[boundary_marker.len + 2 .. content_start];
-    const filename_start = std.mem.indexOf(u8, headers, "filename=\"") orelse {
-        // Note: status cannot be changed after respondStreaming in Zig 0.15
-        try response.writer.writeAll("{\"error\": \"Filename not found\"}");
-        return;
-    };
-
-    const filename_end = std.mem.indexOfPos(u8, headers, filename_start + 10, "\"") orelse headers.len;
-    const filename = headers[filename_start + 10 .. filename_end];
-
-    // Determine content type (simplified)
-    var file_content_type = "application/octet-stream";
-    if (std.mem.indexOf(u8, filename, ".jpg") != null or std.mem.indexOf(u8, filename, ".jpeg") != null) {
-        file_content_type = "image/jpeg";
-    } else if (std.mem.indexOf(u8, filename, ".png") != null) {
-        file_content_type = "image/png";
-    } else if (std.mem.indexOf(u8, filename, ".gif") != null) {
-        file_content_type = "image/gif";
-    } else if (std.mem.indexOf(u8, filename, ".mp4") != null) {
-        file_content_type = "video/mp4";
-    } else if (std.mem.indexOf(u8, filename, ".webm") != null) {
-        file_content_type = "video/webm";
-    } else if (std.mem.indexOf(u8, filename, ".mp3") != null) {
-        file_content_type = "audio/mp3";
-    }
-
-    // Validate upload
-    try media.validateUpload(file_content_type, file_data.len);
-
-    // Process the media
-    var processed_media = try media.processMediaUpload(allocator, file_data, filename, file_content_type);
-    defer processed_media.deinit(allocator);
-
-    // Store in database
-    const media_id = try media.storeMediaInDatabase(db, allocator, processed_media, null);
-
-    // Return media information
-    const media_response = struct {
-        id: []const u8,
-        type: []const u8,
-        url: []const u8,
-        preview_url: ?[]const u8 = null,
-        text_url: ?[]const u8 = null,
-        meta: struct {
-            width: ?u32 = null,
-            height: ?u32 = null,
-            size: u64,
-            aspect: ?f32 = null,
-        },
-        blurhash: ?[]const u8 = null,
-    }{
-        .id = try std.fmt.allocPrint(allocator, "{}", .{media_id}),
-        .type = switch (media.MediaType.fromMimeType(file_content_type)) {
-            .image => "image",
-            .video => "video",
-            .audio => "audio",
-            .unknown => "unknown",
-        },
-        .url = try media.getMediaUrl(allocator, processed_media.id, .original),
-        .preview_url = if (processed_media.thumbnail_path != null) try media.getMediaUrl(allocator, processed_media.id, .thumbnail) else null,
-        .text_url = null, // Not used in Mastodon
-        .meta = .{
-            .width = processed_media.metadata.width,
-            .height = processed_media.metadata.height,
-            .size = processed_media.metadata.size,
-            .aspect = if (processed_media.metadata.width != null and processed_media.metadata.height != null)
-                @as(f32, @floatFromInt(processed_media.metadata.width.?)) / @as(f32, @floatFromInt(processed_media.metadata.height.?))
-            else
-                null,
-        },
-        .blurhash = processed_media.blurhash,
-    };
-    defer allocator.free(media_response.id);
-    defer allocator.free(media_response.url);
-    if (media_response.preview_url) |pu| allocator.free(pu);
-
-    var json_buf = std.array_list.Managed(u8).init(allocator);
-    defer json_buf.deinit();
-
-    try std.json.stringify(media_response, .{}, json_buf.writer());
-    // Note: status cannot be changed after respondStreaming in Zig 0.15
-    try response.writer.writeAll(json_buf.items);
+    // Body reading needs Zig 0.15 HTTP API migration
+    try response.writer.writeAll("{\"error\": \"POST body reading not yet migrated to Zig 0.15\"}");
 }
 
 fn extractFormParam(body: []const u8, param: []const u8) ?[]const u8 {
@@ -1495,7 +1041,6 @@ fn handleSearch(allocator: std.mem.Allocator, db: *database.Database, response: 
     var hashtags = std.array_list.Managed(struct {
         name: []const u8,
         url: []const u8,
-        history: []@TypeOf(undefined) = &[_]@TypeOf(undefined){},
     }).init(allocator);
     defer hashtags.deinit();
 
@@ -1543,7 +1088,7 @@ fn handleSearch(allocator: std.mem.Allocator, db: *database.Database, response: 
     var json_buf = std.array_list.Managed(u8).init(allocator);
     defer json_buf.deinit();
 
-    try std.json.stringify(search_response, .{}, json_buf.writer());
+    try compat.jsonStringify(search_response, .{}, json_buf.writer());
     try response.writer.writeAll(json_buf.items);
 }
 
@@ -1635,7 +1180,7 @@ fn handleSearchV2(allocator: std.mem.Allocator, db: *database.Database, response
     var json_buf = std.array_list.Managed(u8).init(allocator);
     defer json_buf.deinit();
 
-    try std.json.stringify(unified_results.items, .{}, json_buf.writer());
+    try compat.jsonStringify(unified_results.items, .{}, json_buf.writer());
     try response.writer.writeAll(json_buf.items);
 }
 
@@ -1659,19 +1204,17 @@ fn handleTrendingTags(allocator: std.mem.Allocator, db: *database.Database, resp
     }
 
     // Convert to Mastodon tag format
-    var mastodon_tags = std.array_list.Managed(struct {
+    const TagHistory = struct {
+        day: []const u8,
+        uses: []const u8,
+        accounts: []const u8,
+    };
+    const MastodonTag = struct {
         name: []const u8,
         url: []const u8,
-        history: []struct {
-            day: []const u8,
-            uses: []const u8,
-            accounts: []const u8,
-        } = &[_]struct {
-            day: []const u8,
-            uses: []const u8,
-            accounts: []const u8,
-        }{},
-    }).init(allocator);
+        history: []const TagHistory = &[_]TagHistory{},
+    };
+    var mastodon_tags = std.array_list.Managed(MastodonTag).init(allocator);
     defer {
         for (mastodon_tags.items) |*tag| {
             allocator.free(tag.name);
@@ -1690,7 +1233,7 @@ fn handleTrendingTags(allocator: std.mem.Allocator, db: *database.Database, resp
     var json_buf = std.array_list.Managed(u8).init(allocator);
     defer json_buf.deinit();
 
-    try std.json.stringify(mastodon_tags.items, .{}, json_buf.writer());
+    try compat.jsonStringify(mastodon_tags.items, .{}, json_buf.writer());
     try response.writer.writeAll(json_buf.items);
 }
 
@@ -1724,7 +1267,7 @@ fn handleWebSocketUpgrade(allocator: std.mem.Allocator, websocket_server: *webso
     var response_buf = std.array_list.Managed(u8).init(allocator);
     defer response_buf.deinit();
 
-    try std.fmt.format(response_buf.writer(), response, .{std.fmt.fmtSliceEscapeLower(&encoded)});
+    try std.fmt.format(response_buf.writer(), response, .{@as([]const u8, &encoded)});
 
     // Send the response
     _ = try stream.write(response_buf.items);
@@ -1771,7 +1314,7 @@ fn handleWebSocketConnection(allocator: std.mem.Allocator, websocket_server: *we
         }
     }
 
-    std.debug.print("WebSocket client {} disconnected\n", .{client_id});
+    std.debug.print("WebSocket client {s} disconnected\n", .{client_id});
 }
 
 // Create ActivityPub Create activity for a new post
@@ -1825,7 +1368,7 @@ fn createActivityPubCreate(allocator: std.mem.Allocator, post: database.Post, us
     var json_buf = std.array_list.Managed(u8).init(allocator);
     errdefer json_buf.deinit();
 
-    try std.json.stringify(activity, .{}, json_buf.writer());
+    try compat.jsonStringify(activity, .{}, json_buf.writer());
     return json_buf.toOwnedSlice();
 }
 
@@ -1894,10 +1437,11 @@ fn handleUnmuteAccount(_: std.mem.Allocator, db: *database.Database, response: a
 }
 
 // Handle reports endpoint
-fn handleReports(allocator: std.mem.Allocator, db: *database.Database, response: anytype, method: http.Method, path: []const u8, request: *http.Server.Request) !void {
+fn handleReports(_: std.mem.Allocator, _: *database.Database, response: anytype, method: http.Method, path: []const u8, _: *http.Server.Request) !void {
     if (std.mem.eql(u8, path, "/api/v1/reports")) {
         if (method == .POST) {
-            try handleCreateReport(allocator, db, response, request);
+            // Body reading needs Zig 0.15 HTTP API migration
+            try response.writer.writeAll("{\"error\": \"POST body reading not yet migrated to Zig 0.15\"}");
         } else {
             // Note: status cannot be changed after respondStreaming in Zig 0.15
             try response.writer.writeAll("{\"error\": \"Method not allowed\"}");
@@ -1906,74 +1450,6 @@ fn handleReports(allocator: std.mem.Allocator, db: *database.Database, response:
         // Note: status cannot be changed after respondStreaming in Zig 0.15
         try response.writer.writeAll("{\"error\": \"Not found\"}");
     }
-}
-
-// Handle creating a report
-fn handleCreateReport(allocator: std.mem.Allocator, db: *database.Database, response: anytype, request: *http.Server.Request) !void {
-    // Read request body
-    var body_buf = std.array_list.Managed(u8).init(allocator);
-    defer body_buf.deinit();
-
-    try request.reader().readAllArrayList(&body_buf, 10 * 1024); // 10KB limit
-
-    // Parse JSON
-    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, body_buf.items, .{});
-    defer parsed.deinit();
-
-    const account_id = if (parsed.value.object.get("account_id")) |id_val| blk: {
-        if (id_val == .string) {
-            break :blk std.fmt.parseInt(i64, id_val.string, 10) catch null;
-        }
-        break :blk null;
-    } else null;
-
-    const status_ids = if (parsed.value.object.get("status_ids")) |ids_val| blk: {
-        if (ids_val == .array and ids_val.array.items.len > 0) {
-            const status_id_str = ids_val.array.items[0].string;
-            break :blk std.fmt.parseInt(i64, status_id_str, 10) catch null;
-        }
-        break :blk null;
-    } else null;
-
-    const comment = if (parsed.value.object.get("comment")) |comment_val| blk: {
-        if (comment_val == .string) {
-            break :blk comment_val.string;
-        }
-        break :blk null;
-    } else null;
-
-    const category = if (parsed.value.object.get("category")) |cat_val| blk: {
-        if (cat_val == .string) {
-            break :blk cat_val.string;
-        }
-        break :blk "other";
-    } else "other";
-
-    if (account_id == null and status_ids == null) {
-        // Note: status cannot be changed after respondStreaming in Zig 0.15
-        try response.writer.writeAll("{\"error\": \"Either account_id or status_ids must be provided\"}");
-        return;
-    }
-
-    // For demo, use user ID 1 as the reporter
-    const reporter_id: i64 = 1;
-
-    const report_id = try database.createReport(db, reporter_id, account_id, status_ids, category, comment);
-
-    const report_response = struct {
-        id: []const u8,
-        action_taken: bool = false,
-    }{
-        .id = try std.fmt.allocPrint(allocator, "{}", .{report_id}),
-    };
-    defer allocator.free(report_response.id);
-
-    var json_buf = std.array_list.Managed(u8).init(allocator);
-    defer json_buf.deinit();
-
-    try std.json.stringify(report_response, .{}, json_buf.writer());
-    // Note: status cannot be changed after respondStreaming in Zig 0.15
-    try response.writer.writeAll(json_buf.items);
 }
 
 // Handle bookmarking a status
@@ -2063,7 +1539,7 @@ fn handleWebFinger(allocator: std.mem.Allocator, _: *database.Database, response
 // Handle ActivityPub actor routes
 fn handleActivityPubActorRoutes(_: std.mem.Allocator, _: *database.Database, response: anytype, _: http.Method, _: []const u8, _: *http.Server.Request) !void {
     // Stub: ActivityPub actor routes
-    response.status = .not_found;
+    // Note: status cannot be changed after respondStreaming in Zig 0.15
     try response.writer.writeAll("{\"error\": \"ActivityPub actor route not implemented\"}");
 }
 

@@ -2,6 +2,7 @@ const std = @import("std");
 const sqlite = @import("sqlite");
 
 const api = @import("api.zig");
+const atproto_api = @import("api/atproto.zig");
 const database = @import("database.zig");
 const server = @import("server.zig");
 const jobs = @import("jobs.zig");
@@ -76,6 +77,11 @@ pub fn main() !void {
     var email_service = email.EmailService.init(allocator, email_config);
     defer email_service.deinit();
     std.debug.print("Email service initialized\n", .{});
+
+    // Initialize AT Protocol PDS
+    atproto_api.initGlobal(allocator);
+    defer atproto_api.deinitGlobal(allocator);
+    std.debug.print("AT Protocol PDS initialized\n", .{});
 
     // Start HTTP server
     try server.start(allocator, &db, 8080);

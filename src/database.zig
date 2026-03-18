@@ -4,6 +4,14 @@ const search = @import("search.zig");
 
 pub const Database = sqlite.Db;
 
+/// Convenience wrapper: prepare a query and collect all rows into a slice.
+/// Replaces the old `collectAlloc` that was removed from zig-sqlite.
+pub fn collectAlloc(db: *Database, comptime T: type, allocator: std.mem.Allocator, comptime query: []const u8, _: anytype, values: anytype) ![]T {
+    var stmt = try db.prepare(query);
+    defer stmt.deinit();
+    return stmt.all(T, allocator, .{}, values);
+}
+
 pub fn init(_: std.mem.Allocator) !Database {
     return try sqlite.Db.init(.{
         .mode = sqlite.Db.Mode{ .File = "speedy_socials.db" },
@@ -328,14 +336,12 @@ pub const Post = struct {
     favourites_count: i64,
     reblogs_count: i64,
     replies_count: i64,
-    poll: ?Poll,
 
     pub fn deinit(self: Post, allocator: std.mem.Allocator) void {
         allocator.free(self.content);
         if (self.content_warning) |cw| allocator.free(cw);
         allocator.free(self.visibility);
         allocator.free(self.created_at);
-        if (self.poll) |p| p.deinit(allocator);
     }
 };
 
@@ -348,7 +354,7 @@ pub fn createPost(db: *Database, _: std.mem.Allocator, user_id: i64, content: []
 }
 
 pub fn getPosts(db: *Database, allocator: std.mem.Allocator, limit: i64, offset: i64) ![]Post {
-    const posts = try db.collectAlloc(Post, allocator,
+    const posts = try collectAlloc(db,Post, allocator,
         \\SELECT
         \\    p.id,
         \\    p.user_id,
@@ -377,7 +383,7 @@ pub fn getPosts(db: *Database, allocator: std.mem.Allocator, limit: i64, offset:
 }
 
 pub fn getPostsByUser(db: *Database, allocator: std.mem.Allocator, user_id: i64, limit: i64, offset: i64) ![]Post {
-    const posts = try db.collectAlloc(Post, allocator,
+    const posts = try collectAlloc(db,Post, allocator,
         \\SELECT
         \\    p.id,
         \\    p.user_id,
@@ -474,7 +480,7 @@ pub fn isBlocked(db: *Database, blocker_id: i64, blocked_id: i64) !bool {
 }
 
 pub fn getBlockedUsers(db: *Database, allocator: std.mem.Allocator, user_id: i64) ![]i64 {
-    return try db.collectAlloc(i64, allocator,
+    return try collectAlloc(db,i64, allocator,
         \\SELECT blocked_id FROM user_blocks WHERE blocker_id = ?
         \\ORDER BY created_at DESC
     , .{}, .{user_id});
@@ -502,7 +508,7 @@ pub fn isMuted(db: *Database, muter_id: i64, muted_id: i64) !bool {
 }
 
 pub fn getMutedUsers(db: *Database, allocator: std.mem.Allocator, user_id: i64) ![]i64 {
-    return try db.collectAlloc(i64, allocator,
+    return try collectAlloc(db,i64, allocator,
         \\SELECT muted_id FROM user_mutes WHERE muter_id = ?
         \\ORDER BY created_at DESC
     , .{}, .{user_id});
@@ -539,20 +545,20 @@ pub fn createReport(db: *Database, reporter_id: i64, reported_user_id: ?i64, rep
 
 pub fn getReports(db: *Database, allocator: std.mem.Allocator, status: ?[]const u8, limit: i64, offset: i64) ![]Report {
     if (status) |s| {
-        return try db.collectAlloc(Report, allocator,
+        return try collectAlloc(db,Report, allocator,
             \\SELECT id, reporter_id, reported_user_id, reported_post_id, category, comment, status, created_at, resolved_at
             \\FROM reports
             \\WHERE status = ?
             \\ORDER BY created_at DESC
             \\LIMIT ? OFFSET ?
-        , .{}, .{ s, limit, offset });
+        , allocator, .{ s, limit, offset });
     } else {
-        return try db.collectAlloc(Report, allocator,
+        return try collectAlloc(db,Report, allocator,
             \\SELECT id, reporter_id, reported_user_id, reported_post_id, category, comment, status, created_at, resolved_at
             \\FROM reports
             \\ORDER BY created_at DESC
             \\LIMIT ? OFFSET ?
-        , .{}, .{ limit, offset });
+        , allocator, .{ limit, offset });
     }
 }
 
@@ -600,7 +606,7 @@ pub fn isInstanceBlocked(db: *Database, domain: []const u8) !bool {
 }
 
 pub fn getInstanceBlocks(db: *Database, allocator: std.mem.Allocator) ![]InstanceBlock {
-    return try db.collectAlloc(InstanceBlock, allocator,
+    return try collectAlloc(db,InstanceBlock, allocator,
         \\SELECT id, domain, severity, comment, created_at
         \\FROM instance_blocks
         \\ORDER BY created_at DESC
@@ -611,14 +617,14 @@ pub fn getInstanceBlocks(db: *Database, allocator: std.mem.Allocator) ![]Instanc
 pub const Poll = struct {
     id: i64,
     post_id: i64,
-    expires_at: ?[]const u8,
+    expires_at: []const u8 = "",
     multiple: bool,
     hide_totals: bool,
     voters_count: i64,
     created_at: []const u8,
 
     pub fn deinit(self: Poll, allocator: std.mem.Allocator) void {
-        if (self.expires_at) |ea| allocator.free(ea);
+        if (self.expires_at.len > 0) allocator.free(self.expires_at);
         allocator.free(self.created_at);
     }
 };
@@ -660,7 +666,7 @@ pub fn getPoll(db: *Database, allocator: std.mem.Allocator, poll_id: i64) !?Poll
 }
 
 pub fn getPollOptions(db: *Database, allocator: std.mem.Allocator, poll_id: i64) ![]PollOption {
-    return try db.collectAlloc(PollOption, allocator,
+    return try collectAlloc(db,PollOption, allocator,
         \\SELECT id, poll_id, title, votes_count, created_at
         \\FROM poll_options
         \\WHERE poll_id = ?
@@ -715,7 +721,7 @@ pub fn voteOnPoll(db: *Database, poll_id: i64, user_id: i64, option_ids: []const
 }
 
 pub fn getPollVote(db: *Database, poll_id: i64, user_id: i64) ![]i64 {
-    return try db.collectAlloc(i64, db.arena.allocator(),
+    return try collectAlloc(db,i64, db.arena.allocator(),
         \\SELECT poll_option_id FROM poll_votes
         \\WHERE poll_id = ? AND user_id = ?
         \\ORDER BY poll_option_id
@@ -758,7 +764,7 @@ pub fn isBookmarked(db: *Database, user_id: i64, post_id: i64) !bool {
 }
 
 pub fn getBookmarkedPosts(db: *Database, allocator: std.mem.Allocator, user_id: i64, limit: i64, offset: i64) ![]Post {
-    const posts = try db.collectAlloc(Post, allocator,
+    const posts = try collectAlloc(db,Post, allocator,
         \\SELECT
         \\    p.id,
         \\    p.user_id,
@@ -811,7 +817,7 @@ pub fn createList(db: *Database, user_id: i64, title: []const u8, replies_policy
 }
 
 pub fn getLists(db: *Database, allocator: std.mem.Allocator, user_id: i64) ![]List {
-    return try db.collectAlloc(List, allocator,
+    return try collectAlloc(db,List, allocator,
         \\SELECT id, user_id, title, replies_policy, created_at
         \\FROM lists
         \\WHERE user_id = ?
@@ -852,7 +858,7 @@ pub fn removeAccountFromList(db: *Database, list_id: i64, account_id: i64) !void
 }
 
 pub fn getListAccounts(db: *Database, allocator: std.mem.Allocator, list_id: i64) ![]i64 {
-    return try db.collectAlloc(i64, allocator,
+    return try collectAlloc(db,i64, allocator,
         \\SELECT account_id FROM list_accounts
         \\WHERE list_id = ?
         \\ORDER BY created_at
@@ -860,7 +866,7 @@ pub fn getListAccounts(db: *Database, allocator: std.mem.Allocator, list_id: i64
 }
 
 pub fn getListTimeline(db: *Database, allocator: std.mem.Allocator, list_id: i64, limit: i64, offset: i64) ![]Post {
-    const posts = try db.collectAlloc(Post, allocator,
+    const posts = try collectAlloc(db,Post, allocator,
         \\SELECT
         \\    p.id,
         \\    p.user_id,
@@ -911,7 +917,7 @@ pub fn isPostFeatured(db: *Database, user_id: i64, post_id: i64) !bool {
 }
 
 pub fn getFeaturedPosts(db: *Database, allocator: std.mem.Allocator, user_id: i64) ![]Post {
-    const posts = try db.collectAlloc(Post, allocator,
+    const posts = try collectAlloc(db,Post, allocator,
         \\SELECT
         \\    p.id,
         \\    p.user_id,
@@ -953,26 +959,24 @@ pub fn removeEmojiReaction(db: *Database, user_id: i64, post_id: i64, emoji: []c
     , .{}, .{ user_id, post_id, emoji });
 }
 
-pub fn getEmojiReactions(db: *Database, allocator: std.mem.Allocator, post_id: i64) ![]struct {
+pub const EmojiReaction = struct {
     emoji: []const u8,
     count: i64,
     user_reacted: bool,
-} {
+};
+
+pub fn getEmojiReactions(db: *Database, allocator: std.mem.Allocator, post_id: i64) ![]EmojiReaction {
     // For demo, use user ID 1 to check if current user reacted
     const current_user_id: i64 = 1;
 
-    var reactions = std.array_list.Managed(struct {
-        emoji: []const u8,
-        count: i64,
-        user_reacted: bool,
-    }).init(allocator);
+    var reactions = std.array_list.Managed(EmojiReaction).init(allocator);
     errdefer {
         for (reactions.items) |reaction| allocator.free(reaction.emoji);
         reactions.deinit();
     }
 
     // Get all reactions for this post
-    const reaction_rows = try db.collectAlloc(struct {
+    const reaction_rows = try collectAlloc(db,struct {
         emoji: []const u8,
         count: i64,
     }, allocator,
@@ -990,15 +994,15 @@ pub fn getEmojiReactions(db: *Database, allocator: std.mem.Allocator, post_id: i
 
     for (reaction_rows) |row| {
         // Check if current user reacted with this emoji
-        const user_reacted = try db.one(i64,
+        const user_reacted = (try db.one(i64,
             \\SELECT COUNT(*) FROM emoji_reactions
             \\WHERE user_id = ? AND post_id = ? AND emoji = ?
-        , .{}, .{ current_user_id, post_id, row.emoji }) catch 0;
+        , .{}, .{ current_user_id, post_id, row.emoji })) orelse 0;
 
         try reactions.append(.{
             .emoji = try allocator.dupe(u8, row.emoji),
             .count = row.count,
-            .user_reacted = user_reacted.? > 0,
+            .user_reacted = user_reacted > 0,
         });
     }
 
@@ -1006,15 +1010,8 @@ pub fn getEmojiReactions(db: *Database, allocator: std.mem.Allocator, post_id: i
 }
 
 // Helper function to load polls for posts
-fn loadPollsForPosts(db: *Database, allocator: std.mem.Allocator, posts: []Post) !void {
-    for (posts) |*post| {
-        const poll = try db.oneAlloc(Poll, allocator,
-            \\SELECT id, post_id, expires_at, multiple, hide_totals, voters_count, created_at
-            \\FROM polls WHERE post_id = ?
-        , allocator, .{post.id});
-
-        if (poll) |p| {
-            post.poll = p;
-        }
-    }
+// Polls are fetched separately via getPoll() when needed
+fn loadPollsForPosts(_: *Database, _: std.mem.Allocator, _: []Post) !void {
+    // Polls removed from Post struct to fix sqlite deserialization.
+    // Use getPoll(db, allocator, poll_id) to fetch polls individually.
 }

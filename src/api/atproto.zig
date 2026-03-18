@@ -1,285 +1,136 @@
+//! AT Protocol HTTP adapter
+//!
+//! Thin layer between the std.http server and the atproto library.
+//! Constructs XrpcInput from HTTP requests, calls the library router,
+//! and maps XrpcOutput back to HTTP responses.
+
 const std = @import("std");
-const httpz = @import("httpz");
+const http = std.http;
+const atproto = @import("atproto");
 
-const types = @import("../types.zig");
-const utils = @import("../utils.zig");
+/// Server-side AT Protocol context, initialized once at startup.
+pub const AtprotoContext = struct {
+    storage: atproto.Storage,
+    config: atproto.PdsConfig,
+    mem_storage: *atproto.MemoryStorage,
 
-// AT Protocol DID for this server
-const SERVER_DID = "did:web:speedy-socials.local";
-
-// In-memory storage for AT Protocol records
-var records = std.ArrayList(types.ATProtoRecord).init(std.heap.page_allocator);
-var sessions = std.StringHashMap([]const u8).init(std.heap.page_allocator); // token -> did
-
-const Service = struct {
-    id: []const u8,
-    type: []const u8,
-    serviceEndpoint: []const u8,
-};
-
-const Links = struct {
-    privacyPolicy: ?[]const u8 = null,
-    termsOfService: ?[]const u8 = null,
-};
-
-pub fn getDID(_: *httpz.Request, res: *httpz.Response) !void {
-    const did_doc = struct {
-        @"@context": []const []const u8 = &[_][]const u8{
-            "https://www.w3.org/ns/did/v1",
-            "https://w3id.org/security/multikey/v1",
-        },
-        id: []const u8 = SERVER_DID,
-        service: []const Service = &[_]Service{
-            .{
-                .id = "#bsky_pds",
-                .type = "AtprotoPersonalDataServer",
-                .serviceEndpoint = "https://speedy-socials.local",
+    pub fn init(allocator: std.mem.Allocator) AtprotoContext {
+        const mem = allocator.create(atproto.MemoryStorage) catch @panic("Failed to allocate AT Proto storage");
+        mem.* = atproto.MemoryStorage.init(allocator);
+        return .{
+            .storage = mem.storage(),
+            .config = .{
+                .did = "did:web:speedy-socials.local",
+                .hostname = "speedy-socials.local",
+                .service_endpoint = "https://speedy-socials.local",
+                .available_user_domains = &.{".local"},
+                .jwt_secret = "speedy-socials-jwt-secret-change-in-production",
             },
-        },
-    };
-
-    const json = try utils.jsonResponse(res.arena, did_doc);
-    defer res.arena.free(json);
-
-    res.status = utils.HttpStatus.OK;
-    res.header("Content-Type", "application/json");
-    res.body = json;
-}
-
-pub fn describeServer(_: *httpz.Request, res: *httpz.Response) !void {
-    const server_info = struct {
-        did: []const u8 = SERVER_DID,
-        availableUserDomains: []const []const u8 = &[_][]const u8{".local"},
-        inviteCodeRequired: bool = false,
-        phoneVerificationRequired: bool = false,
-        links: Links = .{},
-    };
-
-    const json = try utils.jsonResponse(res.arena, server_info);
-    defer res.arena.free(json);
-
-    res.status = utils.HttpStatus.OK;
-    res.header("Content-Type", "application/json");
-    res.body = json;
-}
-
-pub fn createSession(req: *httpz.Request, res: *httpz.Response) !void {
-    const body = req.body() orelse {
-        res.status = utils.HttpStatus.BAD_REQUEST;
-        res.body = try utils.jsonError(res.arena, "Missing request body");
-        return;
-    };
-
-    var parsed = try std.json.parseFromSlice(std.json.Value, res.arena, body, .{});
-    defer parsed.deinit();
-
-    const identifier = parsed.value.object.get("identifier") orelse {
-        res.status = utils.HttpStatus.BAD_REQUEST;
-        res.body = try utils.jsonError(res.arena, "Missing identifier");
-        return;
-    };
-
-    if (identifier != .string) {
-        res.status = utils.HttpStatus.BAD_REQUEST;
-        res.body = try utils.jsonError(res.arena, "Identifier must be a string");
-        return;
+            .mem_storage = mem,
+        };
     }
 
-    // For demo purposes, accept any identifier and create a session
-    const did = try std.fmt.allocPrint(std.heap.page_allocator, "did:web:{s}", .{identifier.string});
-    const access_token = try utils.generateId(std.heap.page_allocator);
+    pub fn deinit(self: *AtprotoContext, allocator: std.mem.Allocator) void {
+        self.mem_storage.deinit();
+        allocator.destroy(self.mem_storage);
+    }
+};
 
-    try sessions.put(access_token, did);
+/// Global context — initialized in init(), used by handler functions.
+var global_ctx: ?AtprotoContext = null;
 
-    const session_response = struct {
-        did: []const u8,
-        accessJwt: []const u8,
-        refreshJwt: []const u8,
-        handle: []const u8,
-    }{
-        .did = did,
-        .accessJwt = access_token,
-        .refreshJwt = try utils.generateId(std.heap.page_allocator), // Simplified
-        .handle = identifier.string,
-    };
-
-    const json = try utils.jsonResponse(res.arena, session_response);
-    defer res.arena.free(json);
-
-    res.status = utils.HttpStatus.OK;
-    res.header("Content-Type", "application/json");
-    res.body = json;
+pub fn initGlobal(allocator: std.mem.Allocator) void {
+    global_ctx = AtprotoContext.init(allocator);
 }
 
-pub fn createRecord(req: *httpz.Request, res: *httpz.Response) !void {
-    // Check authorization
-    const auth_header = req.header("authorization") orelse {
-        res.status = utils.HttpStatus.UNAUTHORIZED;
-        res.body = try utils.jsonError(res.arena, "Missing authorization");
-        return;
-    };
-
-    if (!std.mem.startsWith(u8, auth_header, "Bearer ")) {
-        res.status = utils.HttpStatus.UNAUTHORIZED;
-        res.body = try utils.jsonError(res.arena, "Invalid authorization format");
-        return;
+pub fn deinitGlobal(allocator: std.mem.Allocator) void {
+    if (global_ctx) |*ctx| {
+        ctx.deinit(allocator);
+        global_ctx = null;
     }
-
-    const token = auth_header[7..];
-    _ = sessions.get(token) orelse {
-        res.status = utils.HttpStatus.UNAUTHORIZED;
-        res.body = try utils.jsonError(res.arena, "Invalid token");
-        return;
-    };
-
-    const body = req.body() orelse {
-        res.status = utils.HttpStatus.BAD_REQUEST;
-        res.body = try utils.jsonError(res.arena, "Missing request body");
-        return;
-    };
-
-    var parsed = try std.json.parseFromSlice(std.json.Value, res.arena, body, .{});
-    defer parsed.deinit();
-
-    const repo = parsed.value.object.get("repo") orelse {
-        res.status = utils.HttpStatus.BAD_REQUEST;
-        res.body = try utils.jsonError(res.arena, "Missing repo");
-        return;
-    };
-
-    const collection = parsed.value.object.get("collection") orelse {
-        res.status = utils.HttpStatus.BAD_REQUEST;
-        res.body = try utils.jsonError(res.arena, "Missing collection");
-        return;
-    };
-
-    const record_value = parsed.value.object.get("record") orelse {
-        res.status = utils.HttpStatus.BAD_REQUEST;
-        res.body = try utils.jsonError(res.arena, "Missing record");
-        return;
-    };
-
-    if (repo != .string or collection != .string or record_value != .object) {
-        res.status = utils.HttpStatus.BAD_REQUEST;
-        res.body = try utils.jsonError(res.arena, "Invalid request format");
-        return;
-    }
-
-    // Create AT Protocol record
-    const record = types.ATProtoRecord{
-        .@"$type" = try utils.duplicateString(std.heap.page_allocator, collection.string),
-        .text = if (record_value.object.get("text")) |text| blk: {
-            break :blk if (text == .string) try utils.duplicateString(std.heap.page_allocator, text.string) else null;
-        } else null,
-        .createdAt = try utils.iso8601Timestamp(std.heap.page_allocator),
-    };
-
-    try records.append(record);
-
-    const response = struct {
-        uri: []const u8,
-        cid: []const u8,
-    }{
-        .uri = try std.fmt.allocPrint(std.heap.page_allocator, "at://{s}/{s}/{s}", .{ repo.string, collection.string, "record_id" }),
-        .cid = try utils.generateId(std.heap.page_allocator),
-    };
-
-    const json = try utils.jsonResponse(res.arena, response);
-    defer res.arena.free(json);
-
-    res.status = utils.HttpStatus.OK;
-    res.header("Content-Type", "application/json");
-    res.body = json;
 }
 
-pub fn listRecords(req: *httpz.Request, res: *httpz.Response) !void {
-    const repo = req.query("repo") orelse {
-        res.status = utils.HttpStatus.BAD_REQUEST;
-        res.body = try utils.jsonError(res.arena, "Missing repo parameter");
+/// Handle /.well-known/atproto-did — returns the DID as plain text.
+pub fn handleAtprotoDid(allocator: std.mem.Allocator, response: anytype) !void {
+    _ = allocator;
+    const ctx = global_ctx orelse {
+        try response.writer.writeAll("{\"error\":\"AT Protocol not initialized\"}");
+        return;
+    };
+    const did = atproto.well_known.atprotoDid(ctx.config);
+    try response.writer.writeAll(did);
+}
+
+/// Handle /xrpc/* — dispatch to the atproto library router.
+pub fn handleXrpc(allocator: std.mem.Allocator, response: anytype, method: http.Method, path: []const u8, request: *http.Server.Request) !void {
+    const ctx = global_ctx orelse {
+        try response.writer.writeAll("{\"error\":\"AT Protocol not initialized\"}");
         return;
     };
 
-    const collection = req.query("collection") orelse {
-        res.status = utils.HttpStatus.BAD_REQUEST;
-        res.body = try utils.jsonError(res.arena, "Missing collection parameter");
-        return;
-    };
+    // Extract XRPC method name from path: /xrpc/com.atproto.server.describeServer
+    const xrpc_method = if (std.mem.startsWith(u8, path, "/xrpc/"))
+        path[6..]
+    else
+        path;
 
-    _ = repo; // TODO: Use repo parameter for filtering
+    // Strip query string if present
+    const method_name = if (std.mem.indexOf(u8, xrpc_method, "?")) |qi|
+        xrpc_method[0..qi]
+    else
+        xrpc_method;
 
-    // Filter records by collection
-    var filtered_records = std.ArrayList(types.ATProtoRecord).init(res.arena);
-    defer filtered_records.deinit();
+    // Build XrpcInput from the HTTP request
+    var input = atproto.XrpcInput{};
 
-    for (records.items) |record| {
-        if (utils.stringEqual(record.@"$type", collection)) {
-            try filtered_records.append(record);
+    // Body reading needs Zig 0.15 HTTP API migration
+    // POST/PUT bodies are not yet read; only query-based XRPC methods work.
+    _ = method;
+
+    // Parse query parameters from the target URL
+    var params: std.StringHashMapUnmanaged([]const u8) = .empty;
+    defer params.deinit(allocator);
+
+    const target = request.head.target;
+    if (std.mem.indexOf(u8, target, "?")) |qi| {
+        const query = target[qi + 1 ..];
+        var pairs = std.mem.splitScalar(u8, query, '&');
+        while (pairs.next()) |pair| {
+            if (std.mem.indexOf(u8, pair, "=")) |eq| {
+                params.put(allocator, pair[0..eq], pair[eq + 1 ..]) catch {};
+            }
+        }
+    }
+    input.params = params;
+
+    // Extract authorization header
+    var headers = request.iterateHeaders();
+    while (headers.next()) |h| {
+        if (std.ascii.eqlIgnoreCase(h.name, "authorization")) {
+            input.auth_token = h.value;
+            break;
         }
     }
 
-    const response = struct {
-        records: []const types.ATProtoRecord,
-        cursor: ?[]const u8 = null,
-    }{
-        .records = filtered_records.items,
-    };
+    // Dispatch to the library
+    const output = try atproto.router.dispatch(method_name, allocator, ctx.storage, ctx.config, input);
 
-    const json = try utils.jsonResponse(res.arena, response);
-    defer res.arena.free(json);
-
-    res.status = utils.HttpStatus.OK;
-    res.header("Content-Type", "application/json");
-    res.body = json;
-}
-
-pub fn getTimeline(req: *httpz.Request, res: *httpz.Response) !void {
-    // Check authorization
-    const auth_header = req.header("authorization") orelse {
-        res.status = utils.HttpStatus.UNAUTHORIZED;
-        res.body = try utils.jsonError(res.arena, "Missing authorization");
-        return;
-    };
-
-    if (!std.mem.startsWith(u8, auth_header, "Bearer ")) {
-        res.status = utils.HttpStatus.UNAUTHORIZED;
-        res.body = try utils.jsonError(res.arena, "Invalid authorization format");
-        return;
+    // Map output to HTTP response
+    switch (output) {
+        .success => |s| {
+            try response.writer.writeAll(s.body);
+            // Free body if it was allocated by the library
+            if (s.body.len > 0 and s.body.ptr != "{}"[0..2].ptr) {
+                allocator.free(s.body);
+            }
+        },
+        .blob => |b| {
+            try response.writer.writeAll(b.data);
+        },
+        .err => |e| {
+            const err_json = try e.toJson(allocator);
+            defer allocator.free(err_json);
+            try response.writer.writeAll(err_json);
+        },
     }
-
-    const token = auth_header[7..];
-    _ = sessions.get(token) orelse {
-        res.status = utils.HttpStatus.UNAUTHORIZED;
-        res.body = try utils.jsonError(res.arena, "Invalid token");
-        return;
-    };
-
-    // Convert our records to feed items
-    var feed_items = std.ArrayList(struct {
-        post: types.ATProtoRecord,
-    }).init(res.arena);
-    defer feed_items.deinit();
-
-    for (records.items) |record| {
-        try feed_items.append(.{ .post = record });
-    }
-
-    const response = struct {
-        feed: []const @TypeOf(feed_items.items[0]),
-        cursor: ?[]const u8 = null,
-    }{
-        .feed = feed_items.items,
-    };
-
-    const json = try utils.jsonResponse(res.arena, response);
-    defer res.arena.free(json);
-
-    res.status = utils.HttpStatus.OK;
-    res.header("Content-Type", "application/json");
-    res.body = json;
-}
-
-pub fn putRecord(req: *httpz.Request, res: *httpz.Response) !void {
-    // Similar to createRecord but for updating existing records
-    // For simplicity, we'll treat this as creating a new record
-    try createRecord(req, res);
 }

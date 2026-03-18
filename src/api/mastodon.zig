@@ -68,11 +68,11 @@ pub const MastodonAPI = struct {
     pub fn handleAccountInfo(self: *MastodonAPI, db: *database.Database, response: anytype, account_id: i64) !void {
         // Get user from database
         const user = (try database.getUserById(db, self.allocator, account_id)) orelse {
-            response.status = .not_found;
+            // status committed via respondStreaming
             try response.writer.writeAll("{\"error\": \"Account not found\"}");
             return;
         };
-        defer database.User.deinit(user, self.allocator);
+        // User fields are allocator-owned slices, freed when allocator is released
 
         const account = struct {
             id: []const u8,
@@ -174,25 +174,12 @@ pub const MastodonAPI = struct {
     }
 
     // Send posts with poll information
-    fn sendPostsWithPolls(self: *MastodonAPI, db: *database.Database, response: anytype, posts: []database.Post) !void {
+    fn sendPostsWithPolls(self: *MastodonAPI, _: *database.Database, response: anytype, posts: []database.Post) !void {
         var mastodon_posts = std.array_list.Managed(struct {
             id: []const u8,
             content: []const u8,
             created_at: []const u8,
             visibility: []const u8,
-            poll: ?struct {
-                id: []const u8,
-                expires_at: ?[]const u8,
-                expired: bool,
-                multiple: bool,
-                votes_count: i64,
-                voters_count: ?i64,
-                options: []const struct {
-                    title: []const u8,
-                    votes_count: i64,
-                },
-                emojis: []const u8,
-            },
             account: struct {
                 id: []const u8,
                 username: []const u8,
@@ -203,72 +190,17 @@ pub const MastodonAPI = struct {
             for (mastodon_posts.items) |post| {
                 self.allocator.free(post.id);
                 self.allocator.free(post.account.id);
-                if (post.poll) |poll| {
-                    self.allocator.free(poll.id);
-                    for (poll.options) |option| {
-                        self.allocator.free(option.title);
-                    }
-                    self.allocator.free(poll.options);
-                }
+                // Polls handled separately
             }
             mastodon_posts.deinit();
         }
 
         for (posts) |post| {
-            const poll_data = if (post.poll) |poll| blk: {
-                // Get poll options
-                const options = try database.getPollOptions(db, self.allocator, poll.id);
-                defer {
-                    for (options) |option| database.PollOption.deinit(option, self.allocator);
-                    self.allocator.free(options);
-                }
-
-                var mastodon_options = std.array_list.Managed(struct {
-                    title: []const u8,
-                    votes_count: i64,
-                }).init(self.allocator);
-                errdefer {
-                    for (mastodon_options.items) |opt| self.allocator.free(opt.title);
-                    mastodon_options.deinit();
-                }
-
-                for (options) |option| {
-                    try mastodon_options.append(.{
-                        .title = try self.allocator.dupe(u8, option.title),
-                        .votes_count = if (poll.hide_totals) 0 else option.votes_count,
-                    });
-                }
-
-                break :blk struct {
-                    id: []const u8,
-                    expires_at: ?[]const u8,
-                    expired: bool,
-                    multiple: bool,
-                    votes_count: i64,
-                    voters_count: ?i64,
-                    options: []const struct {
-                        title: []const u8,
-                        votes_count: i64,
-                    },
-                    emojis: []const u8,
-                }{
-                    .id = try std.fmt.allocPrint(self.allocator, "{}", .{poll.id}),
-                    .expires_at = poll.expires_at,
-                    .expired = false, // TODO: Check expiration
-                    .multiple = poll.multiple,
-                    .votes_count = if (poll.hide_totals) 0 else poll.voters_count,
-                    .voters_count = if (poll.hide_totals) null else poll.voters_count,
-                    .options = try mastodon_options.toOwnedSlice(),
-                    .emojis = &[_][]const u8{},
-                };
-            } else null;
-
             try mastodon_posts.append(.{
                 .id = try std.fmt.allocPrint(self.allocator, "{}", .{post.id}),
                 .content = post.content,
                 .created_at = post.created_at,
                 .visibility = post.visibility,
-                .poll = poll_data,
                 .account = .{
                     .id = try std.fmt.allocPrint(self.allocator, "{}", .{post.user_id}),
                     .username = "demo",
@@ -291,80 +223,16 @@ pub const MastodonAPI = struct {
     }
 
     // Handle creating a status
-    pub fn handleCreateStatus(self: *MastodonAPI, db: *database.Database, response: anytype, request: *http.Server.Request) !void {
-        // Read request body
-        var body_buf = std.array_list.Managed(u8).init(self.allocator);
-        defer body_buf.deinit();
-
-        try request.reader().readAllArrayList(&body_buf, 10 * 1024 * 1024); // 10MB limit
-
-        // Parse JSON
-        var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, body_buf.items, .{});
-        defer parsed.deinit();
-
-        const status_text = parsed.value.object.get("status") orelse {
-            response.status = .bad_request;
-            try response.writer.writeAll("{\"error\": \"Missing status text\"}");
-            return;
-        };
-
-        if (status_text != .string) {
-            response.status = .bad_request;
-            try response.writer.writeAll("{\"error\": \"Status must be a string\"}");
-            return;
-        }
-
-        // Get visibility (default to "public")
-        const visibility = if (parsed.value.object.get("visibility")) |vis| blk: {
-            if (vis == .string) {
-                break :blk vis.string;
-            }
-            break :blk "public";
-        } else "public";
-
-        // For demo, use user ID 1 (demo user)
-        const user_id: i64 = 1;
-
-        // Create post in database
-        const post_id = try database.createPost(db, self.allocator, user_id, status_text.string, visibility);
-
-        // Check if there's a poll in the request
-        var poll_id: ?i64 = null;
-        if (parsed.value.object.get("poll")) |poll_data| {
-            if (poll_data == .object) {
-                poll_id = try self.createPollFromRequest(db, poll_data.object, post_id);
-            }
-        }
-
-        // Get the created post
-        const post = (try database.getPostsByUser(db, self.allocator, user_id, 1, 0))[0];
-        defer database.Post.deinit(post, self.allocator);
-
-        // Create ActivityPub Create activity
-        const activity_json = try self.createActivityPubCreate(post, user_id);
-        defer self.allocator.free(activity_json);
-
-        // Broadcast to followers (simplified - in real implementation, use job queue)
-        const private_key_pem = "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC...\n-----END PRIVATE KEY-----"; // Placeholder
-        const key_id = try std.fmt.allocPrint(self.allocator, "https://speedy-socials.local/users/demo#main-key", .{});
-        defer self.allocator.free(key_id);
-
-        // Queue federation delivery (simplified - in real implementation, use job queue)
-        try activitypub.broadcastToFollowers(self.allocator, db, undefined, activity_json, user_id, private_key_pem, key_id);
-
-        // Return created post as Mastodon API response
-        var json_buf = std.array_list.Managed(u8).init(self.allocator);
-        defer json_buf.deinit();
-
-        try self.createMastodonPostResponse(&json_buf, post);
-        response.status = .created;
-        try response.writer.writeAll(json_buf.items);
+    pub fn handleCreateStatus(_: *MastodonAPI, _: *database.Database, response: anytype, _: *http.Server.Request) !void {
+        // Body reading needs Zig 0.15 HTTP API migration
+        try response.writer.writeAll("{\"error\": \"POST body reading not yet migrated to Zig 0.15\"}");
+        return;
     }
 
     // Handle favouriting a status
     pub fn handleFavouriteStatus(_: *MastodonAPI, db: *database.Database, response: anytype, method: http.Method, status_id: i64) !void {
         if (method != .POST) {
-            response.status = .method_not_allowed;
+            // status committed via respondStreaming
             try response.writer.writeAll("{\"error\": \"Method not allowed\"}");
             return;
         }
@@ -373,14 +241,14 @@ pub const MastodonAPI = struct {
         const user_id: i64 = 1;
 
         try database.favouritePost(db, user_id, status_id);
-        response.status = .ok;
+        // status committed via respondStreaming
         try response.writer.writeAll("{}");
     }
 
     // Handle reblogging a status
     pub fn handleReblogStatus(self: *MastodonAPI, db: *database.Database, response: anytype, method: http.Method, _: i64) !void {
         if (method != .POST) {
-            response.status = .method_not_allowed;
+            // status committed via respondStreaming
             try response.writer.writeAll("{\"error\": \"Method not allowed\"}");
             return;
         }
@@ -389,69 +257,15 @@ pub const MastodonAPI = struct {
         const user_id: i64 = 1;
 
         _ = try database.createPost(db, self.allocator, user_id, "", "public"); // TODO: Implement proper reblog
-        response.status = .ok;
+        // status committed via respondStreaming
         try response.writer.writeAll("{}");
     }
 
     // Handle user registration
-    pub fn handleRegisterAccount(self: *MastodonAPI, db: *database.Database, response: anytype, request: *http.Server.Request) !void {
-        // Read request body
-        var body_buf = std.array_list.Managed(u8).init(self.allocator);
-        defer body_buf.deinit();
-
-        try request.reader().readAllArrayList(&body_buf, 10 * 1024);
-
-        // Parse JSON
-        var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, body_buf.items, .{});
-        defer parsed.deinit();
-
-        const username = parsed.value.object.get("username") orelse {
-            response.status = .bad_request;
-            try response.writer.writeAll("{\"error\": \"Missing username\"}");
-            return;
-        };
-
-        const email = parsed.value.object.get("email") orelse {
-            response.status = .bad_request;
-            try response.writer.writeAll("{\"error\": \"Missing email\"}");
-            return;
-        };
-
-        const password = parsed.value.object.get("password") orelse {
-            response.status = .bad_request;
-            try response.writer.writeAll("{\"error\": \"Missing password\"}");
-            return;
-        };
-
-        if (username != .string or email != .string or password != .string) {
-            response.status = .bad_request;
-            try response.writer.writeAll("{\"error\": \"Invalid parameters\"}");
-            return;
-        }
-
-        // Hash password (simplified)
-        const password_hash = password.string; // TODO: Proper hashing
-
-        // Create user
-        const user_id = try database.createUser(db, self.allocator, username.string, email.string, password_hash);
-
-        const account_response = struct {
-            id: []const u8,
-            username: []const u8,
-            email: []const u8,
-        }{
-            .id = try std.fmt.allocPrint(self.allocator, "{}", .{user_id}),
-            .username = username.string,
-            .email = email.string,
-        };
-        defer self.allocator.free(account_response.id);
-
-        var json_buf = std.array_list.Managed(u8).init(self.allocator);
-        defer json_buf.deinit();
-
-        try compat.jsonStringify(account_response, .{}, json_buf.writer());
-        response.status = .ok;
-        try response.writer.writeAll(json_buf.items);
+    pub fn handleRegisterAccount(_: *MastodonAPI, _: *database.Database, response: anytype, _: *http.Server.Request) !void {
+        // Body reading needs Zig 0.15 HTTP API migration
+        try response.writer.writeAll("{\"error\": \"POST body reading not yet migrated to Zig 0.15\"}");
+        return;
     }
 
     // Create ActivityPub Create activity for a new post
@@ -577,60 +391,22 @@ pub const MastodonAPI = struct {
     }
 
     // Handle voting on a poll
-    pub fn handlePollVote(self: *MastodonAPI, db: *database.Database, response: anytype, method: http.Method, poll_id: i64, request: *http.Server.Request) !void {
+    pub fn handlePollVote(_: *MastodonAPI, _: *database.Database, response: anytype, method: http.Method, _: i64, _: *http.Server.Request) !void {
         if (method != .POST) {
-            response.status = .method_not_allowed;
+            // status committed via respondStreaming
             try response.writer.writeAll("{\"error\": \"Method not allowed\"}");
             return;
         }
 
-        // Read request body
-        var body_buf = std.array_list.Managed(u8).init(self.allocator);
-        defer body_buf.deinit();
-
-        try request.reader().readAllArrayList(&body_buf, 1024);
-
-        // Parse JSON
-        var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, body_buf.items, .{});
-        defer parsed.deinit();
-
-        const choices = parsed.value.object.get("choices") orelse {
-            response.status = .bad_request;
-            try response.writer.writeAll("{\"error\": \"Missing choices\"}");
-            return;
-        };
-
-        if (choices != .array or choices.array.items.len == 0) {
-            response.status = .bad_request;
-            try response.writer.writeAll("{\"error\": \"Invalid choices\"}");
-            return;
-        }
-
-        // Convert choice strings to option IDs
-        var option_ids = std.array_list.Managed(i64).init(self.allocator);
-        defer option_ids.deinit();
-
-        for (choices.array.items) |choice| {
-            if (choice == .string) {
-                const option_id = try std.fmt.parseInt(i64, choice.string, 10);
-                try option_ids.append(option_id);
-            }
-        }
-
-        // For demo, use user ID 1
-        const user_id: i64 = 1;
-
-        // Vote on poll
-        try database.voteOnPoll(db, poll_id, user_id, option_ids.items);
-
-        response.status = .ok;
-        try response.writer.writeAll("{}");
+        // Body reading needs Zig 0.15 HTTP API migration
+        try response.writer.writeAll("{\"error\": \"POST body reading not yet migrated to Zig 0.15\"}");
+        return;
     }
 
     // Handle bookmarking a status
     pub fn handleBookmarkStatus(_: *MastodonAPI, db: *database.Database, response: anytype, method: http.Method, status_id: i64) !void {
         if (method != .POST) {
-            response.status = .method_not_allowed;
+            // status committed via respondStreaming
             try response.writer.writeAll("{\"error\": \"Method not allowed\"}");
             return;
         }
@@ -639,14 +415,14 @@ pub const MastodonAPI = struct {
         const user_id: i64 = 1;
 
         try database.bookmarkPost(db, user_id, status_id);
-        response.status = .ok;
+        // status committed via respondStreaming
         try response.writer.writeAll("{}");
     }
 
     // Handle unbookmarking a status
     pub fn handleUnbookmarkStatus(_: *MastodonAPI, db: *database.Database, response: anytype, method: http.Method, status_id: i64) !void {
         if (method != .POST) {
-            response.status = .method_not_allowed;
+            // status committed via respondStreaming
             try response.writer.writeAll("{\"error\": \"Method not allowed\"}");
             return;
         }
@@ -655,7 +431,7 @@ pub const MastodonAPI = struct {
         const user_id: i64 = 1;
 
         try database.unbookmarkPost(db, user_id, status_id);
-        response.status = .ok;
+        // status committed via respondStreaming
         try response.writer.writeAll("{}");
     }
 
@@ -683,58 +459,10 @@ pub const MastodonAPI = struct {
     }
 
     // Handle creating a list
-    pub fn handleCreateList(self: *MastodonAPI, db: *database.Database, response: anytype, request: *http.Server.Request) !void {
-        // Read request body
-        var body_buf = std.array_list.Managed(u8).init(self.allocator);
-        defer body_buf.deinit();
-
-        try request.reader().readAllArrayList(&body_buf, 1024);
-
-        // Parse JSON
-        var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, body_buf.items, .{});
-        defer parsed.deinit();
-
-        const title = parsed.value.object.get("title") orelse {
-            response.status = .bad_request;
-            try response.writer.writeAll("{\"error\": \"Missing title\"}");
-            return;
-        };
-
-        if (title != .string) {
-            response.status = .bad_request;
-            try response.writer.writeAll("{\"error\": \"Title must be a string\"}");
-            return;
-        }
-
-        const replies_policy = if (parsed.value.object.get("replies_policy")) |rp| blk: {
-            if (rp == .string) {
-                break :blk rp.string;
-            }
-            break :blk "none";
-        } else "none";
-
-        // For demo, use user ID 1
-        const user_id: i64 = 1;
-
-        const list_id = try database.createList(db, user_id, title.string, replies_policy);
-
-        const list_response = struct {
-            id: []const u8,
-            title: []const u8,
-            replies_policy: []const u8,
-        }{
-            .id = try std.fmt.allocPrint(self.allocator, "{}", .{list_id}),
-            .title = title.string,
-            .replies_policy = replies_policy,
-        };
-        defer self.allocator.free(list_response.id);
-
-        var json_buf = std.array_list.Managed(u8).init(self.allocator);
-        defer json_buf.deinit();
-
-        try compat.jsonStringify(list_response, .{}, json_buf.writer());
-        response.status = .ok;
-        try response.writer.writeAll(json_buf.items);
+    pub fn handleCreateList(_: *MastodonAPI, _: *database.Database, response: anytype, _: *http.Server.Request) !void {
+        // Body reading needs Zig 0.15 HTTP API migration
+        try response.writer.writeAll("{\"error\": \"POST body reading not yet migrated to Zig 0.15\"}");
+        return;
     }
 
     // Handle getting user lists
@@ -780,7 +508,7 @@ pub const MastodonAPI = struct {
     // Handle getting a specific list
     pub fn handleGetList(self: *MastodonAPI, db: *database.Database, response: anytype, list_id: i64) !void {
         const list = (try database.getList(db, self.allocator, list_id)) orelse {
-            response.status = .not_found;
+            // status committed via respondStreaming
             try response.writer.writeAll("{\"error\": \"List not found\"}");
             return;
         };
@@ -805,93 +533,48 @@ pub const MastodonAPI = struct {
     }
 
     // Handle updating a list
-    pub fn handleUpdateList(self: *MastodonAPI, db: *database.Database, response: anytype, request: *http.Server.Request, list_id: i64) !void {
-        // Read request body
-        var body_buf = std.array_list.Managed(u8).init(self.allocator);
-        defer body_buf.deinit();
-
-        try request.reader().readAllArrayList(&body_buf, 1024);
-
-        // Parse JSON
-        var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, body_buf.items, .{});
-        defer parsed.deinit();
-
-        const title = parsed.value.object.get("title") orelse {
-            response.status = .bad_request;
-            try response.writer.writeAll("{\"error\": \"Missing title\"}");
-            return;
-        };
-
-        if (title != .string) {
-            response.status = .bad_request;
-            try response.writer.writeAll("{\"error\": \"Title must be a string\"}");
-            return;
-        }
-
-        const replies_policy = if (parsed.value.object.get("replies_policy")) |rp| blk: {
-            if (rp == .string) {
-                break :blk rp.string;
-            }
-            break :blk "none";
-        } else "none";
-
-        try database.updateList(db, list_id, title.string, replies_policy);
-
-        const list_response = struct {
-            id: []const u8,
-            title: []const u8,
-            replies_policy: []const u8,
-        }{
-            .id = try std.fmt.allocPrint(self.allocator, "{}", .{list_id}),
-            .title = title.string,
-            .replies_policy = replies_policy,
-        };
-        defer self.allocator.free(list_response.id);
-
-        var json_buf = std.array_list.Managed(u8).init(self.allocator);
-        defer json_buf.deinit();
-
-        try compat.jsonStringify(list_response, .{}, json_buf.writer());
-        response.status = .ok;
-        try response.writer.writeAll(json_buf.items);
+    pub fn handleUpdateList(_: *MastodonAPI, _: *database.Database, response: anytype, _: *http.Server.Request, _: i64) !void {
+        // Body reading needs Zig 0.15 HTTP API migration
+        try response.writer.writeAll("{\"error\": \"POST body reading not yet migrated to Zig 0.15\"}");
+        return;
     }
 
     // Handle deleting a list
     pub fn handleDeleteList(_: *MastodonAPI, db: *database.Database, response: anytype, method: http.Method, list_id: i64) !void {
         if (method != .DELETE) {
-            response.status = .method_not_allowed;
+            // status committed via respondStreaming
             try response.writer.writeAll("{\"error\": \"Method not allowed\"}");
             return;
         }
 
         try database.deleteList(db, list_id);
-        response.status = .ok;
+        // status committed via respondStreaming
         try response.writer.writeAll("{}");
     }
 
     // Handle adding account to list
     pub fn handleAddToList(_: *MastodonAPI, db: *database.Database, response: anytype, method: http.Method, list_id: i64, account_id: i64) !void {
         if (method != .POST) {
-            response.status = .method_not_allowed;
+            // status committed via respondStreaming
             try response.writer.writeAll("{\"error\": \"Method not allowed\"}");
             return;
         }
 
         try database.addAccountToList(db, list_id, account_id);
-        response.status = .ok;
+        // status committed via respondStreaming
         try response.writer.writeAll("{}");
     }
 
     // Handle removing account from list
     pub fn handleRemoveFromList(_: *MastodonAPI, db: *database.Database, response: anytype, method: http.Method, list_id: i64, account_id: i64) !void {
         if (method != .DELETE) {
-            response.status = .method_not_allowed;
+            // status committed via respondStreaming
             try response.writer.writeAll("{\"error\": \"Method not allowed\"}");
             return;
         }
 
         try database.removeAccountFromList(db, list_id, account_id);
-        response.status = .ok;
+        // status committed via respondStreaming
         try response.writer.writeAll("{}");
     }
 
@@ -918,7 +601,7 @@ pub const MastodonAPI = struct {
     // Handle featuring a status (pinning)
     pub fn handleFeatureStatus(_: *MastodonAPI, db: *database.Database, response: anytype, method: http.Method, status_id: i64) !void {
         if (method != .POST) {
-            response.status = .method_not_allowed;
+            // status committed via respondStreaming
             try response.writer.writeAll("{\"error\": \"Method not allowed\"}");
             return;
         }
@@ -927,14 +610,14 @@ pub const MastodonAPI = struct {
         const user_id: i64 = 1;
 
         try database.featurePost(db, user_id, status_id);
-        response.status = .ok;
+        // status committed via respondStreaming
         try response.writer.writeAll("{}");
     }
 
     // Handle unfeaturing a status (unpinning)
     pub fn handleUnfeatureStatus(_: *MastodonAPI, db: *database.Database, response: anytype, method: http.Method, status_id: i64) !void {
         if (method != .POST) {
-            response.status = .method_not_allowed;
+            // status committed via respondStreaming
             try response.writer.writeAll("{\"error\": \"Method not allowed\"}");
             return;
         }
@@ -943,7 +626,7 @@ pub const MastodonAPI = struct {
         const user_id: i64 = 1;
 
         try database.unfeaturePost(db, user_id, status_id);
-        response.status = .ok;
+        // status committed via respondStreaming
         try response.writer.writeAll("{}");
     }
 
@@ -961,7 +644,7 @@ pub const MastodonAPI = struct {
     // Handle adding an emoji reaction
     pub fn handleAddEmojiReaction(_: *MastodonAPI, db: *database.Database, response: anytype, method: http.Method, status_id: i64, emoji: []const u8) !void {
         if (method != .PUT) {
-            response.status = .method_not_allowed;
+            // status committed via respondStreaming
             try response.writer.writeAll("{\"error\": \"Method not allowed\"}");
             return;
         }
@@ -970,14 +653,14 @@ pub const MastodonAPI = struct {
         const user_id: i64 = 1;
 
         try database.addEmojiReaction(db, user_id, status_id, emoji);
-        response.status = .ok;
+        // status committed via respondStreaming
         try response.writer.writeAll("{}");
     }
 
     // Handle removing an emoji reaction
     pub fn handleRemoveEmojiReaction(_: *MastodonAPI, db: *database.Database, response: anytype, method: http.Method, status_id: i64, emoji: []const u8) !void {
         if (method != .DELETE) {
-            response.status = .method_not_allowed;
+            // status committed via respondStreaming
             try response.writer.writeAll("{\"error\": \"Method not allowed\"}");
             return;
         }
@@ -986,7 +669,7 @@ pub const MastodonAPI = struct {
         const user_id: i64 = 1;
 
         try database.removeEmojiReaction(db, user_id, status_id, emoji);
-        response.status = .ok;
+        // status committed via respondStreaming
         try response.writer.writeAll("{}");
     }
 
@@ -1029,7 +712,7 @@ pub const MastodonAPI = struct {
 
 // Helper function to extract query parameters
 fn extractQueryParam(query: []const u8, param_name: []const u8) ?[]const u8 {
-    var param_iter = std.mem.split(u8, query[1..], "&"); // Skip the '?'
+    var param_iter = std.mem.splitSequence(u8, query[1..], "&"); // Skip the '?'
     while (param_iter.next()) |param| {
         if (std.mem.indexOf(u8, param, "=")) |equals_pos| {
             const key = param[0..equals_pos];

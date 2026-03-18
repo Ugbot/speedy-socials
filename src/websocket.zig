@@ -61,7 +61,7 @@ pub const WebSocketProtocol = struct {
         var response_buf = std.array_list.Managed(u8).init(self.allocator);
         defer response_buf.deinit();
 
-        try std.fmt.format(response_buf.writer(), response, .{std.fmt.fmtSliceEscapeLower(&accept_key)});
+        try std.fmt.format(response_buf.writer(), response, .{@as([]const u8, &accept_key)});
 
         // TODO: Send response to client
         // For now, return the client (response sending would be handled by HTTP server)

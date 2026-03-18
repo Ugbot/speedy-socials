@@ -149,8 +149,8 @@ pub fn searchPosts(db: *database.Database, allocator: std.mem.Allocator, options
         results.deinit();
     }
 
-    // Build FTS query
-    const query_sql = try std.fmt.allocPrint(allocator,
+    // FTS query with comptime string; limit/offset are SQL parameters
+    const query_sql =
         \\SELECT
         \\    p.id, p.content, u.username, u.display_name, p.created_at,
         \\    posts_fts.rank
@@ -160,33 +160,33 @@ pub fn searchPosts(db: *database.Database, allocator: std.mem.Allocator, options
         \\WHERE posts_fts MATCH ?
         \\ORDER BY posts_fts.rank
         \\LIMIT ? OFFSET ?
-    , .{ options.limit, options.offset });
-    defer allocator.free(query_sql);
+    ;
 
     // Execute search
     var stmt = try db.prepare(query_sql);
     defer stmt.deinit();
 
-    const rows = try stmt.all(allocator, .{}, .{options.query});
+    const Row = struct { id: []const u8, content: []const u8, username: []const u8, display_name: ?[]const u8, created_at: []const u8, rank: f64 };
+    const rows = try stmt.all(Row, allocator, .{}, .{ options.query, options.limit, options.offset });
     defer {
         for (rows) |row| {
-            allocator.free(row[0].?.text.?); // id
-            allocator.free(row[1].?.text.?); // content
-            allocator.free(row[2].?.text.?); // username
-            if (row[3].?.text) |dn| allocator.free(dn); // display_name
-            allocator.free(row[4].?.text.?); // created_at
+            allocator.free(row.id);
+            allocator.free(row.content);
+            allocator.free(row.username);
+            if (row.display_name) |dn| allocator.free(dn);
+            allocator.free(row.created_at);
         }
         allocator.free(rows);
     }
 
     for (rows) |row| {
-        const id = try allocator.dupe(u8, row[0].?.text.?);
-        const content = try allocator.dupe(u8, row[1].?.text.?);
-        const username = try allocator.dupe(u8, row[2].?.text.?);
-        const display_name = if (row[3].?.text) |dn| try allocator.dupe(u8, dn) else null;
-        const created_at = try allocator.dupe(u8, row[4].?.text.?);
+        const id = try allocator.dupe(u8, row.id);
+        const content = try allocator.dupe(u8, row.content);
+        const username = try allocator.dupe(u8, row.username);
+        const display_name = if (row.display_name) |dn| try allocator.dupe(u8, dn) else null;
+        const created_at = try allocator.dupe(u8, row.created_at);
 
-        const url = try std.fmt.allocPrint(allocator, "https://speedy-socials.local/posts/{}", .{id});
+        const url = try std.fmt.allocPrint(allocator, "https://speedy-socials.local/posts/{s}", .{id});
 
         try results.append(SearchResult{
             .id = id,
@@ -210,8 +210,8 @@ pub fn searchAccounts(db: *database.Database, allocator: std.mem.Allocator, opti
         results.deinit();
     }
 
-    // Build FTS query
-    const query_sql = try std.fmt.allocPrint(allocator,
+    // FTS query with comptime string
+    const query_sql =
         \\SELECT
         \\    u.id, u.username, u.display_name, u.bio, u.created_at,
         \\    accounts_fts.rank
@@ -220,33 +220,33 @@ pub fn searchAccounts(db: *database.Database, allocator: std.mem.Allocator, opti
         \\WHERE accounts_fts MATCH ?
         \\ORDER BY accounts_fts.rank
         \\LIMIT ? OFFSET ?
-    , .{ options.limit, options.offset });
-    defer allocator.free(query_sql);
+    ;
 
     // Execute search
     var stmt = try db.prepare(query_sql);
     defer stmt.deinit();
 
-    const rows = try stmt.all(allocator, .{}, .{options.query});
+    const AccountRow = struct { id: []const u8, username: []const u8, display_name: ?[]const u8, bio: ?[]const u8, created_at: []const u8, rank: f64 };
+    const rows = try stmt.all(AccountRow, allocator, .{}, .{ options.query, options.limit, options.offset });
     defer {
         for (rows) |row| {
-            allocator.free(row[0].?.text.?); // id
-            allocator.free(row[1].?.text.?); // username
-            allocator.free(row[2].?.text.?); // display_name
-            if (row[3].?.text) |bio| allocator.free(bio); // bio
-            allocator.free(row[4].?.text.?); // created_at
+            allocator.free(row.id);
+            allocator.free(row.username);
+            if (row.display_name) |dn| allocator.free(dn);
+            if (row.bio) |bio| allocator.free(bio);
+            allocator.free(row.created_at);
         }
         allocator.free(rows);
     }
 
     for (rows) |row| {
-        const id = try allocator.dupe(u8, row[0].?.text.?);
-        const username = try allocator.dupe(u8, row[1].?.text.?);
-        const display_name = if (row[2].?.text) |dn| try allocator.dupe(u8, dn) else null;
-        const bio = if (row[3].?.text) |b| try allocator.dupe(u8, b) else "";
-        const created_at = try allocator.dupe(u8, row[4].?.text.?);
+        const id = try allocator.dupe(u8, row.id);
+        const username = try allocator.dupe(u8, row.username);
+        const display_name = if (row.display_name) |dn| try allocator.dupe(u8, dn) else null;
+        const bio = if (row.bio) |b| try allocator.dupe(u8, b) else "";
+        const created_at = try allocator.dupe(u8, row.created_at);
 
-        const url = try std.fmt.allocPrint(allocator, "https://speedy-socials.local/@{}", .{username});
+        const url = try std.fmt.allocPrint(allocator, "https://speedy-socials.local/@{s}", .{username});
 
         try results.append(SearchResult{
             .id = id,
@@ -290,16 +290,17 @@ pub fn searchHashtags(db: *database.Database, allocator: std.mem.Allocator, opti
     var stmt = try db.prepare(query_sql);
     defer stmt.deinit();
 
-    const rows = try stmt.all(allocator, .{}, .{ options.query, options.limit });
+    const HashtagRow = struct { tag: []const u8, post_count: i64 };
+    const rows = try stmt.all(HashtagRow, allocator, .{}, .{ options.query, options.limit });
     defer {
         for (rows) |row| {
-            allocator.free(row[0].?.text.?); // hashtag
+            allocator.free(row.tag);
         }
         allocator.free(rows);
     }
 
     for (rows) |row| {
-        const hashtag = try allocator.dupe(u8, row[0].?.text.?);
+        const hashtag = try allocator.dupe(u8, row.tag);
         const id = try std.fmt.allocPrint(allocator, "hashtag_{s}", .{hashtag});
         const url = try std.fmt.allocPrint(allocator, "https://speedy-socials.local/tags/{s}", .{hashtag});
 
@@ -414,7 +415,9 @@ pub fn reindexAll(db: *database.Database, allocator: std.mem.Allocator) !void {
 }
 
 // Get trending hashtags
-pub fn getTrendingHashtags(db: *database.Database, allocator: std.mem.Allocator, limit: u32) ![]struct { hashtag: []const u8, count: u32 } {
+pub const TrendingHashtag = struct { hashtag: []const u8, count: u32 };
+
+pub fn getTrendingHashtags(db: *database.Database, allocator: std.mem.Allocator, limit: u32) ![]TrendingHashtag {
     const query_sql =
         \\SELECT hashtags.tag, COUNT(*) as post_count
         \\FROM (
@@ -435,21 +438,22 @@ pub fn getTrendingHashtags(db: *database.Database, allocator: std.mem.Allocator,
     var stmt = try db.prepare(query_sql);
     defer stmt.deinit();
 
-    const rows = try stmt.all(allocator, .{}, .{limit});
+    const TrendRow = struct { tag: []const u8, post_count: i64 };
+    const rows = try stmt.all(TrendRow, allocator, .{}, .{limit});
     defer {
         for (rows) |row| {
-            allocator.free(row[0].?.text.?); // hashtag
+            allocator.free(row.tag);
         }
         allocator.free(rows);
     }
 
-    var results = try allocator.alloc(struct { hashtag: []const u8, count: u32 }, rows.len);
+    var results = try allocator.alloc(TrendingHashtag, rows.len);
     errdefer allocator.free(results);
 
     for (rows, 0..) |row, i| {
         results[i] = .{
-            .hashtag = try allocator.dupe(u8, row[0].?.text.?),
-            .count = @intCast(row[1].?.int.?),
+            .hashtag = try allocator.dupe(u8, row.tag),
+            .count = @intCast(row.post_count),
         };
     }
 
