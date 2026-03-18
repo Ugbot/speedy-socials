@@ -223,10 +223,76 @@ pub const MastodonAPI = struct {
     }
 
     // Handle creating a status
-    pub fn handleCreateStatus(_: *MastodonAPI, _: *database.Database, response: anytype, _: *http.Server.Request) !void {
-        // Body reading needs Zig 0.15 HTTP API migration
-        try response.writer.writeAll("{\"error\": \"POST body reading not yet migrated to Zig 0.15\"}");
-        return;
+    pub fn handleCreateStatus(self: *MastodonAPI, db: *database.Database, response: anytype, request: *http.Server.Request) !void {
+        var read_buf: [8192]u8 = undefined;
+        const reader = request.readerExpectNone(&read_buf);
+        const body = reader.allocRemaining(self.allocator, std.io.Limit.limited(1024 * 1024)) catch {
+            try response.writer.writeAll("{\"error\": \"Failed to read request body\"}");
+            return;
+        };
+        defer self.allocator.free(body);
+
+        // Parse JSON body
+        const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, body, .{}) catch {
+            try response.writer.writeAll("{\"error\": \"Invalid JSON\"}");
+            return;
+        };
+        defer parsed.deinit();
+
+        const root = parsed.value.object;
+        const status_text = if (root.get("status")) |s| switch (s) {
+            .string => |str| str,
+            else => {
+                try response.writer.writeAll("{\"error\": \"status must be a string\"}");
+                return;
+            },
+        } else {
+            try response.writer.writeAll("{\"error\": \"status field required\"}");
+            return;
+        };
+
+        const visibility = if (root.get("visibility")) |v| switch (v) {
+            .string => |str| str,
+            else => "public",
+        } else "public";
+
+        // For demo, use user ID 1
+        const user_id: i64 = 1;
+        const post_id = try database.createPost(db, self.allocator, user_id, status_text, visibility);
+
+        // Check for poll
+        if (root.get("poll")) |poll_val| {
+            if (poll_val == .object) {
+                const poll_obj = poll_val.object;
+                _ = try self.createPollFromRequest(db, poll_obj, post_id);
+            }
+        }
+
+        // Build and send response
+        const id_str = try std.fmt.allocPrint(self.allocator, "{}", .{post_id});
+        defer self.allocator.free(id_str);
+
+        const post_response = struct {
+            id: []const u8,
+            content: []const u8,
+            created_at: []const u8 = "now",
+            visibility: []const u8,
+            account: struct {
+                id: []const u8 = "1",
+                username: []const u8 = "demo",
+                display_name: []const u8 = "Demo User",
+            } = .{},
+        }{
+            .id = id_str,
+            .content = status_text,
+            .visibility = visibility,
+        };
+
+        var json_buf = std.array_list.Managed(u8).init(self.allocator);
+        defer json_buf.deinit();
+
+        try compat.jsonStringify(post_response, .{}, json_buf.writer());
+        try response.writer.writeAll(json_buf.items);
     }
 
     // Handle favouriting a status
@@ -262,10 +328,83 @@ pub const MastodonAPI = struct {
     }
 
     // Handle user registration
-    pub fn handleRegisterAccount(_: *MastodonAPI, _: *database.Database, response: anytype, _: *http.Server.Request) !void {
-        // Body reading needs Zig 0.15 HTTP API migration
-        try response.writer.writeAll("{\"error\": \"POST body reading not yet migrated to Zig 0.15\"}");
-        return;
+    pub fn handleRegisterAccount(self: *MastodonAPI, db: *database.Database, response: anytype, request: *http.Server.Request) !void {
+        var read_buf: [8192]u8 = undefined;
+        const reader = request.readerExpectNone(&read_buf);
+        const body = reader.allocRemaining(self.allocator, std.io.Limit.limited(1024 * 1024)) catch {
+            try response.writer.writeAll("{\"error\": \"Failed to read request body\"}");
+            return;
+        };
+        defer self.allocator.free(body);
+
+        // Parse JSON body
+        const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, body, .{}) catch {
+            try response.writer.writeAll("{\"error\": \"Invalid JSON\"}");
+            return;
+        };
+        defer parsed.deinit();
+
+        const root = parsed.value.object;
+        const username = if (root.get("username")) |u| switch (u) {
+            .string => |str| str,
+            else => {
+                try response.writer.writeAll("{\"error\": \"username must be a string\"}");
+                return;
+            },
+        } else {
+            try response.writer.writeAll("{\"error\": \"username required\"}");
+            return;
+        };
+
+        const email = if (root.get("email")) |e| switch (e) {
+            .string => |str| str,
+            else => {
+                try response.writer.writeAll("{\"error\": \"email must be a string\"}");
+                return;
+            },
+        } else {
+            try response.writer.writeAll("{\"error\": \"email required\"}");
+            return;
+        };
+
+        const password = if (root.get("password")) |p| switch (p) {
+            .string => |str| str,
+            else => {
+                try response.writer.writeAll("{\"error\": \"password must be a string\"}");
+                return;
+            },
+        } else {
+            try response.writer.writeAll("{\"error\": \"password required\"}");
+            return;
+        };
+
+        // Create user in database
+        const user_id = database.createUser(db, self.allocator, username, email, password) catch {
+            try response.writer.writeAll("{\"error\": \"Failed to create account\"}");
+            return;
+        };
+
+        const id_str = try std.fmt.allocPrint(self.allocator, "{}", .{user_id});
+        defer self.allocator.free(id_str);
+
+        const account_response = struct {
+            id: []const u8,
+            username: []const u8,
+            acct: []const u8,
+            display_name: []const u8,
+            created_at: []const u8 = "now",
+        }{
+            .id = id_str,
+            .username = username,
+            .acct = username,
+            .display_name = username,
+        };
+
+        var json_buf = std.array_list.Managed(u8).init(self.allocator);
+        defer json_buf.deinit();
+
+        try compat.jsonStringify(account_response, .{}, json_buf.writer());
+        try response.writer.writeAll(json_buf.items);
     }
 
     // Create ActivityPub Create activity for a new post
@@ -391,16 +530,62 @@ pub const MastodonAPI = struct {
     }
 
     // Handle voting on a poll
-    pub fn handlePollVote(_: *MastodonAPI, _: *database.Database, response: anytype, method: http.Method, _: i64, _: *http.Server.Request) !void {
+    pub fn handlePollVote(self: *MastodonAPI, db: *database.Database, response: anytype, method: http.Method, poll_id: i64, request: *http.Server.Request) !void {
         if (method != .POST) {
             // status committed via respondStreaming
             try response.writer.writeAll("{\"error\": \"Method not allowed\"}");
             return;
         }
 
-        // Body reading needs Zig 0.15 HTTP API migration
-        try response.writer.writeAll("{\"error\": \"POST body reading not yet migrated to Zig 0.15\"}");
-        return;
+        var read_buf: [8192]u8 = undefined;
+        const reader = request.readerExpectNone(&read_buf);
+        const body = reader.allocRemaining(self.allocator, std.io.Limit.limited(1024 * 1024)) catch {
+            try response.writer.writeAll("{\"error\": \"Failed to read request body\"}");
+            return;
+        };
+        defer self.allocator.free(body);
+
+        // Parse JSON body for vote choices
+        const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, body, .{}) catch {
+            try response.writer.writeAll("{\"error\": \"Invalid JSON\"}");
+            return;
+        };
+        defer parsed.deinit();
+
+        const root = parsed.value.object;
+        const choices = if (root.get("choices")) |c| switch (c) {
+            .array => |arr| arr.items,
+            else => {
+                try response.writer.writeAll("{\"error\": \"choices must be an array\"}");
+                return;
+            },
+        } else {
+            try response.writer.writeAll("{\"error\": \"choices required\"}");
+            return;
+        };
+
+        // Convert choices to i64 array
+        var option_ids = std.array_list.Managed(i64).init(self.allocator);
+        defer option_ids.deinit();
+
+        for (choices) |choice| {
+            const id = switch (choice) {
+                .integer => |i| i,
+                .string => |s| std.fmt.parseInt(i64, s, 10) catch continue,
+                else => continue,
+            };
+            try option_ids.append(id);
+        }
+
+        // For demo, use user ID 1
+        const user_id: i64 = 1;
+
+        database.voteOnPoll(db, self.allocator, poll_id, user_id, option_ids.items) catch {
+            try response.writer.writeAll("{\"error\": \"Failed to record vote\"}");
+            return;
+        };
+
+        try response.writer.writeAll("{}");
     }
 
     // Handle bookmarking a status
@@ -459,10 +644,65 @@ pub const MastodonAPI = struct {
     }
 
     // Handle creating a list
-    pub fn handleCreateList(_: *MastodonAPI, _: *database.Database, response: anytype, _: *http.Server.Request) !void {
-        // Body reading needs Zig 0.15 HTTP API migration
-        try response.writer.writeAll("{\"error\": \"POST body reading not yet migrated to Zig 0.15\"}");
-        return;
+    pub fn handleCreateList(self: *MastodonAPI, db: *database.Database, response: anytype, request: *http.Server.Request) !void {
+        var read_buf: [8192]u8 = undefined;
+        const reader = request.readerExpectNone(&read_buf);
+        const body = reader.allocRemaining(self.allocator, std.io.Limit.limited(1024 * 1024)) catch {
+            try response.writer.writeAll("{\"error\": \"Failed to read request body\"}");
+            return;
+        };
+        defer self.allocator.free(body);
+
+        // Parse JSON body
+        const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, body, .{}) catch {
+            try response.writer.writeAll("{\"error\": \"Invalid JSON\"}");
+            return;
+        };
+        defer parsed.deinit();
+
+        const root = parsed.value.object;
+        const title = if (root.get("title")) |t| switch (t) {
+            .string => |str| str,
+            else => {
+                try response.writer.writeAll("{\"error\": \"title must be a string\"}");
+                return;
+            },
+        } else {
+            try response.writer.writeAll("{\"error\": \"title required\"}");
+            return;
+        };
+
+        const replies_policy = if (root.get("replies_policy")) |r| switch (r) {
+            .string => |str| str,
+            else => "list",
+        } else "list";
+
+        // For demo, use user ID 1
+        const user_id: i64 = 1;
+
+        const list_id = database.createList(db, user_id, title, replies_policy) catch {
+            try response.writer.writeAll("{\"error\": \"Failed to create list\"}");
+            return;
+        };
+
+        const id_str = try std.fmt.allocPrint(self.allocator, "{}", .{list_id});
+        defer self.allocator.free(id_str);
+
+        const list_response = struct {
+            id: []const u8,
+            title: []const u8,
+            replies_policy: []const u8,
+        }{
+            .id = id_str,
+            .title = title,
+            .replies_policy = replies_policy,
+        };
+
+        var json_buf = std.array_list.Managed(u8).init(self.allocator);
+        defer json_buf.deinit();
+
+        try compat.jsonStringify(list_response, .{}, json_buf.writer());
+        try response.writer.writeAll(json_buf.items);
     }
 
     // Handle getting user lists
@@ -533,10 +773,62 @@ pub const MastodonAPI = struct {
     }
 
     // Handle updating a list
-    pub fn handleUpdateList(_: *MastodonAPI, _: *database.Database, response: anytype, _: *http.Server.Request, _: i64) !void {
-        // Body reading needs Zig 0.15 HTTP API migration
-        try response.writer.writeAll("{\"error\": \"POST body reading not yet migrated to Zig 0.15\"}");
-        return;
+    pub fn handleUpdateList(self: *MastodonAPI, db: *database.Database, response: anytype, request: *http.Server.Request, list_id: i64) !void {
+        var read_buf: [8192]u8 = undefined;
+        const reader = request.readerExpectNone(&read_buf);
+        const body = reader.allocRemaining(self.allocator, std.io.Limit.limited(1024 * 1024)) catch {
+            try response.writer.writeAll("{\"error\": \"Failed to read request body\"}");
+            return;
+        };
+        defer self.allocator.free(body);
+
+        // Parse JSON body
+        const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, body, .{}) catch {
+            try response.writer.writeAll("{\"error\": \"Invalid JSON\"}");
+            return;
+        };
+        defer parsed.deinit();
+
+        const root = parsed.value.object;
+        const title = if (root.get("title")) |t| switch (t) {
+            .string => |str| str,
+            else => {
+                try response.writer.writeAll("{\"error\": \"title must be a string\"}");
+                return;
+            },
+        } else {
+            try response.writer.writeAll("{\"error\": \"title required\"}");
+            return;
+        };
+
+        const replies_policy = if (root.get("replies_policy")) |r| switch (r) {
+            .string => |str| str,
+            else => "list",
+        } else "list";
+
+        database.updateList(db, list_id, title, replies_policy) catch {
+            try response.writer.writeAll("{\"error\": \"Failed to update list\"}");
+            return;
+        };
+
+        const id_str = try std.fmt.allocPrint(self.allocator, "{}", .{list_id});
+        defer self.allocator.free(id_str);
+
+        const list_response = struct {
+            id: []const u8,
+            title: []const u8,
+            replies_policy: []const u8,
+        }{
+            .id = id_str,
+            .title = title,
+            .replies_policy = replies_policy,
+        };
+
+        var json_buf = std.array_list.Managed(u8).init(self.allocator);
+        defer json_buf.deinit();
+
+        try compat.jsonStringify(list_response, .{}, json_buf.writer());
+        try response.writer.writeAll(json_buf.items);
     }
 
     // Handle deleting a list

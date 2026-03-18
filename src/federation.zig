@@ -174,10 +174,46 @@ pub const Federation = struct {
     }
 
     // Handle incoming federation request (ActivityPub inbox)
-    pub fn handleInbox(_: *Federation, _: *database.Database, response: anytype, _: *http.Server.Request) !void {
-        // Body reading needs Zig 0.15 HTTP API migration
-        try response.writer.writeAll("{\"error\": \"POST body reading not yet migrated to Zig 0.15\"}");
-        return;
+    pub fn handleInbox(self: *Federation, db: *database.Database, response: anytype, request: *http.Server.Request) !void {
+        var read_buf: [8192]u8 = undefined;
+        const reader = request.readerExpectNone(&read_buf);
+        const body = reader.allocRemaining(self.allocator, std.io.Limit.limited(1024 * 1024)) catch {
+            try response.writer.writeAll("{\"error\": \"Failed to read request body\"}");
+            return;
+        };
+        defer self.allocator.free(body);
+
+        // Parse the incoming ActivityPub activity
+        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, body, .{}) catch {
+            try response.writer.writeAll("{\"error\": \"Invalid JSON\"}");
+            return;
+        };
+        defer parsed.deinit();
+
+        // Determine activity type and dispatch
+        const activity_type = if (parsed.value.object.get("type")) |t| switch (t) {
+            .string => |str| str,
+            else => {
+                try response.writer.writeAll("{\"error\": \"Invalid activity type\"}");
+                return;
+            },
+        } else {
+            try response.writer.writeAll("{\"error\": \"Missing activity type\"}");
+            return;
+        };
+
+        if (std.mem.eql(u8, activity_type, "Follow")) {
+            self.handleFollow(db, &parsed.value) catch {};
+        } else if (std.mem.eql(u8, activity_type, "Create")) {
+            self.handleCreate(db, &parsed.value) catch {};
+        } else if (std.mem.eql(u8, activity_type, "Like")) {
+            self.handleLike(db, &parsed.value) catch {};
+        } else {
+            std.debug.print("Received unhandled activity type: {s}\n", .{activity_type});
+        }
+
+        // Return 202 Accepted (body only since status is already committed)
+        try response.writer.writeAll("{\"status\": \"accepted\"}");
     }
 
     // Handle incoming Follow activity

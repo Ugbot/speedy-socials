@@ -30,10 +30,34 @@ pub const WebInterface = struct {
     }
 
     // Handle HTMX post creation
-    pub fn handleCreatePost(self: *WebInterface, _: *database.Database, response: anytype, _: *http.Server.Request) !void {
-        // Body reading not available in Zig 0.15 HTTP API
-        _ = self;
-        try response.writer.writeAll("<div class='error'>POST body reading not yet migrated to Zig 0.15</div>");
+    pub fn handleCreatePost(self: *WebInterface, db: *database.Database, response: anytype, request: *http.Server.Request) !void {
+        var read_buf: [8192]u8 = undefined;
+        const reader = request.readerExpectNone(&read_buf);
+        const body = reader.allocRemaining(self.allocator, std.io.Limit.limited(1024 * 1024)) catch {
+            try response.writer.writeAll("<div class='error'>Failed to read request body</div>");
+            return;
+        };
+        defer self.allocator.free(body);
+
+        // Parse form-encoded body (content=...)
+        const content = self.extractFormField(body, "content") orelse {
+            try response.writer.writeAll("<div class='error'>Content is required</div>");
+            return;
+        };
+
+        // For demo, use user ID 1
+        const user_id: i64 = 1;
+        const post_id = database.createPost(db, self.allocator, user_id, content, "public") catch {
+            try response.writer.writeAll("<div class='error'>Failed to create post</div>");
+            return;
+        };
+
+        // Return success HTML fragment for HTMX
+        var html = std.array_list.Managed(u8).init(self.allocator);
+        defer html.deinit();
+
+        try std.fmt.format(html.writer(), "<div class='success'>Post #{} created successfully!</div>", .{post_id});
+        try response.writer.writeAll(html.items);
     }
 
     // Handle HTMX reaction
@@ -246,7 +270,7 @@ pub const WebInterface = struct {
 
     // Extract form field from URL-encoded data
     fn extractFormField(self: *WebInterface, data: []const u8, field_name: []const u8) ?[]const u8 {
-        var iter = std.mem.split(u8, data, "&");
+        var iter = std.mem.splitScalar(u8, data, '&');
         while (iter.next()) |pair| {
             if (std.mem.indexOf(u8, pair, "=")) |eq_pos| {
                 const key = pair[0..eq_pos];
@@ -261,7 +285,7 @@ pub const WebInterface = struct {
     }
 
     // Simple URL decode
-    fn urlDecode(self: *WebInterface, input: []const u8) []const u8 {
+    fn urlDecode(self: *WebInterface, input: []const u8) ?[]const u8 {
         var result = std.array_list.Managed(u8).init(self.allocator);
         defer result.deinit();
 
@@ -285,7 +309,7 @@ pub const WebInterface = struct {
             }
         }
 
-        return result.toOwnedSlice();
+        return result.toOwnedSlice() catch return null;
     }
 };
 

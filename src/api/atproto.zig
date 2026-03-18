@@ -83,9 +83,15 @@ pub fn handleXrpc(allocator: std.mem.Allocator, response: anytype, method: http.
     // Build XrpcInput from the HTTP request
     var input = atproto.XrpcInput{};
 
-    // Body reading needs Zig 0.15 HTTP API migration
-    // POST/PUT bodies are not yet read; only query-based XRPC methods work.
-    _ = method;
+    // Read POST/PUT body if present
+    var body_buf: ?[]u8 = null;
+    defer if (body_buf) |b| allocator.free(b);
+    if (method == .POST or method == .PUT) {
+        var read_buf: [8192]u8 = undefined;
+        const reader = request.readerExpectNone(&read_buf);
+        body_buf = reader.allocRemaining(allocator, std.io.Limit.limited(1024 * 1024)) catch null;
+        input.body = body_buf;
+    }
 
     // Parse query parameters from the target URL
     var params: std.StringHashMapUnmanaged([]const u8) = .empty;

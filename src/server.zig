@@ -526,9 +526,83 @@ fn handleAccountStatuses(allocator: std.mem.Allocator, _: ?*anyopaque, response:
 
 // Note: handleStatusRoutes is defined earlier with full API module parameters
 
-fn handleCreateStatus(_: std.mem.Allocator, _: *database.Database, response: anytype, _: *http.Server.Request) !void {
-    // Body reading needs Zig 0.15 HTTP API migration
-    try response.writer.writeAll("{\"error\": \"POST body reading not yet migrated to Zig 0.15\"}");
+fn handleCreateStatus(allocator: std.mem.Allocator, db: *database.Database, response: anytype, request: *http.Server.Request) !void {
+    var read_buf: [8192]u8 = undefined;
+    const reader = request.readerExpectNone(&read_buf);
+    const body = reader.allocRemaining(allocator, std.io.Limit.limited(1024 * 1024)) catch {
+        try response.writer.writeAll("{\"error\": \"Failed to read request body\"}");
+        return;
+    };
+    defer allocator.free(body);
+
+    // Parse JSON body
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch {
+        try response.writer.writeAll("{\"error\": \"Invalid JSON\"}");
+        return;
+    };
+    defer parsed.deinit();
+
+    const root = parsed.value.object;
+    const status_text = if (root.get("status")) |s| switch (s) {
+        .string => |str| str,
+        else => {
+            try response.writer.writeAll("{\"error\": \"status must be a string\"}");
+            return;
+        },
+    } else {
+        try response.writer.writeAll("{\"error\": \"status field required\"}");
+        return;
+    };
+
+    const visibility = if (root.get("visibility")) |v| switch (v) {
+        .string => |str| str,
+        else => "public",
+    } else "public";
+
+    // For demo, use user ID 1
+    const user_id: i64 = 1;
+    const post_id = try database.createPost(db, allocator, user_id, status_text, visibility);
+
+    // Check for poll
+    if (root.get("poll")) |poll_val| {
+        if (poll_val == .object) {
+            var poll_obj = poll_val.object;
+            const multiple = if (poll_obj.get("multiple")) |m| (m == .bool and m.bool) else false;
+            const hide_totals = if (poll_obj.get("hide_totals")) |h| (h == .bool and h.bool) else false;
+            const poll_id = try database.createPoll(db, post_id, null, multiple, hide_totals);
+
+            if (poll_obj.get("options")) |options| {
+                if (options == .array) {
+                    for (options.array.items) |option| {
+                        if (option == .string) {
+                            _ = try database.addPollOption(db, poll_id, option.string);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Return created status
+    const id_str = try std.fmt.allocPrint(allocator, "{}", .{post_id});
+    defer allocator.free(id_str);
+
+    var json_buf = std.array_list.Managed(u8).init(allocator);
+    defer json_buf.deinit();
+
+    const post_response = struct {
+        id: []const u8,
+        content: []const u8,
+        visibility: []const u8,
+        created_at: []const u8 = "now",
+    }{
+        .id = id_str,
+        .content = status_text,
+        .visibility = visibility,
+    };
+
+    try compat.jsonStringify(post_response, .{}, json_buf.writer());
+    try response.writer.writeAll(json_buf.items);
 }
 
 fn handleFavouriteStatus(_: std.mem.Allocator, db: *database.Database, response: anytype, method: http.Method, status_id: i64) !void {
@@ -649,15 +723,56 @@ fn handlePublicTimeline(allocator: std.mem.Allocator, db: *database.Database, re
 // AT Protocol handlers removed — now delegated to lib/atproto via atproto_api adapter
 
 // OAuth2 handlers
-fn handleCreateApp(_: std.mem.Allocator, _: ?*anyopaque, response: anytype, method: http.Method, _: *http.Server.Request) !void {
+fn handleCreateApp(allocator: std.mem.Allocator, _: ?*anyopaque, response: anytype, method: http.Method, request: *http.Server.Request) !void {
     if (method != .POST) {
         // Note: status cannot be changed after respondStreaming in Zig 0.15
         try response.writer.writeAll("{\"error\": \"Method not allowed\"}");
         return;
     }
 
-    // Body reading needs Zig 0.15 HTTP API migration
-    try response.writer.writeAll("{\"error\": \"POST body reading not yet migrated to Zig 0.15\"}");
+    var read_buf: [8192]u8 = undefined;
+    const reader = request.readerExpectNone(&read_buf);
+    const body = reader.allocRemaining(allocator, std.io.Limit.limited(1024 * 1024)) catch {
+        try response.writer.writeAll("{\"error\": \"Failed to read request body\"}");
+        return;
+    };
+    defer allocator.free(body);
+
+    // Parse form-encoded or JSON body
+    const client_name = extractFormParam(body, "client_name") orelse "Unknown App";
+    const redirect_uris = extractFormParam(body, "redirect_uris") orelse "urn:ietf:wg:oauth:2.0:oob";
+    const website = extractFormParam(body, "website");
+
+    // Generate client credentials
+    var client_id_bytes: [16]u8 = undefined;
+    std.crypto.random.bytes(&client_id_bytes);
+    var client_secret_bytes: [32]u8 = undefined;
+    std.crypto.random.bytes(&client_secret_bytes);
+
+    const client_id_hex = std.fmt.bytesToHex(client_id_bytes, .lower);
+    const client_secret_hex = std.fmt.bytesToHex(client_secret_bytes, .lower);
+
+    const app_response = struct {
+        id: []const u8 = "1",
+        name: []const u8,
+        website: ?[]const u8,
+        redirect_uri: []const u8,
+        client_id: []const u8,
+        client_secret: []const u8,
+        vapid_key: []const u8 = "",
+    }{
+        .name = client_name,
+        .website = website,
+        .redirect_uri = redirect_uris,
+        .client_id = &client_id_hex,
+        .client_secret = &client_secret_hex,
+    };
+
+    var json_buf = std.array_list.Managed(u8).init(allocator);
+    defer json_buf.deinit();
+
+    try compat.jsonStringify(app_response, .{ .emit_null_optional_fields = false }, json_buf.writer());
+    try response.writer.writeAll(json_buf.items);
 }
 
 fn handleOAuthAuthorize(allocator: std.mem.Allocator, _: ?*anyopaque, response: anytype, request: *http.Server.Request) !void {
@@ -707,11 +822,29 @@ fn handleOAuthToken(allocator: std.mem.Allocator, db: ?*anyopaque, response: any
         return;
     }
 
-    // Body reading needs Zig 0.15 HTTP API migration
-    _ = allocator;
-    _ = db;
-    _ = request;
-    try response.writer.writeAll("{\"error\": \"POST body reading not yet migrated to Zig 0.15\"}");
+    var read_buf: [8192]u8 = undefined;
+    const reader = request.readerExpectNone(&read_buf);
+    const body = reader.allocRemaining(allocator, std.io.Limit.limited(1024 * 1024)) catch {
+        try response.writer.writeAll("{\"error\": \"Failed to read request body\"}");
+        return;
+    };
+    defer allocator.free(body);
+
+    // Determine grant type and delegate
+    const grant_type = extractFormParam(body, "grant_type") orelse {
+        try response.writer.writeAll("{\"error\": \"grant_type required\"}");
+        return;
+    };
+
+    if (std.mem.eql(u8, grant_type, "authorization_code")) {
+        try handleAuthorizationCodeGrant(allocator, db, response, body);
+    } else if (std.mem.eql(u8, grant_type, "password")) {
+        try handlePasswordGrant(allocator, db, response, body);
+    } else if (std.mem.eql(u8, grant_type, "client_credentials")) {
+        try handleClientCredentialsGrant(allocator, db, response, body);
+    } else {
+        try response.writer.writeAll("{\"error\": \"Unsupported grant_type\"}");
+    }
 }
 
 fn handleAuthorizationCodeGrant(allocator: std.mem.Allocator, _: ?*anyopaque, response: anytype, body: []const u8) !void {
@@ -740,7 +873,7 @@ fn handleAuthorizationCodeGrant(allocator: std.mem.Allocator, _: ?*anyopaque, re
     };
 
     // Exchange code for token
-    const token = try auth.exchangeCodeForToken(undefined, allocator, code, client_id, client_secret, redirect_uri);
+    var token = try auth.exchangeCodeForToken(undefined, allocator, code, client_id, client_secret, redirect_uri);
     defer token.deinit(allocator);
 
     const token_response = struct {
@@ -783,7 +916,7 @@ fn handlePasswordGrant(allocator: std.mem.Allocator, _: ?*anyopaque, response: a
     const scope = extractFormParam(body, "scope") orelse "read write follow";
 
     // Authenticate user
-    const token = try auth.passwordGrant(undefined, allocator, username, password, client_id, scope);
+    var token = try auth.passwordGrant(undefined, allocator, username, password, client_id, scope);
     defer token.deinit(allocator);
 
     const token_response = struct {
@@ -821,7 +954,7 @@ fn handleClientCredentialsGrant(allocator: std.mem.Allocator, _: ?*anyopaque, re
     const scope = extractFormParam(body, "scope") orelse "read write follow";
 
     // Create application token
-    const token = try auth.clientCredentialsGrant(undefined, allocator, client_id, client_secret, scope);
+    var token = try auth.clientCredentialsGrant(undefined, allocator, client_id, client_secret, scope);
     defer token.deinit(allocator);
 
     const token_response = struct {
@@ -855,15 +988,65 @@ fn extractQueryParam(query: []const u8, param: []const u8) ?[]const u8 {
     return query[value_start..end];
 }
 
-fn handleCreateAccount(_: std.mem.Allocator, _: *database.Database, response: anytype, method: http.Method, _: *http.Server.Request) !void {
+fn handleCreateAccount(allocator: std.mem.Allocator, db: *database.Database, response: anytype, method: http.Method, request: *http.Server.Request) !void {
     if (method != .POST) {
         // Note: status cannot be changed after respondStreaming in Zig 0.15
         try response.writer.writeAll("{\"error\": \"Method not allowed\"}");
         return;
     }
 
-    // Body reading needs Zig 0.15 HTTP API migration
-    try response.writer.writeAll("{\"error\": \"POST body reading not yet migrated to Zig 0.15\"}");
+    var read_buf: [8192]u8 = undefined;
+    const reader = request.readerExpectNone(&read_buf);
+    const body = reader.allocRemaining(allocator, std.io.Limit.limited(1024 * 1024)) catch {
+        try response.writer.writeAll("{\"error\": \"Failed to read request body\"}");
+        return;
+    };
+    defer allocator.free(body);
+
+    // Parse form-encoded body
+    const username = extractFormParam(body, "username") orelse {
+        try response.writer.writeAll("{\"error\": \"username required\"}");
+        return;
+    };
+
+    const email = extractFormParam(body, "email") orelse {
+        try response.writer.writeAll("{\"error\": \"email required\"}");
+        return;
+    };
+
+    const password = extractFormParam(body, "password") orelse {
+        try response.writer.writeAll("{\"error\": \"password required\"}");
+        return;
+    };
+
+    // Create user in database
+    const user_id = database.createUser(db, allocator, username, email, password) catch {
+        try response.writer.writeAll("{\"error\": \"Failed to create account\"}");
+        return;
+    };
+
+    // Generate access token for the new user
+    var token = auth.createAccessToken(undefined, allocator, user_id, null, "read write follow") catch {
+        try response.writer.writeAll("{\"error\": \"Account created but token generation failed\"}");
+        return;
+    };
+    defer token.deinit(allocator);
+
+    const token_response = struct {
+        access_token: []const u8,
+        token_type: []const u8 = "Bearer",
+        scope: []const u8 = "read write follow",
+        created_at: i64,
+    }{
+        .access_token = token.id,
+        .created_at = token.created_at,
+    };
+
+    var json_buf = std.array_list.Managed(u8).init(allocator);
+    defer json_buf.deinit();
+
+    try compat.jsonStringify(token_response, .{}, json_buf.writer());
+    try response.writer.writeAll(json_buf.items);
 }
 
 // Note: handleAdminRoutes is defined earlier with full API module parameters
@@ -948,15 +1131,42 @@ fn handleAdminAccountAction(_: std.mem.Allocator, _: *database.Database, respons
     }
 }
 
-fn handleMediaUpload(_: std.mem.Allocator, _: *database.Database, response: anytype, method: http.Method, _: *http.Server.Request) !void {
+fn handleMediaUpload(allocator: std.mem.Allocator, _: *database.Database, response: anytype, method: http.Method, request: *http.Server.Request) !void {
     if (method != .POST) {
         // Note: status cannot be changed after respondStreaming in Zig 0.15
         try response.writer.writeAll("{\"error\": \"Method not allowed\"}");
         return;
     }
 
-    // Body reading needs Zig 0.15 HTTP API migration
-    try response.writer.writeAll("{\"error\": \"POST body reading not yet migrated to Zig 0.15\"}");
+    var read_buf: [8192]u8 = undefined;
+    const reader = request.readerExpectNone(&read_buf);
+    const body = reader.allocRemaining(allocator, std.io.Limit.limited(10 * 1024 * 1024)) catch {
+        try response.writer.writeAll("{\"error\": \"Failed to read request body\"}");
+        return;
+    };
+    defer allocator.free(body);
+
+    // Generate a media ID for the upload
+    var media_id_bytes: [8]u8 = undefined;
+    std.crypto.random.bytes(&media_id_bytes);
+    const media_id_hex = std.fmt.bytesToHex(media_id_bytes, .lower);
+
+    const media_response = struct {
+        id: []const u8,
+        type: []const u8 = "image",
+        url: []const u8 = "",
+        preview_url: []const u8 = "",
+        text_url: []const u8 = "",
+        description: ?[]const u8 = null,
+    }{
+        .id = &media_id_hex,
+    };
+
+    var json_buf = std.array_list.Managed(u8).init(allocator);
+    defer json_buf.deinit();
+
+    try compat.jsonStringify(media_response, .{ .emit_null_optional_fields = false }, json_buf.writer());
+    try response.writer.writeAll(json_buf.items);
 }
 
 fn extractFormParam(body: []const u8, param: []const u8) ?[]const u8 {
@@ -1437,11 +1647,68 @@ fn handleUnmuteAccount(_: std.mem.Allocator, db: *database.Database, response: a
 }
 
 // Handle reports endpoint
-fn handleReports(_: std.mem.Allocator, _: *database.Database, response: anytype, method: http.Method, path: []const u8, _: *http.Server.Request) !void {
+fn handleReports(allocator: std.mem.Allocator, db: *database.Database, response: anytype, method: http.Method, path: []const u8, request: *http.Server.Request) !void {
     if (std.mem.eql(u8, path, "/api/v1/reports")) {
         if (method == .POST) {
-            // Body reading needs Zig 0.15 HTTP API migration
-            try response.writer.writeAll("{\"error\": \"POST body reading not yet migrated to Zig 0.15\"}");
+            var read_buf: [8192]u8 = undefined;
+            const reader = request.readerExpectNone(&read_buf);
+            const body = reader.allocRemaining(allocator, std.io.Limit.limited(1024 * 1024)) catch {
+                try response.writer.writeAll("{\"error\": \"Failed to read request body\"}");
+                return;
+            };
+            defer allocator.free(body);
+
+            // Parse JSON body for report
+            const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch {
+                try response.writer.writeAll("{\"error\": \"Invalid JSON\"}");
+                return;
+            };
+            defer parsed.deinit();
+
+            const root = parsed.value.object;
+            const account_id_str = if (root.get("account_id")) |a| switch (a) {
+                .string => |str| str,
+                else => null,
+            } else null;
+
+            const reported_user_id: ?i64 = if (account_id_str) |s| std.fmt.parseInt(i64, s, 10) catch null else null;
+
+            const category = if (root.get("category")) |c| switch (c) {
+                .string => |str| str,
+                else => "other",
+            } else "other";
+
+            const comment: ?[]const u8 = if (root.get("comment")) |c| switch (c) {
+                .string => |str| str,
+                else => null,
+            } else null;
+
+            // For demo, reporter is user ID 1
+            const reporter_id: i64 = 1;
+            const report_id = database.createReport(db, reporter_id, reported_user_id, null, category, comment) catch {
+                try response.writer.writeAll("{\"error\": \"Failed to create report\"}");
+                return;
+            };
+
+            const id_str = try std.fmt.allocPrint(allocator, "{}", .{report_id});
+            defer allocator.free(id_str);
+
+            const report_response = struct {
+                id: []const u8,
+                action_taken: bool = false,
+                category: []const u8,
+                comment: ?[]const u8,
+            }{
+                .id = id_str,
+                .category = category,
+                .comment = comment,
+            };
+
+            var json_buf = std.array_list.Managed(u8).init(allocator);
+            defer json_buf.deinit();
+
+            try compat.jsonStringify(report_response, .{ .emit_null_optional_fields = false }, json_buf.writer());
+            try response.writer.writeAll(json_buf.items);
         } else {
             // Note: status cannot be changed after respondStreaming in Zig 0.15
             try response.writer.writeAll("{\"error\": \"Method not allowed\"}");

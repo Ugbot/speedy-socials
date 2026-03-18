@@ -536,11 +536,11 @@ pub const Report = struct {
 };
 
 pub fn createReport(db: *Database, reporter_id: i64, reported_user_id: ?i64, reported_post_id: ?i64, category: []const u8, comment: ?[]const u8) !i64 {
-    return try db.one(i64,
+    return (try db.one(i64,
         \\INSERT INTO reports (reporter_id, reported_user_id, reported_post_id, category, comment)
         \\VALUES (?, ?, ?, ?, ?)
         \\RETURNING id
-    , .{}, .{ reporter_id, reported_user_id, reported_post_id, category, comment });
+    , .{}, .{ reporter_id, reported_user_id, reported_post_id, category, comment })) orelse error.InsertFailed;
 }
 
 pub fn getReports(db: *Database, allocator: std.mem.Allocator, status: ?[]const u8, limit: i64, offset: i64) ![]Report {
@@ -585,11 +585,11 @@ pub const InstanceBlock = struct {
 };
 
 pub fn blockInstance(db: *Database, domain: []const u8, severity: []const u8, comment: ?[]const u8) !i64 {
-    return try db.one(i64,
+    return (try db.one(i64,
         \\INSERT INTO instance_blocks (domain, severity, comment)
         \\VALUES (?, ?, ?)
         \\RETURNING id
-    , .{}, .{ domain, severity, comment });
+    , .{}, .{ domain, severity, comment })) orelse error.InsertFailed;
 }
 
 pub fn unblockInstance(db: *Database, domain: []const u8) !void {
@@ -643,19 +643,19 @@ pub const PollOption = struct {
 };
 
 pub fn createPoll(db: *Database, post_id: i64, expires_at: ?[]const u8, multiple: bool, hide_totals: bool) !i64 {
-    return try db.one(i64,
+    return (try db.one(i64,
         \\INSERT INTO polls (post_id, expires_at, multiple, hide_totals)
         \\VALUES (?, ?, ?, ?)
         \\RETURNING id
-    , .{}, .{ post_id, expires_at, multiple, hide_totals });
+    , .{}, .{ post_id, expires_at, multiple, hide_totals })) orelse error.InsertFailed;
 }
 
 pub fn addPollOption(db: *Database, poll_id: i64, title: []const u8) !i64 {
-    return try db.one(i64,
+    return (try db.one(i64,
         \\INSERT INTO poll_options (poll_id, title)
         \\VALUES (?, ?)
         \\RETURNING id
-    , .{}, .{ poll_id, title });
+    , .{}, .{ poll_id, title })) orelse error.InsertFailed;
 }
 
 pub fn getPoll(db: *Database, allocator: std.mem.Allocator, poll_id: i64) !?Poll {
@@ -674,17 +674,17 @@ pub fn getPollOptions(db: *Database, allocator: std.mem.Allocator, poll_id: i64)
     , .{}, .{poll_id});
 }
 
-pub fn voteOnPoll(db: *Database, poll_id: i64, user_id: i64, option_ids: []const i64) !void {
+pub fn voteOnPoll(db: *Database, allocator: std.mem.Allocator, poll_id: i64, user_id: i64, option_ids: []const i64) !void {
     // Start transaction
     try db.exec("BEGIN", .{}, .{});
     errdefer db.exec("ROLLBACK", .{}, .{}) catch {};
 
     // Check if poll allows multiple votes
-    const poll = (try getPoll(db, db.arena.allocator(), poll_id)) orelse {
+    const poll = (try getPoll(db, allocator, poll_id)) orelse {
         try db.exec("ROLLBACK", .{}, .{});
         return error.PollNotFound;
     };
-    defer poll.deinit(db.arena.allocator());
+    defer poll.deinit(allocator);
 
     // If not multiple choice, remove existing votes from this user
     if (!poll.multiple) {
@@ -720,8 +720,8 @@ pub fn voteOnPoll(db: *Database, poll_id: i64, user_id: i64, option_ids: []const
     try db.exec("COMMIT", .{}, .{});
 }
 
-pub fn getPollVote(db: *Database, poll_id: i64, user_id: i64) ![]i64 {
-    return try collectAlloc(db,i64, db.arena.allocator(),
+pub fn getPollVote(db: *Database, allocator: std.mem.Allocator, poll_id: i64, user_id: i64) ![]i64 {
+    return try collectAlloc(db,i64, allocator,
         \\SELECT poll_option_id FROM poll_votes
         \\WHERE poll_id = ? AND user_id = ?
         \\ORDER BY poll_option_id
@@ -809,11 +809,11 @@ pub const List = struct {
 };
 
 pub fn createList(db: *Database, user_id: i64, title: []const u8, replies_policy: []const u8) !i64 {
-    return try db.one(i64,
+    return (try db.one(i64,
         \\INSERT INTO lists (user_id, title, replies_policy)
         \\VALUES (?, ?, ?)
         \\RETURNING id
-    , .{}, .{ user_id, title, replies_policy });
+    , .{}, .{ user_id, title, replies_policy })) orelse error.InsertFailed;
 }
 
 pub fn getLists(db: *Database, allocator: std.mem.Allocator, user_id: i64) ![]List {
