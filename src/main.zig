@@ -78,10 +78,10 @@ pub fn main() !void {
     defer email_service.deinit();
     std.debug.print("Email service initialized\n", .{});
 
-    // Initialize AT Protocol PDS
-    atproto_api.initGlobal(allocator);
+    // Initialize AT Protocol PDS (backed by SQLite)
+    try atproto_api.initGlobal(allocator, &db);
     defer atproto_api.deinitGlobal(allocator);
-    std.debug.print("AT Protocol PDS initialized\n", .{});
+    std.debug.print("AT Protocol PDS initialized (SQLite-backed)\n", .{});
 
     // Start HTTP server
     try server.start(allocator, &db, 8080);

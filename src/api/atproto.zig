@@ -7,18 +7,22 @@
 const std = @import("std");
 const http = std.http;
 const atproto = @import("atproto");
+const atproto_storage = @import("../atproto_storage.zig");
+const database = @import("../database.zig");
 
 /// Server-side AT Protocol context, initialized once at startup.
 pub const AtprotoContext = struct {
     storage: atproto.Storage,
     config: atproto.PdsConfig,
-    mem_storage: *atproto.MemoryStorage,
+    sqlite_storage: *atproto_storage.SqliteStorage,
 
-    pub fn init(allocator: std.mem.Allocator) AtprotoContext {
-        const mem = allocator.create(atproto.MemoryStorage) catch @panic("Failed to allocate AT Proto storage");
-        mem.* = atproto.MemoryStorage.init(allocator);
+    pub fn init(allocator: std.mem.Allocator, db: *database.Database) !AtprotoContext {
+        const sql_store = try allocator.create(atproto_storage.SqliteStorage);
+        sql_store.* = atproto_storage.SqliteStorage.init(db);
+        try sql_store.migrate();
+
         return .{
-            .storage = mem.storage(),
+            .storage = sql_store.storage(),
             .config = .{
                 .did = "did:web:speedy-socials.local",
                 .hostname = "speedy-socials.local",
@@ -26,21 +30,20 @@ pub const AtprotoContext = struct {
                 .available_user_domains = &.{".local"},
                 .jwt_secret = "speedy-socials-jwt-secret-change-in-production",
             },
-            .mem_storage = mem,
+            .sqlite_storage = sql_store,
         };
     }
 
     pub fn deinit(self: *AtprotoContext, allocator: std.mem.Allocator) void {
-        self.mem_storage.deinit();
-        allocator.destroy(self.mem_storage);
+        allocator.destroy(self.sqlite_storage);
     }
 };
 
 /// Global context — initialized in init(), used by handler functions.
 var global_ctx: ?AtprotoContext = null;
 
-pub fn initGlobal(allocator: std.mem.Allocator) void {
-    global_ctx = AtprotoContext.init(allocator);
+pub fn initGlobal(allocator: std.mem.Allocator, db: *database.Database) !void {
+    global_ctx = try AtprotoContext.init(allocator, db);
 }
 
 pub fn deinitGlobal(allocator: std.mem.Allocator) void {
@@ -51,8 +54,7 @@ pub fn deinitGlobal(allocator: std.mem.Allocator) void {
 }
 
 /// Handle /.well-known/atproto-did — returns the DID as plain text.
-pub fn handleAtprotoDid(allocator: std.mem.Allocator, response: anytype) !void {
-    _ = allocator;
+pub fn handleAtprotoDid(_: std.mem.Allocator, response: anytype) !void {
     const ctx = global_ctx orelse {
         try response.writer.writeAll("{\"error\":\"AT Protocol not initialized\"}");
         return;
@@ -125,10 +127,7 @@ pub fn handleXrpc(allocator: std.mem.Allocator, response: anytype, method: http.
     switch (output) {
         .success => |s| {
             try response.writer.writeAll(s.body);
-            // Free body if it was allocated by the library
-            if (s.body.len > 0 and s.body.ptr != "{}"[0..2].ptr) {
-                allocator.free(s.body);
-            }
+            allocator.free(s.body);
         },
         .blob => |b| {
             try response.writer.writeAll(b.data);
