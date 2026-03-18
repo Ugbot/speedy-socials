@@ -148,13 +148,14 @@ pub fn deleteSession(
     access_token: []const u8,
 ) !XrpcOutput {
     // Verify the token is valid
-    _ = jwt_mod.verifyToken(allocator, access_token, cfg.jwt_secret) catch {
+    const claims = jwt_mod.verifyToken(allocator, access_token, cfg.jwt_secret) catch {
         return XrpcOutput.errResponse(401, "InvalidToken", "Invalid token");
     };
+    jwt_mod.freeClaims(allocator, claims);
 
     try store.deleteSession(allocator, access_token);
 
-    return XrpcOutput.ok("{}");
+    return XrpcOutput.ok(try allocator.dupe(u8, "{}"));
 }
 
 /// Get current session info (com.atproto.server.getSession).

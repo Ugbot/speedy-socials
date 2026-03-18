@@ -147,7 +147,7 @@ pub fn deleteRecord(allocator: std.mem.Allocator, store: Storage, cfg: PdsConfig
 
     try store.deleteRecord(allocator, auth_did, parsed.value.collection, parsed.value.rkey);
 
-    return XrpcOutput.ok("{}");
+    return XrpcOutput.ok(try allocator.dupe(u8, "{}"));
 }
 
 /// com.atproto.repo.putRecord

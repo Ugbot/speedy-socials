@@ -60,6 +60,9 @@ pub const moderation_handlers = @import("handlers/moderation.zig");
 // Router
 pub const router = @import("router.zig");
 
+// Integration tests
+const integration_test = @import("integration_test.zig");
+
 test {
     _ = xrpc;
     _ = config;
@@ -78,4 +81,5 @@ test {
     _ = label_handlers;
     _ = moderation_handlers;
     _ = router;
+    _ = integration_test;
 }
