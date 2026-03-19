@@ -424,8 +424,8 @@ pub fn formatHttpDate(allocator: std.mem.Allocator, ts: i64) ![]u8 {
     const day_secs = epoch_secs.getDaySeconds();
 
     const day_names = [_][]const u8{ "Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed" };
-    // Epoch (1970-01-01) was a Thursday, day index 0
-    const day_of_week = @as(usize, @intCast(@rem(@as(i64, @intCast(epoch_day.day)) + 4, 7)));
+    // Epoch (1970-01-01) was a Thursday. day 0 → index 0 → "Thu"
+    const day_of_week = @as(usize, @intCast(@rem(@as(i64, @intCast(epoch_day.day)), 7)));
     const month_names = [_][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
 
     return std.fmt.allocPrint(allocator, "{s}, {d:0>2} {s} {d} {d:0>2}:{d:0>2}:{d:0>2} GMT", .{

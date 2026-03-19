@@ -112,4 +112,8 @@ test {
     _ = @import("api.zig");
     _ = @import("crypto_sig.zig");
     _ = @import("test_federation.zig");
+    _ = @import("relay/mod.zig");
+    _ = @import("relay/translate.zig");
+    _ = @import("relay/identity_map.zig");
+    _ = @import("relay/subscription.zig");
 }

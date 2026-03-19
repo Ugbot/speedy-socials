@@ -17,8 +17,8 @@ test "unixTimestampToIso8601 epoch zero" {
 
 test "unixTimestampToIso8601 known date" {
     const allocator = std.testing.allocator;
-    // 2024-01-15 10:30:00 UTC = 1705312200
-    const result = try activitypub.unixTimestampToIso8601(allocator, 1705312200);
+    // 2024-01-15 10:30:00 UTC = 1705314600
+    const result = try activitypub.unixTimestampToIso8601(allocator, 1705314600);
     defer allocator.free(result);
     try std.testing.expectEqualStrings("2024-01-15T10:30:00Z", result);
 }
@@ -33,8 +33,8 @@ test "unixTimestampToIso8601 year 2038" {
 
 test "unixTimestampToIso8601 recent date" {
     const allocator = std.testing.allocator;
-    // 2026-03-19 00:00:00 UTC = 1774051200
-    const result = try activitypub.unixTimestampToIso8601(allocator, 1774051200);
+    // 2026-03-19 00:00:00 UTC = 1773878400
+    const result = try activitypub.unixTimestampToIso8601(allocator, 1773878400);
     defer allocator.free(result);
     try std.testing.expectEqualStrings("2026-03-19T00:00:00Z", result);
 }
@@ -48,8 +48,8 @@ test "sqliteDatetimeToIso8601 converts correctly" {
 
 test "formatHttpDate known date" {
     const allocator = std.testing.allocator;
-    // 2026-03-19 12:00:00 UTC = 1774094400 (Thursday)
-    const result = try activitypub.formatHttpDate(allocator, 1774094400);
+    // 2026-03-19 12:00:00 UTC = 1773921600 (Thursday)
+    const result = try activitypub.formatHttpDate(allocator, 1773921600);
     defer allocator.free(result);
     try std.testing.expectEqualStrings("Thu, 19 Mar 2026 12:00:00 GMT", result);
 }
@@ -145,8 +145,7 @@ test "PEM encoding produces valid format" {
 // ---- Database Federation Tests ----
 
 test "database federation tables migrate" {
-    const allocator = std.testing.allocator;
-    var db = try database.init(allocator);
+    var db = try database.initTestDb();
     defer db.deinit();
     try database.migrate(&db);
     // If we get here without error, all tables created successfully
@@ -154,7 +153,7 @@ test "database federation tables migrate" {
 
 test "database actor key pair lifecycle" {
     const allocator = std.testing.allocator;
-    var db = try database.init(allocator);
+    var db = try database.initTestDb();
     defer db.deinit();
     try database.migrate(&db);
 
@@ -179,7 +178,7 @@ test "database actor key pair lifecycle" {
 
 test "database remote actor CRUD" {
     const allocator = std.testing.allocator;
-    var db = try database.init(allocator);
+    var db = try database.initTestDb();
     defer db.deinit();
     try database.migrate(&db);
 
@@ -191,11 +190,13 @@ test "database remote actor CRUD" {
         "https://mastodon.social/users/alice/inbox",
         "mastodon.social",
     );
+    defer actor.deinit(allocator);
     try std.testing.expectEqualStrings("https://mastodon.social/users/alice", actor.actor_uri);
 
     // Get by URI
     const found = try database.getRemoteActorByUri(&db, allocator, "https://mastodon.social/users/alice");
     try std.testing.expect(found != null);
+    defer found.?.deinit(allocator);
     try std.testing.expectEqualStrings("mastodon.social", found.?.domain);
 
     // Not found
@@ -210,23 +211,25 @@ test "database remote actor CRUD" {
         "https://mastodon.social/users/alice/inbox",
         "mastodon.social",
     );
+    defer actor2.deinit(allocator);
     try std.testing.expectEqual(actor.id, actor2.id);
 }
 
 test "database federation follow lifecycle" {
     const allocator = std.testing.allocator;
-    var db = try database.init(allocator);
+    var db = try database.initTestDb();
     defer db.deinit();
     try database.migrate(&db);
 
     _ = try database.createUser(&db, allocator, "localuser", "local@test.com", "hash");
-    _ = try database.getOrCreateRemoteActor(
+    const remote_actor = try database.getOrCreateRemoteActor(
         &db,
         allocator,
         "https://remote.social/users/bob",
         "https://remote.social/users/bob/inbox",
         "remote.social",
     );
+    defer remote_actor.deinit(allocator);
 
     // Create inbound follow
     try database.createFederationFollow(&db, 1, 1, "https://remote.social/activities/follow-1", "inbound");
@@ -234,12 +237,15 @@ test "database federation follow lifecycle" {
     // Find by URI
     const follow = try database.getFederationFollowByUri(&db, allocator, "https://remote.social/activities/follow-1");
     try std.testing.expect(follow != null);
+    defer follow.?.deinit(allocator);
     try std.testing.expectEqualStrings("inbound", follow.?.direction);
     try std.testing.expectEqualStrings("pending", follow.?.status);
 
     // Update status
     try database.updateFederationFollowStatus(&db, "https://remote.social/activities/follow-1", "accepted");
     const updated = try database.getFederationFollowByUri(&db, allocator, "https://remote.social/activities/follow-1");
+    try std.testing.expect(updated != null);
+    defer updated.?.deinit(allocator);
     try std.testing.expectEqualStrings("accepted", updated.?.status);
 
     // Delete
@@ -249,8 +255,7 @@ test "database federation follow lifecycle" {
 }
 
 test "database activity deduplication" {
-    const allocator = std.testing.allocator;
-    var db = try database.init(allocator);
+    var db = try database.initTestDb();
     defer db.deinit();
     try database.migrate(&db);
 
@@ -270,15 +275,17 @@ test "database activity deduplication" {
 
 test "database remote follower inbox resolution" {
     const allocator = std.testing.allocator;
-    var db = try database.init(allocator);
+    var db = try database.initTestDb();
     defer db.deinit();
     try database.migrate(&db);
 
     _ = try database.createUser(&db, allocator, "popular", "popular@test.com", "hash");
 
     // Create remote actors on two different servers
-    _ = try database.getOrCreateRemoteActor(&db, allocator, "https://server1.social/users/a", "https://server1.social/users/a/inbox", "server1.social");
-    _ = try database.getOrCreateRemoteActor(&db, allocator, "https://server2.social/users/b", "https://server2.social/users/b/inbox", "server2.social");
+    const ra1 = try database.getOrCreateRemoteActor(&db, allocator, "https://server1.social/users/a", "https://server1.social/users/a/inbox", "server1.social");
+    defer ra1.deinit(allocator);
+    const ra2 = try database.getOrCreateRemoteActor(&db, allocator, "https://server2.social/users/b", "https://server2.social/users/b/inbox", "server2.social");
+    defer ra2.deinit(allocator);
 
     // Create accepted inbound follows
     try database.createFederationFollow(&db, 1, 1, "https://server1.social/follow-1", "inbound");
@@ -299,7 +306,7 @@ test "database remote follower inbox resolution" {
 test "database instance blocking" {
     const allocator = std.testing.allocator;
     _ = allocator;
-    var db = try database.init(std.testing.allocator);
+    var db = try database.initTestDb();
     defer db.deinit();
     try database.migrate(&db);
 
@@ -317,7 +324,7 @@ test "database instance blocking" {
 
 test "database user and post counts" {
     const allocator = std.testing.allocator;
-    var db = try database.init(allocator);
+    var db = try database.initTestDb();
     defer db.deinit();
     try database.migrate(&db);
 
@@ -341,12 +348,13 @@ test "database user and post counts" {
 
 test "database remote post and interaction CRUD" {
     const allocator = std.testing.allocator;
-    var db = try database.init(allocator);
+    var db = try database.initTestDb();
     defer db.deinit();
     try database.migrate(&db);
 
     _ = try database.createUser(&db, allocator, "localuser", "l@test.com", "hash");
-    _ = try database.getOrCreateRemoteActor(&db, allocator, "https://remote.social/users/alice", "https://remote.social/inbox", "remote.social");
+    const remote_actor = try database.getOrCreateRemoteActor(&db, allocator, "https://remote.social/users/alice", "https://remote.social/inbox", "remote.social");
+    defer remote_actor.deinit(allocator);
     _ = try database.createPost(&db, allocator, 1, "Local post", "public");
 
     // Create remote post

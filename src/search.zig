@@ -36,27 +36,27 @@ pub const SearchOptions = struct {
 
 // Initialize search indexes
 pub fn initSearchIndexes(db: *database.Database) !void {
-    // Create FTS virtual tables for posts
-    try db.exec(
+    // Create FTS virtual tables for posts (requires FTS5 module)
+    db.exec(
         \\CREATE VIRTUAL TABLE IF NOT EXISTS posts_fts USING fts5(
         \\    content, username, hashtags,
         \\    content_id UNINDEXED,
         \\    tokenize = 'porter unicode61'
         \\)
-    , .{}, .{});
+    , .{}, .{}) catch return error.SQLiteError;
 
     // Create FTS virtual table for accounts
-    try db.exec(
+    db.exec(
         \\CREATE VIRTUAL TABLE IF NOT EXISTS accounts_fts USING fts5(
         \\    username, display_name, bio,
         \\    account_id UNINDEXED,
         \\    tokenize = 'porter unicode61'
         \\)
-    , .{}, .{});
+    , .{}, .{}) catch return error.SQLiteError;
 
     // Create triggers to keep FTS tables in sync
-    try createPostSearchTriggers(db);
-    try createAccountSearchTriggers(db);
+    createPostSearchTriggers(db) catch return error.SQLiteError;
+    createAccountSearchTriggers(db) catch return error.SQLiteError;
 }
 
 fn createPostSearchTriggers(db: *database.Database) !void {

@@ -24,6 +24,18 @@ pub fn init(_: std.mem.Allocator) !Database {
     });
 }
 
+/// Initialize an in-memory database for testing (isolated per call).
+pub fn initTestDb() !Database {
+    return try sqlite.Db.init(.{
+        .mode = .{ .Memory = {} },
+        .open_flags = .{
+            .write = true,
+            .create = true,
+        },
+        .threading_mode = .MultiThread,
+    });
+}
+
 pub fn migrate(db: *Database) !void {
     // Create users table
     try db.exec(
@@ -360,6 +372,31 @@ pub fn migrate(db: *Database) !void {
         \\)
     , .{}, .{});
 
+    // Create identity_mappings table for AT↔AP protocol relay
+    try db.exec(
+        \\CREATE TABLE IF NOT EXISTS identity_mappings (
+        \\    id INTEGER PRIMARY KEY AUTOINCREMENT,
+        \\    did TEXT UNIQUE NOT NULL,
+        \\    actor_uri TEXT UNIQUE NOT NULL,
+        \\    handle TEXT,
+        \\    domain TEXT NOT NULL,
+        \\    direction TEXT NOT NULL,
+        \\    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        \\)
+    , .{}, .{});
+
+    // Create relay_subscriptions table for AT↔AP protocol relay
+    try db.exec(
+        \\CREATE TABLE IF NOT EXISTS relay_subscriptions (
+        \\    id INTEGER PRIMARY KEY AUTOINCREMENT,
+        \\    subscriber_uri TEXT UNIQUE NOT NULL,
+        \\    protocol TEXT NOT NULL,
+        \\    status TEXT NOT NULL DEFAULT 'active',
+        \\    subscribed_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        \\    last_delivered_at DATETIME
+        \\)
+    , .{}, .{});
+
     // Create indexes for performance
     try db.exec("CREATE INDEX IF NOT EXISTS idx_posts_user_id ON posts(user_id)", .{}, .{});
     try db.exec("CREATE INDEX IF NOT EXISTS idx_posts_created_at ON posts(created_at DESC)", .{}, .{});
@@ -370,9 +407,13 @@ pub fn migrate(db: *Database) !void {
     try db.exec("CREATE INDEX IF NOT EXISTS idx_remote_actors_domain ON remote_actors(domain)", .{}, .{});
     try db.exec("CREATE INDEX IF NOT EXISTS idx_federation_follows_local ON federation_follows(local_user_id)", .{}, .{});
     try db.exec("CREATE INDEX IF NOT EXISTS idx_federation_follows_remote ON federation_follows(remote_actor_id)", .{}, .{});
+    try db.exec("CREATE INDEX IF NOT EXISTS idx_identity_mappings_did ON identity_mappings(did)", .{}, .{});
+    try db.exec("CREATE INDEX IF NOT EXISTS idx_identity_mappings_actor ON identity_mappings(actor_uri)", .{}, .{});
 
-    // Initialize search indexes
-    try search.initSearchIndexes(db);
+    // Initialize search indexes (FTS5 may not be available in all builds)
+    search.initSearchIndexes(db) catch |err| {
+        std.debug.print("Search indexes not available (FTS5 required): {}\n", .{err});
+    };
 
     std.debug.print("Database migrations completed\n", .{});
 }
@@ -1126,6 +1167,7 @@ pub fn getActorKeyPair(db: *Database, allocator: std.mem.Allocator, user_id: i64
 
 pub fn ensureActorKeyPair(db: *Database, allocator: std.mem.Allocator, user_id: i64) !struct { public_key_pem: []const u8, private_key_raw: [64]u8 } {
     if (try getActorKeyPair(db, allocator, user_id)) |existing| {
+        defer allocator.free(existing.private_key_raw.data);
         var raw: [64]u8 = undefined;
         if (existing.private_key_raw.data.len == 64) {
             @memcpy(&raw, existing.private_key_raw.data[0..64]);
@@ -1157,6 +1199,18 @@ pub const RemoteActor = struct {
     username: ?[]const u8 = null,
     display_name: ?[]const u8 = null,
     domain: []const u8,
+
+    /// Free all heap-allocated string fields returned by oneAlloc.
+    pub fn deinit(self: RemoteActor, allocator: std.mem.Allocator) void {
+        allocator.free(self.actor_uri);
+        allocator.free(self.inbox_url);
+        allocator.free(self.domain);
+        if (self.shared_inbox_url) |s| allocator.free(s);
+        if (self.public_key_pem) |s| allocator.free(s);
+        if (self.public_key_id) |s| allocator.free(s);
+        if (self.username) |s| allocator.free(s);
+        if (self.display_name) |s| allocator.free(s);
+    }
 };
 
 pub fn getRemoteActorByUri(db: *Database, allocator: std.mem.Allocator, actor_uri: []const u8) !?RemoteActor {
@@ -1201,6 +1255,12 @@ pub const FederationFollow = struct {
     remote_actor_id: ?i64,
     direction: []const u8,
     status: []const u8,
+
+    /// Free all heap-allocated string fields returned by oneAlloc.
+    pub fn deinit(self: FederationFollow, allocator: std.mem.Allocator) void {
+        allocator.free(self.direction);
+        allocator.free(self.status);
+    }
 };
 
 pub fn createFederationFollow(db: *Database, local_user_id: ?i64, remote_actor_id: ?i64, activity_uri: []const u8, direction: []const u8) !void {
