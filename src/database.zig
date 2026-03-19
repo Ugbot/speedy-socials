@@ -1,6 +1,7 @@
 const std = @import("std");
 const sqlite = @import("sqlite");
 const search = @import("search.zig");
+const crypto_sig = @import("crypto_sig.zig");
 
 pub const Database = sqlite.Db;
 
@@ -274,6 +275,91 @@ pub fn migrate(db: *Database) !void {
         \\)
     , .{}, .{});
 
+    // Create actor_keys table for Ed25519 key pairs per local user
+    try db.exec(
+        \\CREATE TABLE IF NOT EXISTS actor_keys (
+        \\    user_id INTEGER PRIMARY KEY,
+        \\    public_key_pem TEXT NOT NULL,
+        \\    private_key_raw BLOB NOT NULL,
+        \\    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        \\    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        \\)
+    , .{}, .{});
+
+    // Create remote_actors table for cached remote ActivityPub actors
+    try db.exec(
+        \\CREATE TABLE IF NOT EXISTS remote_actors (
+        \\    id INTEGER PRIMARY KEY AUTOINCREMENT,
+        \\    actor_uri TEXT UNIQUE NOT NULL,
+        \\    inbox_url TEXT NOT NULL,
+        \\    shared_inbox_url TEXT,
+        \\    public_key_pem TEXT,
+        \\    public_key_id TEXT,
+        \\    username TEXT,
+        \\    display_name TEXT,
+        \\    domain TEXT NOT NULL,
+        \\    avatar_url TEXT,
+        \\    last_fetched_at DATETIME,
+        \\    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        \\)
+    , .{}, .{});
+
+    // Create federation_follows table for cross-instance follow relationships
+    try db.exec(
+        \\CREATE TABLE IF NOT EXISTS federation_follows (
+        \\    id INTEGER PRIMARY KEY AUTOINCREMENT,
+        \\    local_user_id INTEGER,
+        \\    remote_actor_id INTEGER,
+        \\    activity_uri TEXT UNIQUE NOT NULL,
+        \\    direction TEXT NOT NULL,
+        \\    status TEXT NOT NULL DEFAULT 'pending',
+        \\    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        \\    FOREIGN KEY (local_user_id) REFERENCES users(id),
+        \\    FOREIGN KEY (remote_actor_id) REFERENCES remote_actors(id)
+        \\)
+    , .{}, .{});
+
+    // Create federation_activities table for deduplication log
+    try db.exec(
+        \\CREATE TABLE IF NOT EXISTS federation_activities (
+        \\    id INTEGER PRIMARY KEY AUTOINCREMENT,
+        \\    activity_uri TEXT UNIQUE NOT NULL,
+        \\    activity_type TEXT NOT NULL,
+        \\    actor_uri TEXT NOT NULL,
+        \\    object_uri TEXT,
+        \\    processed_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        \\)
+    , .{}, .{});
+
+    // Create remote_posts table for posts from remote actors
+    try db.exec(
+        \\CREATE TABLE IF NOT EXISTS remote_posts (
+        \\    id INTEGER PRIMARY KEY AUTOINCREMENT,
+        \\    post_uri TEXT UNIQUE NOT NULL,
+        \\    remote_actor_id INTEGER NOT NULL,
+        \\    content TEXT NOT NULL,
+        \\    content_warning TEXT,
+        \\    in_reply_to_uri TEXT,
+        \\    published_at DATETIME,
+        \\    received_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        \\    FOREIGN KEY (remote_actor_id) REFERENCES remote_actors(id)
+        \\)
+    , .{}, .{});
+
+    // Create remote_interactions table for remote likes/boosts on local posts
+    try db.exec(
+        \\CREATE TABLE IF NOT EXISTS remote_interactions (
+        \\    id INTEGER PRIMARY KEY AUTOINCREMENT,
+        \\    activity_uri TEXT UNIQUE NOT NULL,
+        \\    remote_actor_id INTEGER NOT NULL,
+        \\    local_post_id INTEGER NOT NULL,
+        \\    interaction_type TEXT NOT NULL,
+        \\    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        \\    FOREIGN KEY (remote_actor_id) REFERENCES remote_actors(id),
+        \\    FOREIGN KEY (local_post_id) REFERENCES posts(id)
+        \\)
+    , .{}, .{});
+
     // Create indexes for performance
     try db.exec("CREATE INDEX IF NOT EXISTS idx_posts_user_id ON posts(user_id)", .{}, .{});
     try db.exec("CREATE INDEX IF NOT EXISTS idx_posts_created_at ON posts(created_at DESC)", .{}, .{});
@@ -281,6 +367,9 @@ pub fn migrate(db: *Database) !void {
     try db.exec("CREATE INDEX IF NOT EXISTS idx_follows_following ON follows(following_id)", .{}, .{});
     try db.exec("CREATE INDEX IF NOT EXISTS idx_favourites_user ON favourites(user_id)", .{}, .{});
     try db.exec("CREATE INDEX IF NOT EXISTS idx_favourites_post ON favourites(post_id)", .{}, .{});
+    try db.exec("CREATE INDEX IF NOT EXISTS idx_remote_actors_domain ON remote_actors(domain)", .{}, .{});
+    try db.exec("CREATE INDEX IF NOT EXISTS idx_federation_follows_local ON federation_follows(local_user_id)", .{}, .{});
+    try db.exec("CREATE INDEX IF NOT EXISTS idx_federation_follows_remote ON federation_follows(remote_actor_id)", .{}, .{});
 
     // Initialize search indexes
     try search.initSearchIndexes(db);
@@ -1014,4 +1103,215 @@ pub fn getEmojiReactions(db: *Database, allocator: std.mem.Allocator, post_id: i
 fn loadPollsForPosts(_: *Database, _: std.mem.Allocator, _: []Post) !void {
     // Polls removed from Post struct to fix sqlite deserialization.
     // Use getPoll(db, allocator, poll_id) to fetch polls individually.
+}
+
+// =============================================================================
+// Federation: Key management
+// =============================================================================
+
+pub fn storeActorKeyPair(db: *Database, user_id: i64, public_key_pem: []const u8, private_key_raw: []const u8) !void {
+    try db.exec(
+        \\INSERT INTO actor_keys (user_id, public_key_pem, private_key_raw)
+        \\VALUES (?, ?, ?)
+    , .{}, .{ user_id, public_key_pem, sqlite.Blob{ .data = private_key_raw } });
+}
+
+pub fn getActorKeyPair(db: *Database, allocator: std.mem.Allocator, user_id: i64) !?struct { public_key_pem: []const u8, private_key_raw: sqlite.Blob } {
+    return try db.oneAlloc(struct { public_key_pem: []const u8, private_key_raw: sqlite.Blob }, allocator,
+        \\SELECT public_key_pem, private_key_raw FROM actor_keys WHERE user_id = ?
+    , .{}, .{user_id});
+}
+
+pub fn ensureActorKeyPair(db: *Database, allocator: std.mem.Allocator, user_id: i64) !struct { public_key_pem: []const u8, private_key_raw: [64]u8 } {
+    if (try getActorKeyPair(db, allocator, user_id)) |existing| {
+        var raw: [64]u8 = undefined;
+        if (existing.private_key_raw.data.len == 64) {
+            @memcpy(&raw, existing.private_key_raw.data[0..64]);
+        } else {
+            return error.InvalidKeyLength;
+        }
+        return .{ .public_key_pem = existing.public_key_pem, .private_key_raw = raw };
+    }
+
+    const kp = crypto_sig.generateKeyPair();
+    const pem = try crypto_sig.publicKeyToPem(allocator, kp.public_key);
+
+    try storeActorKeyPair(db, user_id, pem, &kp.secret_key);
+
+    return .{ .public_key_pem = pem, .private_key_raw = kp.secret_key };
+}
+
+// =============================================================================
+// Federation: Remote actors
+// =============================================================================
+
+pub const RemoteActor = struct {
+    id: i64,
+    actor_uri: []const u8,
+    inbox_url: []const u8,
+    shared_inbox_url: ?[]const u8 = null,
+    public_key_pem: ?[]const u8 = null,
+    public_key_id: ?[]const u8 = null,
+    username: ?[]const u8 = null,
+    display_name: ?[]const u8 = null,
+    domain: []const u8,
+};
+
+pub fn getRemoteActorByUri(db: *Database, allocator: std.mem.Allocator, actor_uri: []const u8) !?RemoteActor {
+    return try db.oneAlloc(RemoteActor, allocator,
+        \\SELECT id, actor_uri, inbox_url, shared_inbox_url, public_key_pem, public_key_id, username, display_name, domain
+        \\FROM remote_actors WHERE actor_uri = ?
+    , .{}, .{actor_uri});
+}
+
+pub fn getOrCreateRemoteActor(db: *Database, allocator: std.mem.Allocator, actor_uri: []const u8, inbox_url: []const u8, domain: []const u8) !RemoteActor {
+    if (try getRemoteActorByUri(db, allocator, actor_uri)) |existing| {
+        return existing;
+    }
+
+    const new_id = (try db.one(i64,
+        \\INSERT INTO remote_actors (actor_uri, inbox_url, domain)
+        \\VALUES (?, ?, ?)
+        \\RETURNING id
+    , .{}, .{ actor_uri, inbox_url, domain })) orelse return error.InsertFailed;
+
+    return RemoteActor{
+        .id = new_id,
+        .actor_uri = try allocator.dupe(u8, actor_uri),
+        .inbox_url = try allocator.dupe(u8, inbox_url),
+        .domain = try allocator.dupe(u8, domain),
+    };
+}
+
+pub fn updateRemoteActorKey(db: *Database, actor_id: i64, public_key_pem: []const u8, public_key_id: []const u8) !void {
+    try db.exec(
+        \\UPDATE remote_actors SET public_key_pem = ?, public_key_id = ?, last_fetched_at = CURRENT_TIMESTAMP WHERE id = ?
+    , .{}, .{ public_key_pem, public_key_id, actor_id });
+}
+
+// =============================================================================
+// Federation: Follow relationships
+// =============================================================================
+
+pub const FederationFollow = struct {
+    id: i64,
+    local_user_id: ?i64,
+    remote_actor_id: ?i64,
+    direction: []const u8,
+    status: []const u8,
+};
+
+pub fn createFederationFollow(db: *Database, local_user_id: ?i64, remote_actor_id: ?i64, activity_uri: []const u8, direction: []const u8) !void {
+    try db.exec(
+        \\INSERT INTO federation_follows (local_user_id, remote_actor_id, activity_uri, direction, status)
+        \\VALUES (?, ?, ?, ?, 'pending')
+    , .{}, .{ local_user_id, remote_actor_id, activity_uri, direction });
+}
+
+pub fn updateFederationFollowStatus(db: *Database, activity_uri: []const u8, new_status: []const u8) !void {
+    try db.exec(
+        \\UPDATE federation_follows SET status = ? WHERE activity_uri = ?
+    , .{}, .{ new_status, activity_uri });
+}
+
+pub fn getFederationFollowByUri(db: *Database, allocator: std.mem.Allocator, activity_uri: []const u8) !?FederationFollow {
+    return try db.oneAlloc(FederationFollow, allocator,
+        \\SELECT id, local_user_id, remote_actor_id, direction, status
+        \\FROM federation_follows WHERE activity_uri = ?
+    , .{}, .{activity_uri});
+}
+
+pub fn deleteFederationFollow(db: *Database, activity_uri: []const u8) !void {
+    try db.exec(
+        \\DELETE FROM federation_follows WHERE activity_uri = ?
+    , .{}, .{activity_uri});
+}
+
+// =============================================================================
+// Federation: Activity deduplication
+// =============================================================================
+
+pub fn isActivityProcessed(db: *Database, activity_uri: []const u8) !bool {
+    const count = try db.one(i64,
+        \\SELECT COUNT(*) FROM federation_activities WHERE activity_uri = ?
+    , .{}, .{activity_uri});
+    return count.? > 0;
+}
+
+pub fn markActivityProcessed(db: *Database, activity_uri: []const u8, activity_type: []const u8, actor_uri: []const u8, object_uri: ?[]const u8) !void {
+    try db.exec(
+        \\INSERT INTO federation_activities (activity_uri, activity_type, actor_uri, object_uri)
+        \\VALUES (?, ?, ?, ?)
+    , .{}, .{ activity_uri, activity_type, actor_uri, object_uri });
+}
+
+// =============================================================================
+// Federation: Remote posts
+// =============================================================================
+
+pub fn createRemotePost(db: *Database, post_uri: []const u8, remote_actor_id: i64, content: []const u8, content_warning: ?[]const u8, in_reply_to_uri: ?[]const u8, published_at: ?[]const u8) !void {
+    try db.exec(
+        \\INSERT INTO remote_posts (post_uri, remote_actor_id, content, content_warning, in_reply_to_uri, published_at)
+        \\VALUES (?, ?, ?, ?, ?, ?)
+    , .{}, .{ post_uri, remote_actor_id, content, content_warning, in_reply_to_uri, published_at });
+}
+
+pub fn deleteRemotePost(db: *Database, post_uri: []const u8) !void {
+    try db.exec(
+        \\DELETE FROM remote_posts WHERE post_uri = ?
+    , .{}, .{post_uri});
+}
+
+// =============================================================================
+// Federation: Remote interactions
+// =============================================================================
+
+pub fn createRemoteInteraction(db: *Database, activity_uri: []const u8, remote_actor_id: i64, local_post_id: i64, interaction_type: []const u8) !void {
+    try db.exec(
+        \\INSERT INTO remote_interactions (activity_uri, remote_actor_id, local_post_id, interaction_type)
+        \\VALUES (?, ?, ?, ?)
+    , .{}, .{ activity_uri, remote_actor_id, local_post_id, interaction_type });
+}
+
+pub fn deleteRemoteInteraction(db: *Database, activity_uri: []const u8) !void {
+    try db.exec(
+        \\DELETE FROM remote_interactions WHERE activity_uri = ?
+    , .{}, .{activity_uri});
+}
+
+// =============================================================================
+// Federation: Follower inbox resolution
+// =============================================================================
+
+pub fn getRemoteFollowerInboxes(db: *Database, allocator: std.mem.Allocator, local_user_id: i64) ![]const []const u8 {
+    const Row = struct { inbox: []const u8 };
+    const rows = try collectAlloc(db, Row, allocator,
+        \\SELECT DISTINCT COALESCE(ra.shared_inbox_url, ra.inbox_url) as inbox
+        \\FROM federation_follows ff
+        \\JOIN remote_actors ra ON ff.remote_actor_id = ra.id
+        \\WHERE ff.local_user_id = ? AND ff.direction = 'inbound' AND ff.status = 'accepted'
+    , allocator, .{local_user_id});
+    defer allocator.free(rows);
+
+    var inboxes = try allocator.alloc([]const u8, rows.len);
+    for (rows, 0..) |row, i| {
+        inboxes[i] = row.inbox;
+    }
+    return inboxes;
+}
+
+// =============================================================================
+// Federation: Counts for NodeInfo
+// =============================================================================
+
+pub fn getUserCount(db: *Database) !i64 {
+    return (try db.one(i64,
+        \\SELECT COUNT(*) FROM users
+    , .{}, .{})).?;
+}
+
+pub fn getPostCount(db: *Database) !i64 {
+    return (try db.one(i64,
+        \\SELECT COUNT(*) FROM posts
+    , .{}, .{})).?;
 }

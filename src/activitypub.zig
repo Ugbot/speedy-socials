@@ -521,10 +521,73 @@ fn handleIncomingDelete(db: *database.Database, allocator: std.mem.Allocator, ac
     _ = activity;
 }
 
-// Utility function to convert Unix timestamp to ISO 8601
-fn timestampToIso8601(allocator: std.mem.Allocator, _: []const u8) ![]u8 {
-    // Simple conversion - in production, use proper datetime formatting
-    return allocator.dupe(u8, "2024-01-01T00:00:00Z"); // Placeholder
+/// Convert a Unix epoch timestamp (seconds) to ISO 8601 format.
+pub fn unixTimestampToIso8601(allocator: std.mem.Allocator, ts: i64) ![]u8 {
+    const epoch_secs = std.time.epoch.EpochSeconds{ .secs = @intCast(ts) };
+    const epoch_day = epoch_secs.getEpochDay();
+    const year_day = epoch_day.calculateYearDay();
+    const month_day = year_day.calculateMonthDay();
+    const day_secs = epoch_secs.getDaySeconds();
+
+    const year: u16 = year_day.year;
+    const month: u8 = @intFromEnum(month_day.month);
+    const day: u8 = month_day.day_index + 1;
+    const hour: u8 = @intCast(day_secs.getHoursIntoDay());
+    const minute: u8 = @intCast(day_secs.getMinutesIntoHour());
+    const second: u8 = @intCast(day_secs.getSecondsIntoMinute());
+
+    return std.fmt.allocPrint(allocator, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z", .{
+        year, month, day, hour, minute, second,
+    });
+}
+
+/// Convert a SQLite DATETIME string ("YYYY-MM-DD HH:MM:SS") to ISO 8601.
+pub fn sqliteDatetimeToIso8601(allocator: std.mem.Allocator, sqlite_dt: []const u8) ![]u8 {
+    // Already in "YYYY-MM-DD HH:MM:SS" format, just replace space with T and append Z
+    if (sqlite_dt.len < 19) return allocator.dupe(u8, "1970-01-01T00:00:00Z");
+    var buf = try allocator.alloc(u8, 20);
+    @memcpy(buf[0..10], sqlite_dt[0..10]);
+    buf[10] = 'T';
+    @memcpy(buf[11..19], sqlite_dt[11..19]);
+    buf[19] = 'Z';
+    return buf;
+}
+
+/// Format a Unix timestamp as an HTTP Date header (RFC 7231).
+/// Example: "Thu, 19 Mar 2026 12:00:00 GMT"
+pub fn formatHttpDate(allocator: std.mem.Allocator, ts: i64) ![]u8 {
+    const epoch_secs = std.time.epoch.EpochSeconds{ .secs = @intCast(ts) };
+    const epoch_day = epoch_secs.getEpochDay();
+    const year_day = epoch_day.calculateYearDay();
+    const month_day = year_day.calculateMonthDay();
+    const day_secs = epoch_secs.getDaySeconds();
+
+    const day_names = [_][]const u8{ "Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed" };
+    // Epoch (1970-01-01) was a Thursday, day index 0
+    const day_of_week = @as(usize, @intCast(@rem(@as(i64, @intCast(epoch_day.day)) + 4, 7)));
+    const month_names = [_][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+
+    return std.fmt.allocPrint(allocator, "{s}, {d:0>2} {s} {d} {d:0>2}:{d:0>2}:{d:0>2} GMT", .{
+        day_names[day_of_week],
+        @as(u8, month_day.day_index + 1),
+        month_names[@as(usize, @intFromEnum(month_day.month)) - 1],
+        @as(u16, year_day.year),
+        @as(u8, @intCast(day_secs.getHoursIntoDay())),
+        @as(u8, @intCast(day_secs.getMinutesIntoHour())),
+        @as(u8, @intCast(day_secs.getSecondsIntoMinute())),
+    });
+}
+
+/// Legacy compatibility wrapper — accepts anytype to handle both []const u8 and i64 callers.
+fn timestampToIso8601(allocator: std.mem.Allocator, ts: anytype) ![]u8 {
+    const T = @TypeOf(ts);
+    if (T == i64) {
+        return unixTimestampToIso8601(allocator, ts);
+    } else if (T == []const u8 or T == [:0]const u8) {
+        return sqliteDatetimeToIso8601(allocator, ts);
+    } else {
+        @compileError("timestampToIso8601: expected i64 or []const u8, got " ++ @typeName(T));
+    }
 }
 
 // WebFinger support for user discovery
