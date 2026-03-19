@@ -110,4 +110,6 @@ fn createDemoData(allocator: std.mem.Allocator, db: *database.Database) !void {
 
 test {
     _ = @import("api.zig");
+    _ = @import("crypto_sig.zig");
+    _ = @import("test_federation.zig");
 }
