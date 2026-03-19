@@ -1116,8 +1116,10 @@ pub fn storeActorKeyPair(db: *Database, user_id: i64, public_key_pem: []const u8
     , .{}, .{ user_id, public_key_pem, sqlite.Blob{ .data = private_key_raw } });
 }
 
-pub fn getActorKeyPair(db: *Database, allocator: std.mem.Allocator, user_id: i64) !?struct { public_key_pem: []const u8, private_key_raw: sqlite.Blob } {
-    return try db.oneAlloc(struct { public_key_pem: []const u8, private_key_raw: sqlite.Blob }, allocator,
+pub const ActorKeyRow = struct { public_key_pem: []const u8, private_key_raw: sqlite.Blob };
+
+pub fn getActorKeyPair(db: *Database, allocator: std.mem.Allocator, user_id: i64) !?ActorKeyRow {
+    return try db.oneAlloc(ActorKeyRow, allocator,
         \\SELECT public_key_pem, private_key_raw FROM actor_keys WHERE user_id = ?
     , .{}, .{user_id});
 }

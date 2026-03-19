@@ -3,6 +3,7 @@ const sqlite = @import("sqlite");
 
 const api = @import("api.zig");
 const atproto_api = @import("api/atproto.zig");
+const activitypub = @import("activitypub.zig");
 const database = @import("database.zig");
 const server = @import("server.zig");
 const jobs = @import("jobs.zig");
@@ -28,6 +29,15 @@ pub fn main() !void {
 
     try createDemoData(allocator, &db);
     std.debug.print("Demo data created\n", .{});
+
+    // Configure instance domain from environment or default
+    if (std.process.getEnvVarOwned(allocator, "INSTANCE_DOMAIN")) |domain| {
+        activitypub.instance_domain = domain;
+    } else |_| {}
+    if (std.process.getEnvVarOwned(allocator, "INSTANCE_SCHEME")) |scheme| {
+        activitypub.instance_scheme = scheme;
+    } else |_| {}
+    std.debug.print("Instance: {s}://{s}\n", .{ activitypub.instance_scheme, activitypub.instance_domain });
 
     std.debug.print("Speedy Socials - High-performance Zig social media platform\n", .{});
     std.debug.print("Supports Mastodon API and AT Protocol\n", .{});

@@ -134,6 +134,12 @@ fn routeRequest(allocator: std.mem.Allocator, db: *database.Database, _: *websoc
     } else if (std.mem.eql(u8, path, "/.well-known/webfinger")) {
         // WebFinger for user discovery
         try handleWebFinger(allocator, db, &response, request);
+    } else if (std.mem.eql(u8, path, "/.well-known/nodeinfo")) {
+        // NodeInfo discovery
+        try handleNodeInfoDiscovery(allocator, &response);
+    } else if (std.mem.eql(u8, path, "/nodeinfo/2.0")) {
+        // NodeInfo 2.0 endpoint
+        try handleNodeInfo(allocator, db, &response);
     } else if (std.mem.startsWith(u8, path, "/users/")) {
         // ActivityPub actor endpoints
         try handleActivityPubActorRoutes(allocator, db, &response, method, path, request);
@@ -1784,7 +1790,7 @@ fn handleUnfeatureStatus(_: std.mem.Allocator, db: *database.Database, response:
 }
 
 // Handle WebFinger discovery
-fn handleWebFinger(allocator: std.mem.Allocator, _: *database.Database, response: anytype, request: *http.Server.Request) !void {
+fn handleWebFinger(allocator: std.mem.Allocator, db: *database.Database, response: anytype, request: *http.Server.Request) !void {
     // Parse resource parameter
     const query_param = request.head.target;
     const query_start = std.mem.indexOf(u8, query_param, "?") orelse {
@@ -1799,15 +1805,169 @@ fn handleWebFinger(allocator: std.mem.Allocator, _: *database.Database, response
         return;
     };
 
-    var fed = federation.Federation.init(allocator);
+    var fed = federation.Federation.init(allocator, db);
     try fed.handleWebFinger(response, resource);
 }
 
-// Handle ActivityPub actor routes
-fn handleActivityPubActorRoutes(_: std.mem.Allocator, _: *database.Database, response: anytype, _: http.Method, _: []const u8, _: *http.Server.Request) !void {
-    // Stub: ActivityPub actor routes
-    // Note: status cannot be changed after respondStreaming in Zig 0.15
-    try response.writer.writeAll("{\"error\": \"ActivityPub actor route not implemented\"}");
+// Handle ActivityPub actor routes: /users/{username}, /users/{username}/inbox, etc.
+fn handleActivityPubActorRoutes(allocator: std.mem.Allocator, db: *database.Database, response: anytype, method: http.Method, path: []const u8, request: *http.Server.Request) !void {
+    const prefix = "/users/";
+    if (!std.mem.startsWith(u8, path, prefix)) {
+        try response.writer.writeAll("{\"error\": \"Invalid path\"}");
+        return;
+    }
+
+    const remaining = path[prefix.len..];
+
+    // Split on '/' to get username and optional sub-path
+    var username: []const u8 = remaining;
+    var sub_path: ?[]const u8 = null;
+
+    if (std.mem.indexOf(u8, remaining, "/")) |slash_pos| {
+        username = remaining[0..slash_pos];
+        sub_path = remaining[slash_pos..];
+    }
+
+    if (username.len == 0) {
+        try response.writer.writeAll("{\"error\": \"Missing username\"}");
+        return;
+    }
+
+    // Look up user
+    const user = (try database.getUserByUsername(db, allocator, username)) orelse {
+        try response.writer.writeAll("{\"error\": \"User not found\"}");
+        return;
+    };
+    defer {
+        allocator.free(user.username);
+        allocator.free(user.email);
+        if (user.display_name) |dn| allocator.free(dn);
+        if (user.bio) |bio| allocator.free(bio);
+        if (user.avatar_url) |au| allocator.free(au);
+        if (user.header_url) |hu| allocator.free(hu);
+        allocator.free(user.created_at);
+    }
+
+    if (sub_path) |sp| {
+        if (std.mem.eql(u8, sp, "/inbox")) {
+            // POST to user inbox - delegate to federation handler
+            if (method != .POST) {
+                try response.writer.writeAll("{\"error\": \"Method not allowed\"}");
+                return;
+            }
+            var fed = federation.Federation.init(allocator, db);
+            try fed.handleInbox(response, request);
+        } else if (std.mem.eql(u8, sp, "/outbox")) {
+            // Return empty OrderedCollection for outbox
+            const outbox_url = try activitypub.getUserOutboxUrl(allocator, username);
+            defer allocator.free(outbox_url);
+
+            var json_buf = std.array_list.Managed(u8).init(allocator);
+            defer json_buf.deinit();
+            try std.fmt.format(json_buf.writer(),
+                \\{{"@context":"https://www.w3.org/ns/activitystreams","id":"{s}","type":"OrderedCollection","totalItems":0,"orderedItems":[]}}
+            , .{outbox_url});
+            try response.writer.writeAll(json_buf.items);
+        } else if (std.mem.eql(u8, sp, "/followers")) {
+            // Return OrderedCollection with follower count
+            const followers_url = try std.fmt.allocPrint(allocator, "{s}://{s}/users/{s}/followers", .{
+                activitypub.instance_scheme,
+                activitypub.instance_domain,
+                username,
+            });
+            defer allocator.free(followers_url);
+
+            var json_buf = std.array_list.Managed(u8).init(allocator);
+            defer json_buf.deinit();
+            try std.fmt.format(json_buf.writer(),
+                \\{{"@context":"https://www.w3.org/ns/activitystreams","id":"{s}","type":"OrderedCollection","totalItems":0}}
+            , .{followers_url});
+            try response.writer.writeAll(json_buf.items);
+        } else if (std.mem.eql(u8, sp, "/following")) {
+            // Return OrderedCollection with following count
+            const following_url = try std.fmt.allocPrint(allocator, "{s}://{s}/users/{s}/following", .{
+                activitypub.instance_scheme,
+                activitypub.instance_domain,
+                username,
+            });
+            defer allocator.free(following_url);
+
+            var json_buf = std.array_list.Managed(u8).init(allocator);
+            defer json_buf.deinit();
+            try std.fmt.format(json_buf.writer(),
+                \\{{"@context":"https://www.w3.org/ns/activitystreams","id":"{s}","type":"OrderedCollection","totalItems":0}}
+            , .{following_url});
+            try response.writer.writeAll(json_buf.items);
+        } else {
+            try response.writer.writeAll("{\"error\": \"Not found\"}");
+        }
+    } else {
+        // Base path: /users/{username} - return Person object
+        const person = try activitypub.createActorObject(db, allocator, user);
+
+        // Build JSON manually since we need @context at the top level
+        var json_buf = std.array_list.Managed(u8).init(allocator);
+        defer json_buf.deinit();
+
+        const w = json_buf.writer();
+        try w.writeAll("{\"@context\":[\"https://www.w3.org/ns/activitystreams\",\"https://w3id.org/security/v1\"],");
+        try std.fmt.format(w, "\"id\":\"{s}\",", .{person.id});
+        try w.writeAll("\"type\":\"Person\",");
+        try std.fmt.format(w, "\"preferredUsername\":\"{s}\",", .{person.preferredUsername});
+        if (person.name) |name| {
+            try std.fmt.format(w, "\"name\":\"{s}\",", .{name});
+        }
+        if (person.summary) |summary| {
+            try std.fmt.format(w, "\"summary\":\"{s}\",", .{summary});
+        }
+        try std.fmt.format(w, "\"inbox\":\"{s}\",", .{person.inbox});
+        try std.fmt.format(w, "\"outbox\":\"{s}\",", .{person.outbox});
+        try std.fmt.format(w, "\"followers\":\"{s}\",", .{person.followers});
+        try std.fmt.format(w, "\"following\":\"{s}\",", .{person.following});
+        try w.writeAll("\"publicKey\":{");
+        try std.fmt.format(w, "\"id\":\"{s}\",", .{person.publicKey.id});
+        try std.fmt.format(w, "\"owner\":\"{s}\",", .{person.publicKey.owner});
+        // Escape newlines in PEM for JSON
+        try w.writeAll("\"publicKeyPem\":\"");
+        for (person.publicKey.publicKeyPem) |c| {
+            if (c == '\n') {
+                try w.writeAll("\\n");
+            } else {
+                try w.writeByte(c);
+            }
+        }
+        try w.writeAll("\"},");
+        if (person.endpoints) |endpoints| {
+            if (endpoints.sharedInbox) |si| {
+                try std.fmt.format(w, "\"endpoints\":{{\"sharedInbox\":\"{s}\"}}", .{si});
+            }
+        }
+        try w.writeAll("}");
+
+        try response.writer.writeAll(json_buf.items);
+    }
+}
+
+// Handle NodeInfo discovery: /.well-known/nodeinfo
+fn handleNodeInfoDiscovery(allocator: std.mem.Allocator, response: anytype) !void {
+    var json_buf = std.array_list.Managed(u8).init(allocator);
+    defer json_buf.deinit();
+    try std.fmt.format(json_buf.writer(),
+        \\{{"links":[{{"rel":"http://nodeinfo.diaspora.software/ns/schema/2.0","href":"{s}://{s}/nodeinfo/2.0"}}]}}
+    , .{ activitypub.instance_scheme, activitypub.instance_domain });
+    try response.writer.writeAll(json_buf.items);
+}
+
+// Handle NodeInfo 2.0 endpoint: /nodeinfo/2.0
+fn handleNodeInfo(_: std.mem.Allocator, db: *database.Database, response: anytype) !void {
+    const user_count = database.getUserCount(db) catch 0;
+    const post_count = database.getPostCount(db) catch 0;
+
+    var buf: [1024]u8 = undefined;
+    const json = try std.fmt.bufPrint(&buf,
+        \\{{"version":"2.0","software":{{"name":"speedy-socials","version":"1.0.0"}},"protocols":["activitypub"],"usage":{{"users":{{"total":{}}},"localPosts":{}}},"openRegistrations":true}}
+    , .{ user_count, post_count });
+    try response.writer.writeAll(json);
 }
 
 // Handle shared inbox for federation
@@ -1818,8 +1978,8 @@ fn handleSharedInbox(allocator: std.mem.Allocator, db: *database.Database, respo
         return;
     }
 
-    var fed = federation.Federation.init(allocator);
-    try fed.handleInbox(db, response, request);
+    var fed = federation.Federation.init(allocator, db);
+    try fed.handleInbox(response, request);
 }
 
 // Handle list-specific routes

@@ -3,6 +3,10 @@ const database = @import("database.zig");
 const types = @import("types.zig");
 const crypto = std.crypto;
 
+/// Configurable instance domain and scheme. Set from main.zig at startup.
+pub var instance_domain: []const u8 = "speedy-socials.local";
+pub var instance_scheme: []const u8 = "https";
+
 pub const ActivityType = enum {
     Create,
     Update,
@@ -230,31 +234,31 @@ pub fn ServiceObject_deinit(self: *Activity.ServiceObject, allocator: std.mem.Al
 
 // Generate ActivityPub ID for user
 pub fn getUserActivityPubId(allocator: std.mem.Allocator, username: []const u8) ![]u8 {
-    return std.fmt.allocPrint(allocator, "https://speedy-socials.local/users/{s}", .{username});
+    return std.fmt.allocPrint(allocator, "{s}://{s}/users/{s}", .{ instance_scheme, instance_domain, username });
 }
 
 // Generate ActivityPub inbox URL for user
 pub fn getUserInboxUrl(allocator: std.mem.Allocator, username: []const u8) ![]u8 {
-    return std.fmt.allocPrint(allocator, "https://speedy-socials.local/users/{s}/inbox", .{username});
+    return std.fmt.allocPrint(allocator, "{s}://{s}/users/{s}/inbox", .{ instance_scheme, instance_domain, username });
 }
 
 // Generate ActivityPub outbox URL for user
 pub fn getUserOutboxUrl(allocator: std.mem.Allocator, username: []const u8) ![]u8 {
-    return std.fmt.allocPrint(allocator, "https://speedy-socials.local/users/{s}/outbox", .{username});
+    return std.fmt.allocPrint(allocator, "{s}://{s}/users/{s}/outbox", .{ instance_scheme, instance_domain, username });
 }
 
 // Create ActivityPub actor (Person) object
-pub fn createActorObject(_: *database.Database, allocator: std.mem.Allocator, user: database.User) !Activity.PersonObject {
+pub fn createActorObject(db: *database.Database, allocator: std.mem.Allocator, user: database.User) !Activity.PersonObject {
     const actor_id = try getUserActivityPubId(allocator, user.username);
     const inbox_url = try getUserInboxUrl(allocator, user.username);
     const outbox_url = try getUserOutboxUrl(allocator, user.username);
-    const followers_url = try std.fmt.allocPrint(allocator, "https://speedy-socials.local/users/{s}/followers", .{user.username});
-    const following_url = try std.fmt.allocPrint(allocator, "https://speedy-socials.local/users/{s}/following", .{user.username});
-    const liked_url = try std.fmt.allocPrint(allocator, "https://speedy-socials.local/users/{s}/liked", .{user.username});
+    const followers_url = try std.fmt.allocPrint(allocator, "{s}://{s}/users/{s}/followers", .{ instance_scheme, instance_domain, user.username });
+    const following_url = try std.fmt.allocPrint(allocator, "{s}://{s}/users/{s}/following", .{ instance_scheme, instance_domain, user.username });
+    const liked_url = try std.fmt.allocPrint(allocator, "{s}://{s}/users/{s}/liked", .{ instance_scheme, instance_domain, user.username });
 
-    // Generate RSA key pair for HTTP signatures
-    // TODO: Generate proper key pair
-    const public_key_pem = try allocator.dupe(u8, "-----BEGIN PUBLIC KEY-----\nMOCK_PUBLIC_KEY\n-----END PUBLIC KEY-----");
+    // Get or generate Ed25519 key pair for HTTP signatures
+    const key_pair = try database.ensureActorKeyPair(db, allocator, user.id);
+    const public_key_pem = try allocator.dupe(u8, key_pair.public_key_pem);
     const public_key_id = try std.fmt.allocPrint(allocator, "{s}#main-key", .{actor_id});
 
     return Activity.PersonObject{
@@ -285,14 +289,14 @@ pub fn createActorObject(_: *database.Database, allocator: std.mem.Allocator, us
             .publicKeyPem = public_key_pem,
         },
         .endpoints = .{
-            .sharedInbox = try allocator.dupe(u8, "https://speedy-socials.local/inbox"),
+            .sharedInbox = try std.fmt.allocPrint(allocator, "{s}://{s}/inbox", .{ instance_scheme, instance_domain }),
         },
     };
 }
 
 // Create ActivityPub Note object from post
 pub fn createNoteObject(_: *database.Database, allocator: std.mem.Allocator, post: database.Post, author_username: []const u8) !Activity.NoteObject {
-    const post_id = try std.fmt.allocPrint(allocator, "https://speedy-socials.local/posts/{}", .{post.id});
+    const post_id = try std.fmt.allocPrint(allocator, "{s}://{s}/posts/{}", .{ instance_scheme, instance_domain, post.id });
     const author_id = try getUserActivityPubId(allocator, author_username);
 
     // Convert created_at timestamp to ISO 8601
@@ -306,14 +310,14 @@ pub fn createNoteObject(_: *database.Database, allocator: std.mem.Allocator, pos
         .sensitive = post.content_warning != null,
         .summary = if (post.content_warning) |cw| try allocator.dupe(u8, cw) else null,
         .inReplyTo = if (post.reply_to_id) |reply_id| blk: {
-            break :blk try std.fmt.allocPrint(allocator, "https://speedy-socials.local/posts/{}", .{reply_id});
+            break :blk try std.fmt.allocPrint(allocator, "{s}://{s}/posts/{}", .{ instance_scheme, instance_domain, reply_id });
         } else null,
     };
 }
 
 // Create Create activity for a new post
 pub fn createCreateActivity(allocator: std.mem.Allocator, post: database.Post, author_username: []const u8) !Activity {
-    const activity_id = try std.fmt.allocPrint(allocator, "https://speedy-socials.local/activities/{}", .{post.id});
+    const activity_id = try std.fmt.allocPrint(allocator, "{s}://{s}/activities/{}", .{ instance_scheme, instance_domain, post.id });
     const actor_id = try getUserActivityPubId(allocator, author_username);
     const published = try timestampToIso8601(allocator, post.created_at);
 
@@ -330,7 +334,7 @@ pub fn createCreateActivity(allocator: std.mem.Allocator, post: database.Post, a
 
 // Create Follow activity
 pub fn createFollowActivity(allocator: std.mem.Allocator, follower_username: []const u8, following_username: []const u8) !Activity {
-    const activity_id = try std.fmt.allocPrint(allocator, "https://speedy-socials.local/activities/follow-{s}-{s}", .{ follower_username, following_username });
+    const activity_id = try std.fmt.allocPrint(allocator, "{s}://{s}/activities/follow-{s}-{s}", .{ instance_scheme, instance_domain, follower_username, following_username });
     const actor_id = try getUserActivityPubId(allocator, follower_username);
     const target_id = try getUserActivityPubId(allocator, following_username);
     const published = try timestampToIso8601(allocator, std.time.timestamp());
@@ -346,9 +350,9 @@ pub fn createFollowActivity(allocator: std.mem.Allocator, follower_username: []c
 
 // Create Like activity
 pub fn createLikeActivity(allocator: std.mem.Allocator, liker_username: []const u8, post_id: i64) !Activity {
-    const activity_id = try std.fmt.allocPrint(allocator, "https://speedy-socials.local/activities/like-{}-{}", .{ post_id, std.time.timestamp() });
+    const activity_id = try std.fmt.allocPrint(allocator, "{s}://{s}/activities/like-{}-{}", .{ instance_scheme, instance_domain, post_id, std.time.timestamp() });
     const actor_id = try getUserActivityPubId(allocator, liker_username);
-    const object_id = try std.fmt.allocPrint(allocator, "https://speedy-socials.local/posts/{}", .{post_id});
+    const object_id = try std.fmt.allocPrint(allocator, "{s}://{s}/posts/{}", .{ instance_scheme, instance_domain, post_id });
     const published = try timestampToIso8601(allocator, std.time.timestamp());
 
     return Activity{
@@ -362,9 +366,9 @@ pub fn createLikeActivity(allocator: std.mem.Allocator, liker_username: []const 
 
 // Create Announce (reblog/boost) activity
 pub fn createAnnounceActivity(allocator: std.mem.Allocator, booster_username: []const u8, post_id: i64) !Activity {
-    const activity_id = try std.fmt.allocPrint(allocator, "https://speedy-socials.local/activities/announce-{}-{}", .{ post_id, std.time.timestamp() });
+    const activity_id = try std.fmt.allocPrint(allocator, "{s}://{s}/activities/announce-{}-{}", .{ instance_scheme, instance_domain, post_id, std.time.timestamp() });
     const actor_id = try getUserActivityPubId(allocator, booster_username);
-    const object_id = try std.fmt.allocPrint(allocator, "https://speedy-socials.local/posts/{}", .{post_id});
+    const object_id = try std.fmt.allocPrint(allocator, "{s}://{s}/posts/{}", .{ instance_scheme, instance_domain, post_id });
     const published = try timestampToIso8601(allocator, std.time.timestamp());
 
     return Activity{
@@ -376,150 +380,7 @@ pub fn createAnnounceActivity(allocator: std.mem.Allocator, booster_username: []
     };
 }
 
-// HTTP signature verification for incoming activities
-pub fn verifyHttpSignature(allocator: std.mem.Allocator, request: anytype, body: []const u8) !bool {
-    // TODO: Implement HTTP signature verification
-    // This is complex and involves:
-    // 1. Parse Signature header
-    // 2. Fetch public key from actor
-    // 3. Verify signature against request headers and body
-    _ = allocator;
-    _ = request;
-    _ = body;
-    return true; // Placeholder
-}
-
-// Send activity to remote server
-pub fn sendActivity(allocator: std.mem.Allocator, activity: Activity, target_inbox: []const u8) !void {
-    // TODO: Implement HTTP POST to remote inbox with signature
-    // This involves:
-    // 1. Serialize activity to JSON
-    // 2. Create HTTP signature
-    // 3. POST to target inbox
-    // 4. Handle delivery failures and retries
-    _ = allocator;
-    _ = activity;
-    _ = target_inbox;
-}
-
-// Handle incoming activity
-pub fn handleIncomingActivity(db: *database.Database, allocator: std.mem.Allocator, activity: Activity) !void {
-    switch (activity.type) {
-        .Create => {
-            // Handle new post/note
-            switch (activity.object) {
-                .Note => |note| {
-                    try handleIncomingNote(db, allocator, note);
-                },
-                else => {
-                    // Ignore other object types for Create
-                },
-            }
-        },
-        .Follow => {
-            // Handle follow request
-            try handleIncomingFollow(db, allocator, activity);
-        },
-        .Like => {
-            // Handle like/favourite
-            try handleIncomingLike(db, allocator, activity);
-        },
-        .Announce => {
-            // Handle announce/reblog
-            try handleIncomingAnnounce(db, allocator, activity);
-        },
-        .Accept => {
-            // Handle follow acceptance
-            try handleIncomingAccept(db, allocator, activity);
-        },
-        .Reject => {
-            // Handle follow rejection
-            try handleIncomingReject(db, allocator, activity);
-        },
-        .Undo => {
-            // Handle undo (unfollow, unlike, etc.)
-            try handleIncomingUndo(db, allocator, activity);
-        },
-        .Update => {
-            // Handle profile/post updates
-            try handleIncomingUpdate(db, allocator, activity);
-        },
-        .Delete => {
-            // Handle deletion
-            try handleIncomingDelete(db, allocator, activity);
-        },
-    }
-}
-
-// Helper functions for handling incoming activities
-fn handleIncomingNote(db: *database.Database, allocator: std.mem.Allocator, note: Activity.NoteObject) !void {
-    // TODO: Store incoming post in database
-    // This involves:
-    // 1. Parse attributedTo to get author
-    // 2. Store post with federated = true
-    // 3. Handle mentions, hashtags, etc.
-    _ = db;
-    _ = allocator;
-    _ = note;
-}
-
-fn handleIncomingFollow(db: *database.Database, allocator: std.mem.Allocator, activity: Activity) !void {
-    // TODO: Handle incoming follow request
-    // 1. Check if auto-accept follows
-    // 2. Send Accept or Reject activity
-    _ = db;
-    _ = allocator;
-    _ = activity;
-}
-
-fn handleIncomingLike(db: *database.Database, allocator: std.mem.Allocator, activity: Activity) !void {
-    // TODO: Record incoming like
-    _ = db;
-    _ = allocator;
-    _ = activity;
-}
-
-fn handleIncomingAnnounce(db: *database.Database, allocator: std.mem.Allocator, activity: Activity) !void {
-    // TODO: Record incoming reblog
-    _ = db;
-    _ = allocator;
-    _ = activity;
-}
-
-fn handleIncomingAccept(db: *database.Database, allocator: std.mem.Allocator, activity: Activity) !void {
-    // TODO: Mark follow as accepted
-    _ = db;
-    _ = allocator;
-    _ = activity;
-}
-
-fn handleIncomingReject(db: *database.Database, allocator: std.mem.Allocator, activity: Activity) !void {
-    // TODO: Handle follow rejection
-    _ = db;
-    _ = allocator;
-    _ = activity;
-}
-
-fn handleIncomingUndo(db: *database.Database, allocator: std.mem.Allocator, activity: Activity) !void {
-    // TODO: Handle undo operations
-    _ = db;
-    _ = allocator;
-    _ = activity;
-}
-
-fn handleIncomingUpdate(db: *database.Database, allocator: std.mem.Allocator, activity: Activity) !void {
-    // TODO: Handle profile/post updates
-    _ = db;
-    _ = allocator;
-    _ = activity;
-}
-
-fn handleIncomingDelete(db: *database.Database, allocator: std.mem.Allocator, activity: Activity) !void {
-    // TODO: Handle deletion of posts/profiles
-    _ = db;
-    _ = allocator;
-    _ = activity;
-}
+// HTTP signature verification and incoming activity handling are in federation.zig and crypto_sig.zig
 
 /// Convert a Unix epoch timestamp (seconds) to ISO 8601 format.
 pub fn unixTimestampToIso8601(allocator: std.mem.Allocator, ts: i64) ![]u8 {
@@ -605,7 +466,7 @@ pub const WebFinger = struct {
 
 // Generate WebFinger response for user
 pub fn createWebFinger(allocator: std.mem.Allocator, username: []const u8) !WebFinger {
-    const subject = try std.fmt.allocPrint(allocator, "acct:{s}@speedy-socials.local", .{username});
+    const subject = try std.fmt.allocPrint(allocator, "acct:{s}@{s}", .{ username, instance_domain });
     const profile_url = try getUserActivityPubId(allocator, username);
 
     return WebFinger{
@@ -619,7 +480,7 @@ pub fn createWebFinger(allocator: std.mem.Allocator, username: []const u8) !WebF
             .{
                 .rel = "http://schemas.google.com/g/2010#updates-from",
                 .type = "application/atom+xml",
-                .href = try std.fmt.allocPrint(allocator, "https://speedy-socials.local/users/{s}.atom", .{username}),
+                .href = try std.fmt.allocPrint(allocator, "{s}://{s}/users/{s}.atom", .{ instance_scheme, instance_domain, username }),
             },
             .{
                 .rel = "self",
@@ -630,194 +491,16 @@ pub fn createWebFinger(allocator: std.mem.Allocator, username: []const u8) !WebF
     };
 }
 
-// HTTP Signature for federation
-pub const HttpSignature = struct {
-    key_id: []const u8,
-    algorithm: []const u8 = "rsa-sha256",
-    headers: []const u8,
-    signature: []const u8,
-
-    pub fn deinit(self: *HttpSignature, allocator: std.mem.Allocator) void {
-        allocator.free(self.key_id);
-        allocator.free(self.algorithm);
-        allocator.free(self.headers);
-        allocator.free(self.signature);
-    }
-};
-
-// Generate HTTP signature for federation requests
-pub fn generateHttpSignature(allocator: std.mem.Allocator, _: []const u8, key_id: []const u8, method: []const u8, target: []const u8, host: []const u8, date: []const u8, digest: ?[]const u8) !HttpSignature {
-    // Create signing string
-    var signing_string = std.array_list.Managed(u8).init(allocator);
-    defer signing_string.deinit();
-
-    try std.fmt.format(signing_string.writer(), "(request-target): {s} {s}\n", .{ std.ascii.lowerString(allocator, method), target });
-    try std.fmt.format(signing_string.writer(), "host: {s}\n", .{host});
-    try std.fmt.format(signing_string.writer(), "date: {s}\n", .{date});
-    if (digest) |d| {
-        try std.fmt.format(signing_string.writer(), "digest: {s}\n", .{d});
-    }
-
-    // Parse private key (simplified - in real implementation, use proper RSA parsing)
-    // For now, we'll use a placeholder signature
-    const signature_bytes = try allocator.alloc(u8, 256); // RSA-2048 signature size
-    defer allocator.free(signature_bytes);
-
-    // Generate random signature for demo (replace with real RSA signing)
-    crypto.random.bytes(signature_bytes);
-
-    var signature_b64 = std.array_list.Managed(u8).init(allocator);
-    errdefer signature_b64.deinit();
-
-    const encoder = std.base64.standard.Encoder;
-    try encoder.encodeWriter(signature_b64.writer(), signature_bytes);
-
-    return HttpSignature{
-        .key_id = try allocator.dupe(u8, key_id),
-        .algorithm = try allocator.dupe(u8, "rsa-sha256"),
-        .headers = try allocator.dupe(u8, "(request-target) host date" ++ if (digest != null) " digest" else ""),
-        .signature = signature_b64.toOwnedSlice(),
-    };
-}
-
-// Deliver activity to remote inbox
-pub fn deliverActivity(allocator: std.mem.Allocator, activity_json: []const u8, inbox_url: []const u8, private_key_pem: []const u8, key_id: []const u8) !void {
-    // Create HTTP client
-    var client = std.http.Client{ .allocator = allocator };
-    defer client.deinit();
-
-    // Prepare request
-    const uri = try std.Uri.parse(inbox_url);
-
-    // Generate date header
-    const now = std.time.timestamp();
-    // Format timestamp as a simple date string for HTTP Date header
-    const date_str = try std.fmt.allocPrint(allocator, "{d}", .{now});
-    defer allocator.free(date_str);
-
-    // Generate digest
-    const digest = try generateDigest(allocator, activity_json);
-    defer allocator.free(digest);
-
-    // Generate signature
-    const signature = try generateHttpSignature(allocator, private_key_pem, key_id, "POST", uri.path, uri.host.?, date_str, digest);
-    defer signature.deinit(allocator);
-
-    // Create signature header
-    const signature_header = try std.fmt.allocPrint(allocator,
-        \\keyId="{s}",algorithm="{s}",headers="{s}",signature="{s}"
-    , .{ signature.key_id, signature.algorithm, signature.headers, signature.signature });
-    defer allocator.free(signature_header);
-
-    // Make request
-    const headers = [_]std.http.Header{
-        .{ .name = "Host", .value = uri.host.? },
-        .{ .name = "Date", .value = date_str },
-        .{ .name = "Digest", .value = digest },
-        .{ .name = "Signature", .value = signature_header },
-        .{ .name = "Content-Type", .value = "application/activity+json" },
-        .{ .name = "User-Agent", .value = "SpeedySocials/1.0" },
-    };
-
-    var req = try client.request(.POST, uri, .{ .headers = &headers, .keep_alive = false });
-    defer req.deinit();
-
-    // Write body
-    req.transfer_encoding = .chunked;
-    try req.start();
-    _ = try req.writer().write(activity_json);
-    try req.finish();
-
-    // Read response
-    try req.wait();
-
-    if (req.response.status != .ok and req.response.status != .created and req.response.status != .accepted) {
-        std.debug.print("Federation delivery failed: {} to {s}\n", .{ req.response.status, inbox_url });
-        return error.DeliveryFailed;
-    }
-
-    std.debug.print("Successfully delivered activity to {s}\n", .{inbox_url});
-}
-
-// Generate SHA-256 digest for HTTP signature
-fn generateDigest(allocator: std.mem.Allocator, body: []const u8) ![]u8 {
-    var hash: [32]u8 = undefined;
-    crypto.hash.sha2.Sha256.hash(body, &hash);
-
-    var digest_buf = std.array_list.Managed(u8).init(allocator);
-    errdefer digest_buf.deinit();
-
-    try digest_buf.appendSlice("SHA-256=");
-    const encoder = std.base64.standard.Encoder;
-    try encoder.encodeWriter(digest_buf.writer(), &hash);
-
-    return digest_buf.toOwnedSlice();
-}
-
-// Activity delivery queue item
+// Activity delivery queue item (used by federation.zig)
 pub const DeliveryJob = struct {
     activity_json: []const u8,
     inbox_url: []const u8,
-    private_key_pem: []const u8,
+    private_key_raw: [64]u8,
     key_id: []const u8,
 
-    pub fn deinit(self: *DeliveryJob, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *const DeliveryJob, allocator: std.mem.Allocator) void {
         allocator.free(self.activity_json);
         allocator.free(self.inbox_url);
-        allocator.free(self.private_key_pem);
         allocator.free(self.key_id);
     }
 };
-
-// Process federation delivery job
-pub fn processDeliveryJob(allocator: std.mem.Allocator, job: DeliveryJob) !void {
-    defer job.deinit(allocator);
-
-    try deliverActivity(allocator, job.activity_json, job.inbox_url, job.private_key_pem, job.key_id);
-}
-
-// Queue activity for delivery to remote server
-pub fn queueActivityDelivery(allocator: std.mem.Allocator, _: anytype, activity_json: []const u8, inbox_url: []const u8, private_key_pem: []const u8, key_id: []const u8) !void {
-    const job = DeliveryJob{
-        .activity_json = try allocator.dupe(u8, activity_json),
-        .inbox_url = try allocator.dupe(u8, inbox_url),
-        .private_key_pem = try allocator.dupe(u8, private_key_pem),
-        .key_id = try allocator.dupe(u8, key_id),
-    };
-
-    // Add to job queue (simplified - in real implementation, pass to job system)
-    _ = job;
-    std.debug.print("Queued activity delivery to {s}\n", .{inbox_url});
-}
-
-// Get followers' inboxes for activity delivery
-pub fn getFollowersInboxes(allocator: std.mem.Allocator, _: *database.Database, _: i64) ![]const []const u8 {
-    var inboxes = std.array_list.Managed([]const u8).init(allocator);
-    errdefer {
-        for (inboxes.items) |inbox| allocator.free(inbox);
-        inboxes.deinit();
-    }
-
-    // Query followers and their shared inboxes
-    // This is a simplified version - in real implementation, you'd query the database
-    // for followers and their ActivityPub inboxes
-
-    // For demo, return some example inboxes
-    try inboxes.append(try allocator.dupe(u8, "https://mastodon.social/inbox"));
-    try inboxes.append(try allocator.dupe(u8, "https://pixelfed.social/inbox"));
-
-    return inboxes.toOwnedSlice();
-}
-
-// Broadcast activity to all followers
-pub fn broadcastToFollowers(allocator: std.mem.Allocator, db: *database.Database, job_queue: anytype, activity_json: []const u8, user_id: i64, private_key_pem: []const u8, key_id: []const u8) !void {
-    const inboxes = try getFollowersInboxes(allocator, db, user_id);
-    defer {
-        for (inboxes) |inbox| allocator.free(inbox);
-        allocator.free(inboxes);
-    }
-
-    for (inboxes) |inbox_url| {
-        try queueActivityDelivery(allocator, job_queue, activity_json, inbox_url, private_key_pem, key_id);
-    }
-}
