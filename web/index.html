@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Speedy Socials - Minimal HTMX Demo</title>
+    <script src="https://unpkg.com/htmx.org@1.9.10"></script>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; margin: 20px; background: #f5f5f5; }
+        .container { max-width: 600px; margin: 0 auto; background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+        .header { text-align: center; margin-bottom: 30px; }
+        .post { border-bottom: 1px solid #eee; padding: 15px 0; }
+        .post:last-child { border-bottom: none; }
+        .post-content { margin: 10px 0; line-height: 1.5; }
+        .post-meta { color: #666; font-size: 14px; }
+        .actions { margin-top: 10px; }
+        .reaction { display: inline-block; margin-right: 10px; padding: 4px 8px; background: #f0f0f0; border-radius: 4px; cursor: pointer; }
+        .reaction:hover { background: #e0e0e0; }
+        .create-post { margin-bottom: 20px; padding: 15px; background: #f9f9f9; border-radius: 8px; }
+        .create-post textarea { width: 100%; padding: 10px; border: 1px solid #ddd; border-radius: 4px; resize: vertical; }
+        .create-post button { background: #007bff; color: white; border: none; padding: 8px 16px; border-radius: 4px; cursor: pointer; margin-top: 10px; }
+        .create-post button:hover { background: #0056b3; }
+        .success { color: #28a745; padding: 10px; background: #d4edda; border-radius: 4px; margin: 10px 0; }
+        .error { color: #dc3545; padding: 10px; background: #f8d7da; border-radius: 4px; margin: 10px 0; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🚀 Speedy Socials</h1>
+            <p>A high-performance social media platform built with Zig</p>
+            <p><em>This is a demo interface using HTMX. The backend is fully functional!</em></p>
+        </div>
+
+        <div class="create-post">
+            <h3>Create a new post</h3>
+            <form hx-post="http://localhost:8080/create-post" hx-target="#result" hx-swap="innerHTML">
+                <textarea name="content" rows="3" placeholder="What's on your mind?" required></textarea>
+                <br>
+                <button type="submit">Post</button>
+            </form>
+            <div id="result"></div>
+        </div>
+
+        <div id="posts">
+            <h3>Recent Posts</h3>
+            <div class="post">
+                <div class="post-content">Welcome to Speedy Socials! 🚀 A high-performance social media platform built with Zig.</div>
+                <div class="post-meta">Posted by Demo User • 2025-01-01</div>
+                <div class="actions">
+                    <div class="reactions" id="reactions-1">
+                        <span class="reaction" hx-post="http://localhost:8080/react/1/👍" hx-target="#reactions-1" hx-swap="innerHTML">👍 0</span>
+                        <span class="reaction" hx-post="http://localhost:8080/react/1/❤️" hx-target="#reactions-1" hx-swap="innerHTML">❤️ 0</span>
+                        <span class="reaction" hx-post="http://localhost:8080/react/1/😂" hx-target="#reactions-1" hx-swap="innerHTML">😂 0</span>
+                    </div>
+                </div>
+            </div>
+
+            <div class="post">
+                <div class="post-content">Building decentralized social media is the future. No more walled gardens!</div>
+                <div class="post-meta">Posted by Demo User • 2025-01-01</div>
+                <div class="actions">
+                    <div class="reactions" id="reactions-2">
+                        <span class="reaction" hx-post="http://localhost:8080/react/2/👍" hx-target="#reactions-2" hx-swap="innerHTML">👍 0</span>
+                        <span class="reaction" hx-post="http://localhost:8080/react/2/❤️" hx-target="#reactions-2" hx-swap="innerHTML">❤️ 0</span>
+                        <span class="reaction" hx-post="http://localhost:8080/react/2/😂" hx-target="#reactions-2" hx-swap="innerHTML">😂 0</span>
+                    </div>
+                </div>
+            </div>
+
+            <div class="post">
+                <div class="post-content">Zig + SQLite = Blazing fast social media. Try it out!</div>
+                <div class="post-meta">Posted by Demo User • 2025-01-01</div>
+                <div class="actions">
+                    <div class="reactions" id="reactions-3">
+                        <span class="reaction" hx-post="http://localhost:8080/react/3/👍" hx-target="#reactions-3" hx-swap="innerHTML">👍 0</span>
+                        <span class="reaction" hx-post="http://localhost:8080/react/3/❤️" hx-target="#reactions-3" hx-swap="innerHTML">❤️ 0</span>
+                        <span class="reaction" hx-post="http://localhost:8080/react/3/😂" hx-target="#reactions-3" hx-swap="innerHTML">😂 0</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div style="margin-top: 40px; padding: 20px; background: #f8f9fa; border-radius: 8px;">
+            <h3>🚀 Features Implemented</h3>
+            <ul>
+                <li>✅ Mastodon API v1 (accounts, statuses, timelines)</li>
+                <li>✅ AT Protocol (DID documents, session management)</li>
+                <li>✅ ActivityPub Federation (WebFinger, actors, inbox/outbox)</li>
+                <li>✅ WebSocket Streaming (real-time updates)</li>
+                <li>✅ Full-text Search (posts, users, hashtags)</li>
+                <li>✅ OAuth2 Authentication</li>
+                <li>✅ Media Upload & Processing</li>
+                <li>✅ Rate Limiting & Caching</li>
+                <li>✅ Background Jobs (email, federation)</li>
+                <li>✅ Moderation (blocking, muting, reports)</li>
+                <li>✅ Polls & Voting System</li>
+                <li>✅ Bookmarks & Lists</li>
+                <li>✅ Featured Posts & Emoji Reactions</li>
+                <li>✅ Admin Dashboard & Statistics</li>
+            </ul>
+
+            <h3>🛠️ Tech Stack</h3>
+            <ul>
+                <li><strong>Backend:</strong> Zig (high-performance, memory-safe)</li>
+                <li><strong>Database:</strong> SQLite (embedded, fast)</li>
+                <li><strong>HTTP Server:</strong> std.http (built-in Zig)</li>
+                <li><strong>WebSockets:</strong> Custom implementation</li>
+                <li><strong>Frontend:</strong> HTMX (minimal, fast)</li>
+            </ul>
+        </div>
+    </div>
+</body>
+</html>
