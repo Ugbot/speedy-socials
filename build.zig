@@ -8,6 +8,22 @@ pub fn build(b: *std.Build) void {
     const sqlite_dep = b.dependency("sqlite", .{ .target = target, .optimize = optimize });
     const sqlite_mod = sqlite_dep.module("sqlite");
 
+    // ── third-party: TigerBeetle vendored utilities ────────────────
+    // We vendor selected files from TigerBeetle (Apache-2.0) under
+    // `src/third_party/tigerbeetle/`. Each sub-area is exposed as a
+    // separate module so `core` can re-export specific pieces without
+    // pulling in unrelated TB code. See `docs/adr/004-vendor-tigerbeetle.md`.
+    const tb_static_alloc_mod = b.addModule("tigerbeetle_static_allocator", .{
+        .root_source_file = b.path("src/third_party/tigerbeetle/alloc/static_allocator.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const tb_counting_alloc_mod = b.addModule("tigerbeetle_counting_allocator", .{
+        .root_source_file = b.path("src/third_party/tigerbeetle/alloc/counting_allocator.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     // ── core module ────────────────────────────────────────────────
     const core_mod = b.addModule("core", .{
         .root_source_file = b.path("src/core/root.zig"),
@@ -15,6 +31,8 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "sqlite", .module = sqlite_mod },
+            .{ .name = "tigerbeetle_static_allocator", .module = tb_static_alloc_mod },
+            .{ .name = "tigerbeetle_counting_allocator", .module = tb_counting_alloc_mod },
         },
     });
 

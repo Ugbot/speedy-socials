@@ -4,6 +4,7 @@
 pub const limits = @import("limits.zig");
 pub const assert = @import("assert.zig");
 pub const errors = @import("errors.zig");
+pub const alloc = @import("alloc.zig");
 pub const static = @import("static.zig");
 pub const arena = @import("arena.zig");
 pub const clock = @import("clock.zig");
@@ -38,6 +39,7 @@ test {
     _ = limits;
     _ = assert;
     _ = errors;
+    _ = alloc;
     _ = static;
     _ = arena;
     _ = clock;
