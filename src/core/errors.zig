@@ -74,6 +74,18 @@ pub const AtpError = error{
     BadTid,
     BadDid,
     BadCbor,
+    // Syntax validators added by `protocols/atproto/syntax.zig`. They live
+    // here rather than in their own set so callers (router, repo, relay)
+    // can match a single error type.
+    BadHandle,
+    BadNsid,
+    BadRkey,
+    BadAtUri,
+    BadMultibase,
+    BadMulticodec,
+    // Misc AT primitive failures.
+    BufferTooSmall,
+    NotImplemented,
     MstInvariant,
     CommitInvalid,
 };
