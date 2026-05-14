@@ -8,6 +8,16 @@ pub fn build(b: *std.Build) void {
     const sqlite_dep = b.dependency("sqlite", .{ .target = target, .optimize = optimize });
     const sqlite_mod = sqlite_dep.module("sqlite");
 
+    // ── vendored TigerBeetle intrusive collections ────────────────
+    // Exposed as its own module so the core module can `@import` it by
+    // name without having to reach outside the `src/core/` subtree.
+    // See `src/third_party/tigerbeetle/intrusive/*.zig` for the headers.
+    const tb_intrusive_mod = b.addModule("tb_intrusive", .{
+        .root_source_file = b.path("src/third_party/tigerbeetle/intrusive/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     // ── core module ────────────────────────────────────────────────
     const core_mod = b.addModule("core", .{
         .root_source_file = b.path("src/core/root.zig"),
@@ -15,6 +25,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "sqlite", .module = sqlite_mod },
+            .{ .name = "tb_intrusive", .module = tb_intrusive_mod },
         },
     });
 
