@@ -21,6 +21,14 @@ pub const http = struct {
     pub const router = @import("http/router.zig");
 };
 
+pub const ws = struct {
+    pub const handshake = @import("ws/handshake.zig");
+    pub const frame = @import("ws/frame.zig");
+    pub const messages = @import("ws/messages.zig");
+    pub const event_ring = @import("ws/event_ring.zig");
+    pub const registry = @import("ws/registry.zig");
+};
+
 test {
     _ = limits;
     _ = assert;
@@ -38,4 +46,9 @@ test {
     _ = http.response;
     _ = http.response_stream;
     _ = http.router;
+    _ = ws.handshake;
+    _ = ws.frame;
+    _ = ws.messages;
+    _ = ws.event_ring;
+    _ = ws.registry;
 }
