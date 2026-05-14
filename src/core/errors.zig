@@ -77,3 +77,33 @@ pub const AtpError = error{
     MstInvariant,
     CommitInvalid,
 };
+
+pub const WsError = error{
+    // Handshake — RFC 6455 §4
+    HandshakeMissingUpgrade,
+    HandshakeMissingConnection,
+    HandshakeBadVersion,
+    HandshakeMissingKey,
+    HandshakeBadMethod,
+    HandshakeBufferFull,
+    // Frame codec — RFC 6455 §5
+    FrameNeedMore,
+    FrameReservedBitsSet,
+    FrameUnknownOpcode,
+    FrameControlTooLarge,
+    FrameControlFragmented,
+    FrameUnmasked,
+    FrameMaskedFromServer,
+    FrameTooLarge,
+    FrameEncodeBufferTooSmall,
+    // Message reassembly
+    MessageTooLarge,
+    UnexpectedContinuation,
+    UnexpectedNonContinuation,
+    InvalidUtf8,
+    // Subscription registry
+    RegistryExhausted,
+    RegistryShardFull,
+    SubscriptionNotFound,
+    StreamKeyTooLong,
+};
