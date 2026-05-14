@@ -1,0 +1,18 @@
+when:
+  - event: ["push", "pull_request"]
+    branch: main
+
+engine: nixery
+
+dependencies:
+  nixpkgs:
+    - zig
+
+steps:
+  - name: check formatting
+    command: |
+      zig fmt --check .
+
+  - name: run tests
+    command: |
+      zig build test --summary all

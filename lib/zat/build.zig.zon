@@ -1,0 +1,19 @@
+.{
+    .name = .zat,
+    .version = "0.2.17",
+    .fingerprint = 0x8da9db57ee82fbe4,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .websocket = .{ .path = "../../third_party/zig-websocket" },
+        .@"atproto-interop-tests" = .{
+            .url = "https://github.com/bluesky-social/atproto-interop-tests/archive/35bb5638ab1e5ce71fb88a0c95953fc557ef1925.tar.gz",
+            .hash = "N-V-__8AAIp5AQCe4JjGmPl8CplTkCis8PF1qvn7QX6GwDfu",
+            .lazy = true,
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}

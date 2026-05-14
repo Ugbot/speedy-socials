@@ -1,0 +1,7 @@
+.zig-cache/
+zig-out/
+.env
+.env.*
+
+# Wisp docs build output (generated)
+site-out/

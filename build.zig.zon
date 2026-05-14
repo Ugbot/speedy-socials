@@ -2,17 +2,18 @@
     .name = .speedy_socials,
     .version = "0.0.0",
     .fingerprint = 0x91f6e54618b15db1,
-    .minimum_zig_version = "0.15.0",
+    .minimum_zig_version = "0.16.0",
     .dependencies = .{
-        .sqlite = .{
-            .url = "https://github.com/vrischmann/zig-sqlite/archive/refs/heads/master.tar.gz",
-            .hash = "sqlite-3.48.0-F2R_a8eODgD9X8XjvWlZ1K7C-tDuHae4FuShM2N-yIT2",
-        },
+        .sqlite = .{ .path = "third_party/zig-sqlite" },
         .atproto = .{ .path = "lib/atproto" },
     },
     .paths = .{
         "build.zig",
         "build.zig.zon",
         "src",
+        "lib",
+        "third_party",
+        "NOTICE",
+        "LICENSE",
     },
 }

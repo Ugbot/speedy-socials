@@ -1,0 +1,15 @@
+when:
+  - event: push
+    tag: "v*"
+
+engine: nixery
+
+dependencies:
+  nixpkgs:
+    - zig
+
+steps:
+  - name: build and publish docs to ATProto
+    command: |
+      zig build
+      ./zig-out/bin/publish-docs

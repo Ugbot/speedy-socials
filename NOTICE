@@ -1,0 +1,25 @@
+speedy-socials
+==============
+
+This project incorporates source code from third-party projects, absorbed
+into the tree (no longer tracked as submodules or external dependencies).
+We own and maintain this code going forward.
+
+zat (AT Protocol Zig library)
+-----------------------------
+Origin: https://tangled.sh/zat.dev/zat
+Author: nate nowack
+License: MIT (see lib/zat/LICENSE)
+Imported commit: 1c3eaec0f8825b47ed1390fc53872c5d12db2254 (v0.2.17-2-g1c3eaec)
+Imported date: 2026-05-14
+
+atproto (PDS scaffold, originally lib/atproto in this repo)
+-----------------------------------------------------------
+Origin: in-tree path dependency, authored alongside speedy-socials.
+License: same as parent project (see LICENSE).
+
+The plan for these absorbed sources is laid out in
+docs/adr/003-fork-protocol-libs.md and the audit plan at
+.claude/plans/audit-the-project-and-steady-tome.md. Code will be
+refactored into protocols/atproto/ under the Tiger Style + plugin
+contract introduced in later phases.
