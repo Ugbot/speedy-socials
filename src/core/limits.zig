@@ -179,5 +179,35 @@ pub const max_shutdown_phases: u32 = 16;
 /// Maximum readiness hooks plugins may register with the health module.
 pub const max_health_hooks: u32 = 16;
 
+// ── Media (W1.4) ───────────────────────────────────────────────────
+//
+// Bounded ceilings for the media plugin. Anything larger → HTTP 413.
+// These caps apply to *both* the raw POST body and the per-part body
+// inside a multipart/form-data envelope.
+
+/// Maximum size in bytes of an uploaded media blob. 16 MiB lets a
+/// typical hi-res still image / short voice clip through while keeping
+/// the per-connection arena pressure bounded.
+pub const max_upload_bytes: usize = 16 * 1024 * 1024;
+
+/// Maximum number of parts in a single multipart/form-data request.
+/// Tiger Style: assert a small constant; clients don't legitimately
+/// need more than this for media uploads (file + optional description
+/// + focus + form field slack).
+pub const max_multipart_parts: u32 = 8;
+
+/// Maximum number of header lines per multipart part.
+pub const max_multipart_headers_per_part: u32 = 16;
+
+/// Maximum length of a multipart boundary string. RFC 7578 allows up
+/// to 70; we add slack for delimiter framing.
+pub const max_multipart_boundary_bytes: usize = 80;
+
+/// Blob inline threshold: blobs strictly larger than this are stored
+/// on the filesystem under `media_root`, and the DB row holds an
+/// "fs:<relative-path>" pointer in place of the bytes. Smaller blobs
+/// live inline in the BLOB column.
+pub const media_inline_threshold_bytes: usize = 1 * 1024 * 1024;
+
 /// Maximum length of a shutdown phase / health hook label.
 pub const max_phase_name_bytes: usize = 32;
