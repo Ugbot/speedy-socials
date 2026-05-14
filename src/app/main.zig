@@ -8,6 +8,7 @@ const std = @import("std");
 const Io = std.Io;
 const core = @import("core");
 const echo = @import("protocol_echo");
+const atproto = @import("protocol_atproto");
 
 const limits = core.limits;
 const Connection = core.connection.Connection;
@@ -45,6 +46,7 @@ pub fn main() !void {
     // Register plugins. New protocol → new entry here. Core unchanged.
     var registry = core.plugin.Registry.init();
     _ = try registry.register(echo.plugin);
+    _ = try registry.register(atproto.plugin);
 
     try registry.initAll(&ctx);
     defer registry.deinitAll(&ctx);
@@ -67,4 +69,5 @@ pub fn main() !void {
 
 test {
     _ = echo;
+    _ = atproto;
 }

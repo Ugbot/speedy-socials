@@ -17,6 +17,7 @@ pub fn build(b: *std.Build) void {
     // module name. New protocol = new module here + one line in app.
     const plugin_modules = [_]struct { name: []const u8, path: []const u8 }{
         .{ .name = "protocol_echo", .path = "src/protocols/echo/plugin.zig" },
+        .{ .name = "protocol_atproto", .path = "src/protocols/atproto/plugin.zig" },
     };
 
     var plugin_imports_list: std.ArrayList(std.Build.Module.Import) = .empty;
@@ -73,4 +74,21 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_core_tests.step);
     test_step.dependOn(&run_app_tests.step);
+
+    // Per-plugin test step. Each plugin module's tests run independently
+    // so that referenced symbols (cid, mst, dag_cbor, …) get pulled in
+    // and their `test` blocks execute.
+    for (plugin_modules) |pm| {
+        const mod = b.createModule(.{
+            .root_source_file = b.path(pm.path),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "core", .module = core_mod },
+            },
+        });
+        const t = b.addTest(.{ .root_module = mod });
+        const run_t = b.addRunArtifact(t);
+        test_step.dependOn(&run_t.step);
+    }
 }
