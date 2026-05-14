@@ -7,9 +7,11 @@
 //!   2. After boot completes (DB open, statements prepared, writer
 //!      thread started), the hot path does *no* allocations.
 //!
-//! We enforce (2) by wrapping the GPA in a `PoisonAllocator` whose
-//! `alloc` panics. We swap the poison allocator in just before the hot
-//! loop and swap it back out after. Any hidden allocation aborts.
+//! We enforce (2) by wrapping the GPA in a TigerBeetle `StaticAllocator`.
+//! While in the `.init` phase, allocations pass through. Just before the
+//! hot loop we transition to `.static` so any allocation panics. After
+//! the hot loop we transition to `.deinit` so cleanup `free` calls
+//! still succeed.
 
 const std = @import("std");
 const core = @import("core");
@@ -30,44 +32,6 @@ const Out = struct {
     }
 };
 
-const PoisonState = struct {
-    underlying: std.mem.Allocator,
-    poisoned: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-};
-
-fn poisonAlloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
-    const self: *PoisonState = @ptrCast(@alignCast(ctx));
-    if (self.poisoned.load(.acquire)) {
-        std.debug.print("\nPOISON: allocation of {d} bytes on hot path!\n", .{len});
-        @panic("hot-path allocation");
-    }
-    return self.underlying.rawAlloc(len, alignment, ra);
-}
-fn poisonResize(ctx: *anyopaque, buf: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) bool {
-    const self: *PoisonState = @ptrCast(@alignCast(ctx));
-    return self.underlying.rawResize(buf, alignment, new_len, ra);
-}
-fn poisonRemap(ctx: *anyopaque, buf: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
-    const self: *PoisonState = @ptrCast(@alignCast(ctx));
-    return self.underlying.rawRemap(buf, alignment, new_len, ra);
-}
-fn poisonFree(ctx: *anyopaque, buf: []u8, alignment: std.mem.Alignment, ra: usize) void {
-    const self: *PoisonState = @ptrCast(@alignCast(ctx));
-    return self.underlying.rawFree(buf, alignment, ra);
-}
-
-fn poisonAllocator(state: *PoisonState) std.mem.Allocator {
-    return .{
-        .ptr = state,
-        .vtable = &.{
-            .alloc = poisonAlloc,
-            .resize = poisonResize,
-            .remap = poisonRemap,
-            .free = poisonFree,
-        },
-    };
-}
-
 fn nowNs() u64 {
     var ts: std.c.timespec = undefined;
     _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts);
@@ -78,8 +42,11 @@ pub fn main() !void {
     var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
 
-    var poison: PoisonState = .{ .underlying = gpa.allocator() };
-    _ = poisonAllocator(&poison);
+    var static_alloc = core.alloc.StaticAllocator.init(gpa.allocator());
+    defer static_alloc.deinit();
+    // `_ = static_alloc.allocator();` would be unused here — the bench
+    // doesn't pass an allocator into storage. We keep the StaticAllocator
+    // around solely as the tripwire for the hot path.
 
     // --- boot: open the DB, prepare statements, start the writer ----
     // Use a private file under /tmp so we don't clobber the dev DB.
@@ -113,9 +80,13 @@ pub fn main() !void {
 
     var handle = core.storage.Handle.init(&channel, &stmts);
 
-    // --- arm the allocator poison: nothing past this should alloc ---
-    poison.poisoned.store(true, .release);
-    defer poison.poisoned.store(false, .release);
+    // --- arm the allocator tripwire: nothing past this should alloc -
+    // Transition the StaticAllocator out of `.init`; any `alloc`/
+    // `resize` call hitting the wrapper now panics. The storage layer
+    // does not take an allocator on the hot path (see
+    // `core/storage/sqlite.zig`), so this catches code that takes one
+    // accidentally via a backdoor.
+    static_alloc.transition_from_init_to_static();
 
     // --- INSERT N rows ---------------------------------------------
     const t0 = nowNs();
@@ -182,8 +153,8 @@ pub fn main() !void {
     }
     const t2 = nowNs();
 
-    // Disarm before printing (printf may alloc).
-    poison.poisoned.store(false, .release);
+    // Disarm before printing (printf may alloc via std internals).
+    static_alloc.transition_from_static_to_deinit();
 
     const ins_ns = t1 - t0;
     const sel_ns = t2 - t1;

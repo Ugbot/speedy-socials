@@ -41,7 +41,19 @@ pub fn main() !void {
     // path. We do not pass `allocator` past this function.
     var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const gpa_allocator = gpa.allocator();
+
+    // Wrap the GPA in a TigerBeetle StaticAllocator. While in `.init`
+    // state, allocations pass through. After the boot sequence we flip
+    // to `.static`, after which any allocation panics — guaranteeing
+    // the hot path is allocation-free. The wrapper is heap-allocated so
+    // its address (used as the vtable `ptr`) is stable across the boot
+    // function frame.
+    const static_alloc = try gpa_allocator.create(core.alloc.StaticAllocator);
+    defer gpa_allocator.destroy(static_alloc);
+    static_alloc.* = core.alloc.StaticAllocator.init(gpa_allocator);
+    defer static_alloc.deinit();
+    const allocator = static_alloc.allocator();
 
     // Threaded Io backend. In Phase 6 we'll swap in a simulation backing
     // for deterministic replay tests.
@@ -183,6 +195,18 @@ pub fn main() !void {
     // don't belong to any registered plugin.
     try core.health.registerRoutes(&router, std.math.maxInt(u16));
     try registry.registerAllRoutes(&ctx, &router);
+
+    // ── Lock down the boot allocator ───────────────────────────────
+    // From here on, the static allocator panics on any `alloc`/`resize`
+    // call. The hot path is required to be allocation-free; this is the
+    // tripwire that proves it. See `src/third_party/tigerbeetle/alloc/`.
+    static_alloc.transition_from_init_to_static();
+    log_ptr.info("boot", "static allocator transitioned: hot path is now alloc-free");
+    // Flip back to `.deinit` at scope exit so all preceding
+    // `defer allocator.destroy(...)` calls can free their slots. Defers
+    // run LIFO, so registering this AFTER every destroy-defer means it
+    // runs FIRST on the way out.
+    defer static_alloc.transition_from_static_to_deinit();
 
     var server = try core.server.Server.init(
         .{ .bind_addr = "127.0.0.1", .port = 8080 },
