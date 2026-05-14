@@ -22,6 +22,7 @@ pub fn build(b: *std.Build) void {
     const plugin_modules = [_]struct { name: []const u8, path: []const u8 }{
         .{ .name = "protocol_echo", .path = "src/protocols/echo/plugin.zig" },
         .{ .name = "protocol_atproto", .path = "src/protocols/atproto/plugin.zig" },
+        .{ .name = "protocol_activitypub", .path = "src/protocols/activitypub/plugin.zig" },
     };
 
     var plugin_imports_list: std.ArrayList(std.Build.Module.Import) = .empty;
