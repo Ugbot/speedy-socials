@@ -8,6 +8,15 @@ pub fn build(b: *std.Build) void {
     const sqlite_dep = b.dependency("sqlite", .{ .target = target, .optimize = optimize });
     const sqlite_mod = sqlite_dep.module("sqlite");
 
+    // ── vendored TigerBeetle PRNG ──────────────────────────────────
+    // Lives in its own module so that `src/core/` can import a file
+    // that physically resides under `src/third_party/`.
+    const tb_prng_mod = b.addModule("tb_prng", .{
+        .root_source_file = b.path("src/third_party/tigerbeetle/prng/prng.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     // ── core module ────────────────────────────────────────────────
     const core_mod = b.addModule("core", .{
         .root_source_file = b.path("src/core/root.zig"),
@@ -15,6 +24,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "sqlite", .module = sqlite_mod },
+            .{ .name = "tb_prng", .module = tb_prng_mod },
         },
     });
 
