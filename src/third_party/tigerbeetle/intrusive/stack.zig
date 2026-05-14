@@ -124,11 +124,6 @@ const StackAny = struct {
     }
 };
 
-// TODO: re-enable when core.prng lands (TB Tranche 3). Upstream's "Stack: fuzz"
-// test depends on stdx.PRNG. Adoption-site tests in
-// src/protocols/atproto/mst.zig exercise push/pop/peek/empty against real
-// MST walks, so coverage is preserved.
-
 test "Stack: push/pop/peek/empty" {
     const testing = @import("std").testing;
     const Item = struct { link: StackLink = .{} };
@@ -167,4 +162,71 @@ test "Stack: push/pop/peek/empty" {
     try testing.expectEqual(@as(?*Item, &one), stack.pop());
     try testing.expect(stack.empty());
     try testing.expectEqual(@as(?*Item, null), stack.pop());
+}
+
+// PRNG-driven differential fuzz: mirror the Stack's contents in an
+// ArrayList model and assert push/pop/peek/contains agree across N random
+// operations. Re-enabled now that `tb_prng` is vendored.
+test "Stack: fuzz against ArrayList model" {
+    const testing = std.testing;
+    const PRNG = @import("tb_prng");
+
+    const Item = struct {
+        id: u32,
+        link: StackLink = .{},
+    };
+    const cap: u32 = 32;
+    var pool: [cap]Item = undefined;
+    for (&pool, 0..) |*it, i| it.* = .{ .id = @intCast(i) };
+
+    var stack = StackType(Item).init(.{ .capacity = cap, .verify_push = true });
+
+    // Mirror: each entry is either null (not in stack) or its position in
+    // the stack from the top. We use an ArrayList of pointers as the model.
+    var model: std.ArrayList(*Item) = .empty;
+    defer model.deinit(testing.allocator);
+
+    var prng = PRNG.from_seed(0xABCD_1234_5678_9ABC);
+    var op: u32 = 0;
+    const ops_total: u32 = 4_000;
+    while (op < ops_total) : (op += 1) {
+        const choose_push = prng.boolean();
+        if (choose_push and model.items.len < cap) {
+            // Pick an item not currently in the stack.
+            // Linear scan is fine — cap is small.
+            const start = prng.int_inclusive(u32, cap - 1);
+            var picked: ?*Item = null;
+            var k: u32 = 0;
+            while (k < cap) : (k += 1) {
+                const idx = (start + k) % cap;
+                const candidate = &pool[idx];
+                if (candidate.link.next == null) {
+                    // Confirm not the head either.
+                    if (!stack.contains(candidate)) {
+                        picked = candidate;
+                        break;
+                    }
+                }
+            }
+            if (picked) |p| {
+                stack.push(p);
+                try model.append(testing.allocator, p);
+                try testing.expect(stack.contains(p));
+                try testing.expectEqual(@as(?*Item, p), stack.peek());
+            }
+        } else if (model.items.len > 0) {
+            const expected = model.items[model.items.len - 1];
+            const got = stack.pop().?;
+            try testing.expectEqual(expected, got);
+            _ = model.pop();
+            try testing.expect(!stack.contains(expected));
+        } else {
+            try testing.expect(stack.empty());
+            try testing.expectEqual(@as(?*Item, null), stack.pop());
+        }
+        try testing.expectEqual(@as(u32, @intCast(model.items.len)), stack.count());
+        try testing.expectEqual(model.items.len == 0, stack.empty());
+    }
+    // Drain so the test's debug allocator doesn't see lingering links.
+    while (stack.pop() != null) {}
 }

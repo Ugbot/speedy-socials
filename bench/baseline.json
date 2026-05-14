@@ -1,0 +1,21 @@
+{
+  "platform": "darwin-aarch64",
+  "zig": "0.16.0",
+  "recorded_at": "2026-05-14",
+  "build": "ReleaseFast",
+  "notes": [
+    "Thresholds are conservative floors derived from the recorded run on an Apple Silicon laptop.",
+    "Re-record by running `zig build bench -Doptimize=ReleaseFast` and committing the produced bench/results.json values.",
+    "echo.rps_single_core is the in-process handler hot-path rps (no TCP loopback). A true cross-process loopback bench will land alongside W1.1 server-upgrades; bump the threshold then.",
+    "alloc_delta_per_request is enforced via TigerBeetle's StaticAllocator tripwire — any heap alloc during the hot loop panics."
+  ],
+  "metrics": {
+    "storage.insert_rate_rps": { "min": 20000, "current": 21304 },
+    "storage.select_rate_rps": { "min": 30000, "current": 67352 },
+    "echo.rps_single_core":     { "min": 25000, "current": 20661157 },
+    "echo.p50_ns":              { "current": 0 },
+    "echo.p99_ns":              { "current": 1000 },
+    "echo.p999_ns":             { "current": 1000 },
+    "alloc_delta_per_request":  { "max": 0, "current": 0 }
+  }
+}
