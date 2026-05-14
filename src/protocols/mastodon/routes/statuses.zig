@@ -9,6 +9,7 @@ const auth = @import("../auth.zig");
 const http_util = @import("../http_util.zig");
 const db_mod = @import("../db.zig");
 const serialize = @import("../serialize.zig");
+const streaming_ws = @import("streaming_ws.zig"); // W2.1
 
 fn parseId(s: []const u8) i64 {
     var val: i64 = 0;
@@ -42,6 +43,48 @@ pub fn handleCreateStatus(hc: *HandlerContext) anyerror!void {
     };
 
     try writeStatusJson(hc, st, db, status_id, user, status_text, now);
+
+    // W2.1: also publish the new status onto live WS subscribers.
+    // Best-effort — failures here must never change HTTP semantics.
+    if (st.ws_registry) |reg| {
+        var json_buf: [8 * 1024]u8 = undefined;
+        const json = renderStatusJson(st, db, status_id, user, status_text, now, &json_buf) catch null;
+        if (json) |j| streaming_ws.publishUpdate(reg, user.id, j);
+    }
+}
+
+/// Serialize the status into `out_buf` and return the slice — kept as
+/// a separate helper so the WS publisher can re-use it without going
+/// through the HTTP response builder.
+fn renderStatusJson(
+    st: *state_mod.State,
+    db: *@import("sqlite").c.sqlite3,
+    status_id: i64,
+    author: db_mod.UserRow,
+    content: []const u8,
+    published_unix: i64,
+    out_buf: []u8,
+) ![]const u8 {
+    var author_iso_buf: [32]u8 = undefined;
+    const author_iso = serialize.formatIsoTimestamp(author.created_at, &author_iso_buf) catch "1970-01-01T00:00:00Z";
+    var status_iso_buf: [32]u8 = undefined;
+    const status_iso = serialize.formatIsoTimestamp(published_unix, &status_iso_buf) catch "1970-01-01T00:00:00Z";
+    return try serialize.writeStatus(.{
+        .id = status_id,
+        .created_at_iso = status_iso,
+        .content_html = content,
+        .favourites_count = db_mod.countFavourites(db, status_id),
+        .reblogs_count = db_mod.countReblogs(db, status_id),
+        .account = .{
+            .id = author.id,
+            .username = author.username(),
+            .acct = author.username(),
+            .display_name = author.displayName(),
+            .note = author.bio(),
+            .hostname = st.hostname(),
+            .created_at_iso = author_iso,
+        },
+    }, out_buf);
 }
 
 pub fn handleGetStatus(hc: *HandlerContext) anyerror!void {
@@ -63,6 +106,12 @@ pub fn handleDeleteStatus(hc: *HandlerContext) anyerror!void {
     const id = parseId(id_str);
     const deleted = db_mod.deleteStatus(db, id, claims.user_id) catch false;
     if (!deleted) return http_util.writeError(hc, .not_found, "unknown status");
+
+    // W2.1: notify live subscribers that the status is gone.
+    if (st.ws_registry) |reg| {
+        streaming_ws.publishDelete(reg, claims.user_id, id);
+    }
+
     try http_util.writeJsonBody(hc, .ok, "{}");
 }
 

@@ -31,6 +31,10 @@ pub const State = struct {
         .secret_key = [_]u8{0} ** 64,
     },
 
+    /// WS subscription registry, wired by the composition root. Null
+    /// until attached. See `src/protocols/mastodon/routes/streaming_ws.zig`.
+    ws_registry: ?*core.ws.registry.Registry = null,
+
     pub fn hostname(self: *const State) []const u8 {
         if (self.hostname_len == 0) return "speedy-socials.local";
         return self.hostname_buf[0..self.hostname_len];
@@ -49,6 +53,10 @@ pub fn reset() void {
 
 pub fn attachDb(db: *c.sqlite3) void {
     instance.db = db;
+}
+
+pub fn attachWsRegistry(reg: *core.ws.registry.Registry) void {
+    instance.ws_registry = reg;
 }
 
 pub fn setClockAndRng(clock: Clock, rng: *Rng) void {

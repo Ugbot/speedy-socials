@@ -30,6 +30,8 @@ const mst = @import("mst.zig");
 const keypair = @import("keypair.zig");
 const tid_mod = @import("tid.zig");
 const firehose = @import("firehose.zig");
+const sync_firehose = @import("sync_firehose.zig");
+const state_mod = @import("state.zig");
 
 pub const Error = AtpError || StorageError;
 
@@ -299,9 +301,18 @@ pub fn commit(
 
     // Emit firehose event. Body = commit CBOR (signed). Subscribers
     // reconstruct individual records by reading atp_records.
-    _ = firehose.append(db, did, commit_cid_s, enc.written(), committed_at) catch |e| switch (e) {
+    const new_seq = firehose.append(db, did, commit_cid_s, enc.written(), committed_at) catch |e| switch (e) {
         else => return e,
     };
+
+    // W2.1: best-effort broadcast to live WS subscribers. The
+    // notification carries the seq number; subscribers re-fetch the
+    // commit body from SQLite (see `sync_firehose.zig`). A missing
+    // registry (early boot) silently drops — replay covers the gap
+    // on the next subscriber reconnect.
+    if (state_mod.get().ws_registry) |reg| {
+        sync_firehose.broadcastSeq(reg, new_seq);
+    }
 
     @memcpy(commit_out.cid_buf[0..commit_cid_s.len], commit_cid_s);
     commit_out.cid_len = @intCast(commit_cid_s.len);

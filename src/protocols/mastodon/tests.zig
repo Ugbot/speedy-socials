@@ -975,7 +975,10 @@ test "media: v2 returns 501" {
     try testing.expect(std.mem.startsWith(u8, call.statusLine(), "HTTP/1.1 501"));
 }
 
-test "streaming: user returns 501 with plumbing-pending header" {
+test "streaming: HTTP fallback returns 400 telling client to upgrade" {
+    // W2.1: real-time streaming is a WebSocket upgrade now. A plain
+    // GET against `/api/v1/streaming/*` falls through to this
+    // 400-with-JSON-body handler.
     const alloc = testing.allocator;
     var fx = Fixture.init(0xF5);
     try fx.start();
@@ -985,8 +988,8 @@ test "streaming: user returns 501 with plumbing-pending header" {
     var hc = call.handler();
     try streaming_routes.handleUser(&hc);
     const raw = call.body();
-    try testing.expect(std.mem.startsWith(u8, raw, "HTTP/1.1 501"));
-    try testing.expect(std.mem.indexOf(u8, raw, "Sec-WebSocket-Plumbing-Pending") != null);
+    try testing.expect(std.mem.startsWith(u8, raw, "HTTP/1.1 400"));
+    try testing.expect(std.mem.indexOf(u8, raw, "WebSocket Upgrade") != null);
 }
 
 // ── Apps ────────────────────────────────────────────────────────

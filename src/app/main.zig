@@ -237,6 +237,16 @@ pub fn main() !void {
     try core.health.registerRoutes(&router, std.math.maxInt(u16));
     try registry.registerAllRoutes(&ctx, &router);
 
+    // ── WebSocket subscription registry (W2.1) ─────────────────────
+    // Shared across plugins that emit/consume real-time streams
+    // (AT subscribeRepos, Mastodon streaming). Heap-allocated because
+    // it carries a static pool sized for `max_subscriptions` slots.
+    const ws_registry_ptr = try allocator.create(core.ws.registry.Registry);
+    defer allocator.destroy(ws_registry_ptr);
+    ws_registry_ptr.initInPlace();
+    atproto.attachWsRegistry(ws_registry_ptr);
+    mastodon.attachWsRegistry(ws_registry_ptr);
+
     // ── WebSocket upgrade router ───────────────────────────────────
     // Plugins that own a WS path (AT subscribeRepos, Mastodon
     // streaming, future bridges) register here. Frozen before the

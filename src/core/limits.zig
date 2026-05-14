@@ -119,6 +119,15 @@ pub const max_cached_pubkeys: u32 = 4096;
 /// streams/users.
 pub const max_subscriptions: u32 = 8192;
 
+/// WebSocket: maximum simultaneously-active subscriber connections per
+/// stream key (firehose / streaming.user etc). Producers fan out only
+/// to active subscriptions; this is a soft fairness ceiling the upgrade
+/// handler enforces by rejecting the handshake once the cap is hit so
+/// a single stream cannot exhaust the global subscription pool. See
+/// `src/protocols/atproto/sync_firehose.zig` and
+/// `src/protocols/mastodon/routes/streaming_ws.zig`.
+pub const max_inflight_subscribers: u32 = 256;
+
 /// WebSocket subscription shards — partitions the registry by
 /// `hash(stream) % shards` so the event loop owns disjoint shards.
 pub const ws_subscription_shards: u32 = 16;
