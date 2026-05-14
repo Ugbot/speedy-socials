@@ -139,6 +139,15 @@ pub fn main() !void {
     // rare, admin-bound, and synchronous (good enough for Phase 5).
     relay.state.attachDb(db);
 
+    // ── AT Protocol PDS wiring (Phase 4b) ──────────────────────────
+    var atp_workers: core.workers.Pool(8) = undefined;
+    atp_workers.initInPlace();
+    try atp_workers.start();
+    defer atp_workers.stop();
+
+    atproto.attachDb(db);
+    atproto.attachWorkers(&atp_workers);
+
     // ── HTTP server ────────────────────────────────────────────────
     var router = core.http.router.Router.init();
     // Health routes use plugin slot u16::MAX as a sentinel — they
