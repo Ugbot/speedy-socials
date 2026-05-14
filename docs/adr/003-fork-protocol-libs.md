@@ -59,3 +59,32 @@ Negative:
   bookkeeping as a `build.zig.zon` path dependency changes.
 - The absorbed source is the starting point for Phase 4 of the plan;
   it is not yet Tiger Style and is not yet plugin-shaped.
+
+## Retirement (2026-05-14)
+
+Phase 8 retired both absorbed trees once the Tiger Style rewrites under
+`src/protocols/atproto/` and `src/protocols/activitypub/` reached parity
+with the build graph and tests. The following were removed via
+`git rm`:
+
+- `lib/zat/` (~10,149 LOC) — MIT, nate nowack. Attribution preserved in
+  `NOTICE`. The structural inspiration (MST traversal, CBOR layout,
+  DID/JWT helpers) informed the rewrite in `src/protocols/atproto/`.
+- `lib/atproto/` (~2,737 LOC) — in-tree PDS scaffold. Superseded by
+  the same directory.
+- Legacy `src/*.zig` monolith (`activitypub.zig`, `database.zig`,
+  `federation.zig`, `server.zig`, `websocket.zig`, etc., ~10,091 LOC).
+- Legacy `src/api/` (~1,530 LOC) and `src/relay/` (~1,958 LOC).
+- `third_party/zig-websocket/` (~5,861 LOC) — only ever consumed by
+  `lib/zat/build.zig.zon`. With `lib/zat` gone its sole consumer is
+  gone; the new WebSocket layer lives in `src/core/ws/`.
+- `lib` removed from `build.zig.zon` `.paths`. Only the `sqlite` path
+  dependency remains.
+
+`third_party/zig-sqlite/` is **kept** — it is the live SQLite
+dependency.
+
+`zig build` and `zig build test` both stay green after the deletion;
+the legacy code was already outside the Phase 7 build graph.
+
+See `docs/phase8-retirement-inventory.md` for the per-file inventory.

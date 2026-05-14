@@ -1,5 +1,13 @@
 # Speedy Socials
 
+> **Note (2026-05-14):** The legacy monolithic layout under `src/*.zig`,
+> `src/api/`, `src/relay/`, and the absorbed `lib/atproto/` + `lib/zat/`
+> trees have been retired as of Phase 8. The current source of truth is
+> the Tiger Style layout under `src/core/`, `src/app/`, and
+> `src/protocols/`. See `docs/adr/003-fork-protocol-libs.md` and
+> `docs/phase8-retirement-inventory.md` for details. The feature copy
+> below predates the rewrite and is being re-validated.
+
 A **high-performance, production-ready social media platform** built with Zig that implements the complete Mastodon feature set. Supports both Mastodon API and Bluesky's AT Protocol with federation capabilities.
 
 ## 🚀 Features
@@ -38,18 +46,23 @@ A **high-performance, production-ready social media platform** built with Zig th
 
 ```
 src/
-├── main.zig           # Application entry point with DB setup
-├── server.zig         # HTTP/WebSocket server with routing
-├── database.zig       # SQLite database operations
-├── auth.zig           # OAuth2 authentication system
-├── activitypub.zig    # Federation protocol implementation
-├── media.zig          # File upload and processing
-├── websocket.zig      # Real-time streaming
-├── api/
-│   ├── mastodon.zig   # Mastodon API endpoints
-│   └── atproto.zig    # AT Protocol endpoints
-├── types.zig          # Shared data structures
-└── utils.zig          # Common utilities
+├── app/
+│   └── main.zig           # Entry point: wires core + plugins
+├── core/                  # Tiger Style runtime: HTTP, WS, storage,
+│   │                      # plugin contract, workers, metrics, health,
+│   │                      # shutdown, static pools.
+│   ├── root.zig           # Re-exports of the public core API
+│   ├── server.zig         # TCP accept loop + connection lifecycle
+│   ├── plugin.zig         # Plugin contract (Registry, Context)
+│   ├── http/              # Parser, request, response, router
+│   ├── ws/                # RFC 6455 framing + sharded sub registry
+│   ├── storage/           # Single-writer SQLite + prepared stmts
+│   └── workers.zig        # Bounded worker pool
+└── protocols/
+    ├── echo/              # Reference plugin
+    ├── atproto/           # AT Protocol (MST, CID, dag-cbor, TID, DPoP)
+    ├── activitypub/       # ActivityPub (sigs, NodeInfo, collections)
+    └── relay/             # AP↔AT bidirectional bridge
 ```
 
 ## 📡 API Endpoints
