@@ -15,6 +15,9 @@ const PluginError = errors.PluginError;
 const Router = @import("http/router.zig").Router;
 const Clock = @import("clock.zig").Clock;
 const Rng = @import("rng.zig").Rng;
+const storage_mod = @import("storage.zig");
+const Schema = storage_mod.Schema;
+const Handle = storage_mod.Handle;
 const assert_mod = @import("assert.zig");
 const assert = assert_mod.assert;
 const assertLe = assert_mod.assertLe;
@@ -22,16 +25,18 @@ const assertLe = assert_mod.assertLe;
 /// Bumped whenever the Plugin struct adds or rearranges fields in a way
 /// that would break ABI / API compatibility. Plugins record the version
 /// they were built against; the registry refuses mismatches.
-pub const plugin_abi_version: u32 = 1;
+pub const plugin_abi_version: u32 = 2;
 
 /// Cross-cutting handles plugins use at runtime. Stable references —
 /// the registry passes the same pointer to every hook.
 pub const Context = struct {
     clock: Clock,
     rng: *Rng,
+    /// Storage handle wired in Phase 2. Null only during early
+    /// bootstrapping (between core.init and storage subsystem start).
+    storage: ?*Handle = null,
     // Logger wired in Phase 7 (core/log.zig); until then plugins use
     // std.log directly.
-    // storage, workers added when Phases 2/1 land their concrete types.
     userdata: ?*anyopaque = null,
 };
 
@@ -52,8 +57,13 @@ pub const Plugin = struct {
     deinit: *const fn (state: ?*anyopaque, ctx: *Context) void,
 
     register_routes: ?*const fn (state: ?*anyopaque, ctx: *Context, router: *Router, plugin_index: u16) anyerror!void = null,
-    // register_schema, register_ws, register_jobs, register_metrics added
-    // when the corresponding subsystems land in later phases.
+
+    /// Called once at boot before migrations run. Plugins push their
+    /// `Migration` entries into the shared `Schema`. Phase 2.
+    register_schema: ?*const fn (state: ?*anyopaque, ctx: *Context, schema: *Schema) anyerror!void = null,
+
+    // register_ws, register_jobs, register_metrics added when the
+    // corresponding subsystems land in later phases.
 };
 
 pub const Registry = struct {
@@ -101,6 +111,16 @@ pub const Registry = struct {
             e.deinit(e.state, ctx);
         }
         self.initialized = false;
+    }
+
+    pub fn registerAllSchemas(self: *Registry, ctx: *Context, schema: *Schema) !void {
+        var i: u16 = 0;
+        while (i < self.count) : (i += 1) {
+            const e = self.entries[i];
+            if (e.register_schema) |hook| {
+                try hook(e.state, ctx, schema);
+            }
+        }
     }
 
     pub fn registerAllRoutes(self: *Registry, ctx: *Context, router: *Router) !void {

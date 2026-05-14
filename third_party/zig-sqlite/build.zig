@@ -6,7 +6,8 @@ const ResolvedTarget = std.Build.ResolvedTarget;
 const Query = std.Target.Query;
 const builtin = @import("builtin");
 
-const Preprocessor = @import("build/Preprocessor.zig");
+// Preprocessor step removed for Zig 0.16 build compatibility — only used to
+// regenerate loadable-ext headers, which are vendored in c/.
 
 fn getTarget(original_target: ResolvedTarget) ResolvedTarget {
     var tmp = original_target;
@@ -267,114 +268,10 @@ pub fn build(b: *std.Build) !void {
     //
     // Tools
     //
-
-    addPreprocessStep(b, sqlite_dep);
-}
-
-fn addPreprocessStep(b: *std.Build, sqlite_dep: *std.Build.Dependency) void {
-    var wf = b.addWriteFiles();
-
-    // Preprocessing step
-    const preprocess = PreprocessStep.create(b, .{
-        .source = sqlite_dep.path("."),
-        .target = wf.getDirectory(),
-    });
-    preprocess.step.dependOn(&wf.step);
-
-    const w = b.addUpdateSourceFiles();
-    w.addCopyFileToSource(preprocess.target.join(b.allocator, "loadable-ext-sqlite3.h") catch @panic("OOM"), "c/loadable-ext-sqlite3.h");
-    w.addCopyFileToSource(preprocess.target.join(b.allocator, "loadable-ext-sqlite3ext.h") catch @panic("OOM"), "c/loadable-ext-sqlite3ext.h");
-    w.step.dependOn(&preprocess.step);
-
-    const preprocess_headers = b.step("preprocess-headers", "Preprocess the headers for the loadable extensions");
-    preprocess_headers.dependOn(&w.step);
-}
-
-fn addZigcrypto(b: *std.Build, sqlite_mod: *std.Build.Module, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Step.InstallArtifact {
-    const mod = b.addModule("zigcryto", .{
-        .root_source_file = b.path("examples/zigcrypto.zig"),
-        .target = getTarget(target),
-        .optimize = optimize,
-    });
-    const exe = b.addLibrary(.{
-        .name = "zigcrypto",
-        .root_module = mod,
-        .version = null,
-        .linkage = .dynamic,
-    });
-    exe.root_module.addImport("sqlite", sqlite_mod);
-
-    const install_artifact = b.addInstallArtifact(exe, .{});
-    install_artifact.step.dependOn(&exe.step);
-
-    return install_artifact;
-}
-
-fn addZigcryptoTestRun(b: *std.Build, sqlite_mod: *std.Build.Module, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Step.Run {
-    const mod = b.addModule("zigcryto-test", .{
-        .root_source_file = b.path("examples/zigcrypto_test.zig"),
-        .target = getTarget(target),
-        .optimize = optimize,
-    });
-    const zigcrypto_test = b.addExecutable(.{
-        .name = "zigcrypto-test",
-        .root_module = mod,
-    });
-    zigcrypto_test.root_module.addImport("sqlite", sqlite_mod);
-
-    const install = b.addInstallArtifact(zigcrypto_test, .{});
-    install.step.dependOn(&zigcrypto_test.step);
-
-    const run = b.addRunArtifact(zigcrypto_test);
-    run.step.dependOn(&zigcrypto_test.step);
-
-    return run;
 }
 
 // See https://www.sqlite.org/compile.html for flags
 const EnableOptions = struct {
     // https://www.sqlite.org/fts5.html
     fts5: bool = true,
-};
-
-const PreprocessStep = struct {
-    const Config = struct {
-        source: std.Build.LazyPath,
-        target: std.Build.LazyPath,
-    };
-
-    step: std.Build.Step,
-
-    source: std.Build.LazyPath,
-    target: std.Build.LazyPath,
-
-    fn create(owner: *std.Build, config: Config) *PreprocessStep {
-        const step = owner.allocator.create(PreprocessStep) catch @panic("OOM");
-        step.* = .{
-            .step = std.Build.Step.init(.{
-                .id = std.Build.Step.Id.custom,
-                .name = "preprocess",
-                .owner = owner,
-                .makeFn = make,
-            }),
-            .source = config.source,
-            .target = config.target,
-        };
-
-        return step;
-    }
-
-    fn make(step: *std.Build.Step, _: std.Build.Step.MakeOptions) !void {
-        const ps: *PreprocessStep = @fieldParentPtr("step", step);
-        const owner = step.owner;
-
-        const sqlite3_h = try ps.source.path(owner, "sqlite3.h").getPath3(owner, step).toString(owner.allocator);
-        const sqlite3ext_h = try ps.source.path(owner, "sqlite3ext.h").getPath3(owner, step).toString(owner.allocator);
-
-        const loadable_sqlite3_h = try ps.target.path(owner, "loadable-ext-sqlite3.h").getPath3(owner, step).toString(owner.allocator);
-        const loadable_sqlite3ext_h = try ps.target.path(owner, "loadable-ext-sqlite3ext.h").getPath3(owner, step).toString(owner.allocator);
-
-        try Preprocessor.sqlite3(owner.allocator, sqlite3_h, loadable_sqlite3_h);
-        try Preprocessor.sqlite3ext(owner.allocator, sqlite3ext_h, loadable_sqlite3ext_h);
-    }
 };
