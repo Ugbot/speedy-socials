@@ -30,6 +30,7 @@ const core = @import("core");
 const FedError = core.errors.FedError;
 const Clock = core.clock.Clock;
 const limits = core.limits;
+const assert = core.assert.assert;
 const assertLe = core.assert.assertLe;
 
 pub const max_payload_inline_bytes: usize = 8 * 1024;
@@ -114,6 +115,18 @@ pub fn defaultDeliver(_: []const u8, _: []const u8, _: []const u8) DeliveryResul
 // Worker
 // ──────────────────────────────────────────────────────────────────────
 
+/// One in-flight delivery: lives in the per-tick `inflight` queue while
+/// the delivery hook is running. The intrusive link lets us push/remove
+/// in O(1) without an allocator, and the named queue makes the count
+/// observable for diagnostics (`ap_outbox_inflight`).
+pub const Delivery = struct {
+    id: i64,
+    attempts: u32,
+    link: core.intrusive.Queue(@This()).Link = .{},
+};
+
+const InflightQueue = core.intrusive.Queue(Delivery);
+
 pub const Worker = struct {
     thread: ?std.Thread = null,
     running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -126,6 +139,16 @@ pub const Worker = struct {
     delivered: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     failed: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     dead_lettered: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    /// Peak number of concurrently in-flight deliveries observed across
+    /// this worker's lifetime. Diagnostic only — read via `peakInflight`.
+    peak_inflight: u32 = 0,
+    /// Named intrusive queue of in-flight deliveries. The name is
+    /// surfaced to ops tooling so a stuck outbox is identifiable
+    /// without prior knowledge of the worker's internal layout.
+    inflight: InflightQueue = InflightQueue.init(.{
+        .name = "ap_outbox_inflight",
+        .verify_push = true,
+    }),
     /// Poll cadence — sleep this long when the queue is empty.
     idle_sleep_ns: u64 = 100 * std.time.ns_per_ms,
 
@@ -137,8 +160,17 @@ pub const Worker = struct {
         self.delivered.store(0, .release);
         self.failed.store(0, .release);
         self.dead_lettered.store(0, .release);
+        self.peak_inflight = 0;
         self.running.store(true, .release);
         self.thread = try std.Thread.spawn(.{}, mainLoop, .{self});
+    }
+
+    pub fn peakInflight(self: *const Worker) u32 {
+        return self.peak_inflight;
+    }
+
+    pub fn inflightQueueName(self: *const Worker) ?[]const u8 {
+        return self.inflight.name();
     }
 
     pub fn signalStop(self: *Worker) void {
@@ -188,20 +220,39 @@ pub const Worker = struct {
 
         var processed: u32 = 0;
         var rows_buf: [limits.max_inflight_deliveries]Row = undefined;
+        var deliveries: [limits.max_inflight_deliveries]Delivery = undefined;
         var n_rows: u32 = 0;
         while (n_rows < limits.max_inflight_deliveries) {
             const rc = c.sqlite3_step(stmt);
             if (rc == c.SQLITE_DONE) break;
             if (rc != c.SQLITE_ROW) break;
             rows_buf[n_rows] = readRow(stmt.?);
+            deliveries[n_rows] = .{
+                .id = rows_buf[n_rows].id,
+                .attempts = rows_buf[n_rows].attempts,
+            };
             n_rows += 1;
         }
 
-        // Run the hook for each row, then update state.
+        // Run the hook for each row, threading the Delivery through the
+        // named in-flight Queue so a stuck worker is inspectable from
+        // diagnostics. Push *before* the hook (so the queue reflects
+        // reality even if the hook blocks), remove on completion.
         var i: u32 = 0;
         while (i < n_rows) : (i += 1) {
             const r = &rows_buf[i];
+            const d = &deliveries[i];
+
+            self.inflight.push(d);
+            const cur: u32 = @intCast(self.inflight.count());
+            if (cur > self.peak_inflight) self.peak_inflight = cur;
+
             const result = hook(r.inboxSlice(), r.payloadSlice(), r.keyIdSlice());
+
+            // Always remove from the in-flight queue before mutating
+            // state — Tiger Style: bounded ownership transitions.
+            self.inflight.remove(d);
+
             switch (result) {
                 .success => {
                     self.markDone(r.id) catch {};
@@ -222,6 +273,8 @@ pub const Worker = struct {
             processed += 1;
         }
         assertLe(processed, limits.max_inflight_deliveries);
+        // Postcondition: the in-flight queue must be drained after every tick.
+        assert(self.inflight.empty());
         return processed;
     }
 
@@ -538,6 +591,52 @@ test "tickOnce respects next_attempt_at" {
 
     const n = try w.tickOnce();
     try testing.expectEqual(@as(u32, 0), n);
+}
+
+test "Worker in-flight queue exposes named diagnostic" {
+    // The intrusive Queue carries a name for ops dashboards. A worker
+    // that hasn't been started should still report the queue name and
+    // an empty count.
+    const w = Worker{};
+    try testing.expect(w.inflight.empty());
+    try testing.expectEqual(@as(u64, 0), w.inflight.count());
+    const got_name = w.inflightQueueName();
+    try testing.expect(got_name != null);
+    try testing.expectEqualStrings("ap_outbox_inflight", got_name.?);
+}
+
+test "Worker tickOnce tracks peak in-flight deliveries via Queue" {
+    const sqlite_mod = core.storage.sqlite;
+    const db = try sqlite_mod.openWriter(":memory:");
+    defer sqlite_mod.closeDb(db);
+    try schema.applyAllForTests(db);
+
+    var sc = core.clock.SimClock.init(500);
+    var rng = Rng.init(7);
+    // Enqueue 3 deliveries so tickOnce must push 3 onto the in-flight queue.
+    const recipients = [_]delivery.Recipient{
+        .{ .inbox = "https://x/inbox" },
+        .{ .inbox = "https://y/inbox" },
+        .{ .inbox = "https://z/inbox" },
+    };
+    _ = try delivery.enqueueDeliveries(db, sc.clock(), &recipients, "{}", "kid");
+
+    TestDeliver.ok_count = 0;
+    TestDeliver.force_result = .success;
+    setDeliverHook(TestDeliver.run);
+    defer setDeliverHook(null);
+
+    var w = Worker{};
+    w.db = db;
+    w.clock = sc.clock();
+    w.rng = &rng;
+    const n = try w.tickOnce();
+    try testing.expectEqual(@as(u32, 3), n);
+    // After the tick the queue must be empty (postcondition).
+    try testing.expect(w.inflight.empty());
+    try testing.expectEqual(@as(u64, 0), w.inflight.count());
+    // Peak observed must be >= 1 (each row passes through the queue).
+    try testing.expect(w.peakInflight() >= 1);
 }
 
 test "Worker thread start/signalStop/join" {

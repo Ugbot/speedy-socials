@@ -46,11 +46,17 @@ const errors = @import("errors.zig");
 const static = @import("static.zig");
 const arena_mod = @import("arena.zig");
 const assert_mod = @import("assert.zig");
+const intrusive = @import("intrusive.zig");
 
 const Arena = arena_mod.Arena;
 const assert = assert_mod.assert;
 const assertLe = assert_mod.assertLe;
 const BoundedMpsc = static.BoundedMpsc;
+
+/// Per-worker maximum queue-name length. Names are baked at
+/// `initInPlace` time and never reallocated — fixed buffer keeps the
+/// worker struct allocator-free.
+const worker_queue_name_bytes: usize = 32;
 
 /// `std.Thread.sleep` was removed in Zig 0.16. Use the libc syscall
 /// directly. Tiger Style: every place a thread parks is bounded.
@@ -166,6 +172,16 @@ pub const Job = struct {
     completion: ?*Completion,
 };
 
+/// Per-worker in-flight tracker. The MPSC channel above provides the
+/// wakeup signal; this Queue records what the worker is currently
+/// running so diagnostics and crash dumps can answer "what job is stuck
+/// on worker N?" without a second source of truth. Because each worker
+/// runs jobs sequentially the queue depth is always 0 or 1.
+pub const JobEntry = struct {
+    job: Job,
+    link: intrusive.Queue(@This()).Link = .{},
+};
+
 /// The compile-time-sized pool. `size_const` is the number of worker
 /// threads — capped at `limits.worker_pool_size`. Each worker owns a
 /// `worker_arena_bytes` slab.
@@ -196,6 +212,17 @@ pub fn Pool(comptime size_const: u32) type {
             arena_buf: [limits.worker_arena_bytes]u8 = undefined,
             arena: Arena = undefined,
             owner: *Self = undefined,
+            /// In-flight job tracker (depth 0 or 1; one slot per worker).
+            inflight: intrusive.Queue(JobEntry) = undefined,
+            /// The storage slot for the JobEntry currently in flight.
+            inflight_slot: JobEntry = .{ .job = undefined },
+            /// Stable name buffer for the queue. Format: "worker_<id>_inflight".
+            name_buf: [worker_queue_name_bytes]u8 = undefined,
+            name_len: u8 = 0,
+
+            pub fn inflightQueueName(self: *const Worker) []const u8 {
+                return self.name_buf[0..self.name_len];
+            }
         };
 
         /// Prime the worker structs in place. Call once on the heap-
@@ -209,6 +236,16 @@ pub fn Pool(comptime size_const: u32) type {
                 self.workers[i] = .{ .id = i };
                 self.workers[i].arena = Arena.init(&self.workers[i].arena_buf);
                 self.workers[i].owner = self;
+                self.workers[i].inflight_slot = .{ .job = undefined };
+                // Bake the queue name into the worker's stable buffer so
+                // the Queue can hold a slice pointer for the worker's lifetime.
+                const w = &self.workers[i];
+                const written = std.fmt.bufPrint(&w.name_buf, "worker_{d}_inflight", .{i}) catch unreachable;
+                w.name_len = @intCast(written.len);
+                w.inflight = intrusive.Queue(JobEntry).init(.{
+                    .name = w.name_buf[0..w.name_len],
+                    .verify_push = true,
+                });
                 self.threads[i] = null;
             }
         }
@@ -303,6 +340,16 @@ pub fn Pool(comptime size_const: u32) type {
             // way a panicking worker leaves the arena empty for the
             // next job.
             w.arena.reset();
+            // Record the job in the per-worker in-flight Queue so a
+            // diagnostic snapshot can answer "what is worker N running?".
+            // Invariant: the queue is empty between jobs.
+            assert(w.inflight.empty());
+            w.inflight_slot.job = job;
+            w.inflight.push(&w.inflight_slot);
+            defer {
+                w.inflight.remove(&w.inflight_slot);
+                assert(w.inflight.empty());
+            }
             const res = job.run(job.ctx, &w.arena);
             if (job.completion) |c| {
                 if (res) |_| {
@@ -545,6 +592,67 @@ test "Pool completion timeout returns Timeout" {
     // Eventually the job *does* finish; drain so `defer pool.stop()`
     // doesn't race with an in-flight job's completion.
     try c.wait();
+}
+
+test "Pool worker exposes per-thread in-flight Queue name" {
+    // The intrusive Queue carries a name "worker_N_inflight" baked at
+    // initInPlace. Verify every worker reports its own unique name and
+    // that the queue starts empty.
+    var pool: Pool(4) = undefined;
+    pool.initInPlace();
+    defer {} // no start: we're only checking the named queue surface.
+
+    var seen: [4][32]u8 = undefined;
+    var seen_lens: [4]u8 = undefined;
+    var i: u32 = 0;
+    while (i < 4) : (i += 1) {
+        const n = pool.workers[i].inflightQueueName();
+        try testing.expect(pool.workers[i].inflight.empty());
+        try testing.expectEqual(@as(u64, 0), pool.workers[i].inflight.count());
+        const wname = pool.workers[i].inflight.name().?;
+        try testing.expectEqualStrings(n, wname);
+        @memcpy(seen[i][0..n.len], n);
+        seen_lens[i] = @intCast(n.len);
+    }
+    // Verify uniqueness pairwise.
+    i = 0;
+    while (i < 4) : (i += 1) {
+        var j: u32 = i + 1;
+        while (j < 4) : (j += 1) {
+            const a = seen[i][0..seen_lens[i]];
+            const b = seen[j][0..seen_lens[j]];
+            try testing.expect(!std.mem.eql(u8, a, b));
+        }
+    }
+    // Spot-check format.
+    try testing.expectEqualStrings("worker_0_inflight", pool.workers[0].inflightQueueName());
+    try testing.expectEqualStrings("worker_3_inflight", pool.workers[3].inflightQueueName());
+}
+
+test "Pool worker in-flight Queue is drained between jobs" {
+    // After every job runs the queue must be empty (invariant in runOne).
+    // Drive several jobs through a single worker and verify the queue
+    // is empty after the pool finishes them.
+    var pool: Pool(1) = undefined;
+    pool.initInPlace();
+    try pool.start();
+    defer pool.stop();
+
+    var counter: Counter = .{};
+    const n: u32 = 8;
+    var completions: [8]Completion = undefined;
+    var i: u32 = 0;
+    while (i < n) : (i += 1) {
+        completions[i] = .init();
+        try pool.submit(.{ .run = incJob, .ctx = &counter, .completion = &completions[i] });
+    }
+    i = 0;
+    while (i < n) : (i += 1) try completions[i].wait();
+    // All jobs done. The queue must be empty — the runOne defer block
+    // always removes the slot, so a leak here would fire the assert
+    // in the worker thread first.
+    try testing.expect(pool.workers[0].inflight.empty());
+    try testing.expectEqual(@as(u64, 0), pool.workers[0].inflight.count());
 }
 
 test "Pool completedCount tracks drained jobs" {

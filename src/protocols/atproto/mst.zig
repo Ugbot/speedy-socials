@@ -145,19 +145,46 @@ pub fn Tree(comptime N: u32) type {
             return lo;
         }
 
+        /// A single tree-walker frame. Lives on the C stack (the caller's
+        /// frame block); the intrusive `link` field is what the explicit
+        /// `Stack` threads through. When the MST grows to a real 16-way
+        /// fanout these will hold (node_cid, child_index, …) instead of
+        /// a single u32 cursor, but the storage shape is already correct.
+        pub const Frame = struct {
+            /// First entry index this frame is responsible for visiting.
+            start: u32,
+            /// One past the last entry this frame visits.
+            stop: u32,
+            link: core.intrusive.Stack(@This()).Link = .{},
+        };
+
         /// In-order callback over every (key, value) pair.
         /// `Visitor` must define `fn onLeaf(*Self, []const u8, Cid) void`.
         pub fn walkInOrder(self: *const Self, comptime Visitor: type, visitor: *Visitor) void {
             // Already sorted in `entries`; the "walk" is a single linear
-            // pass with an *explicit* depth-1 stack frame to keep the
-            // shape consistent with the future tree implementation.
-            var stack: [max_walk_depth]u32 = undefined;
-            stack[0] = 0;
-            var top: u32 = 1;
-            while (top > 0) {
-                top -= 1;
-                var i = stack[top];
-                while (i < self.count) : (i += 1) {
+            // pass driven by an *explicit* TigerBeetle intrusive Stack
+            // (LIFO). Tiger Style: no recursion, fixed capacity (sized
+            // by `max_walk_depth`), every loop bounded by `self.count`.
+            //
+            // The leaf storage is flat, so today there's only ever one
+            // frame on the stack — but the shape is the same one the
+            // tree-shape implementation will use when each frame
+            // represents a node in the 16-way fanout.
+            var frames: [max_walk_depth]Frame = undefined;
+            var top: u32 = 0;
+            var stack = core.intrusive.Stack(Frame).init(.{
+                .capacity = max_walk_depth,
+                .verify_push = true,
+            });
+
+            assertLe(top, max_walk_depth);
+            frames[top] = .{ .start = 0, .stop = self.count };
+            stack.push(&frames[top]);
+            top += 1;
+
+            while (stack.pop()) |frame| {
+                var i = frame.start;
+                while (i < frame.stop) : (i += 1) {
                     assertLe(i, self.count);
                     visitor.onLeaf(&self.entries[i], self.entries[i].key(), self.entries[i].value);
                 }
@@ -267,6 +294,48 @@ test "mst: root CID is deterministic by content (order-independent)" {
     const r1 = try t1.getRoot(&s1);
     const r2 = try t2.getRoot(&s2);
     try std.testing.expectEqualSlices(u8, r1.cid.raw(), r2.cid.raw());
+}
+
+test "mst: walker visits every entry exactly once via intrusive Stack" {
+    // Cover the explicit-stack walker's push/pop path against many entries
+    // so the Stack(Frame) adoption is verified end-to-end.
+    var t = Tree(64).init();
+    var key_buf: [16]u8 = undefined;
+    var i: u8 = 0;
+    while (i < 32) : (i += 1) {
+        const k = try std.fmt.bufPrint(&key_buf, "k{x:0>2}", .{i});
+        _ = try t.put(k, fakeCid(i));
+    }
+
+    const Visitor = struct {
+        seen: [32]bool = [_]bool{false} ** 32,
+        count: u32 = 0,
+        fn onLeaf(self: *@This(), _: *const Entry, k: []const u8, _: cid_mod.Cid) void {
+            // Decode "kNN" hex suffix.
+            const idx = std.fmt.parseInt(u8, k[1..], 16) catch return;
+            std.testing.expect(!self.seen[idx]) catch return;
+            self.seen[idx] = true;
+            self.count += 1;
+        }
+    };
+    var v: Visitor = .{};
+    t.walkInOrder(Visitor, &v);
+    try std.testing.expectEqual(@as(u32, 32), v.count);
+    for (v.seen) |s| try std.testing.expect(s);
+}
+
+test "mst: walker Stack respects capacity bound" {
+    // Verify the Frame stack's reported capacity matches max_walk_depth.
+    // This is the structural guarantee the Tiger-Style explicit-stack
+    // walker depends on: the frame block on the C stack must be large
+    // enough that pushing up to capacity frames never overflows.
+    const TreeT = Tree(16);
+    var s = core.intrusive.Stack(TreeT.Frame).init(.{
+        .capacity = max_walk_depth,
+        .verify_push = true,
+    });
+    try std.testing.expectEqual(max_walk_depth, s.capacity());
+    try std.testing.expect(s.empty());
 }
 
 test "mst: root CID changes when contents change" {

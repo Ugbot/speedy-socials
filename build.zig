@@ -28,6 +28,11 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const tb_intrusive_mod = b.addModule("tb_intrusive", .{
+        .root_source_file = b.path("src/third_party/tigerbeetle/intrusive/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
 
     // ── core module ────────────────────────────────────────────────
     const core_mod = b.addModule("core", .{
@@ -39,6 +44,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "tigerbeetle_static_allocator", .module = tb_static_alloc_mod },
             .{ .name = "tigerbeetle_counting_allocator", .module = tb_counting_alloc_mod },
             .{ .name = "tb_prng", .module = tb_prng_mod },
+            .{ .name = "tb_intrusive", .module = tb_intrusive_mod },
         },
     });
 

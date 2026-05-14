@@ -37,22 +37,29 @@ pub const capacity: u32 = 256; // intentionally < limits.max_cached_pubkeys
 /// Default time-to-live for a cache entry: 24 hours.
 pub const default_ttl_ns: i128 = 24 * 60 * 60 * std.time.ns_per_s;
 
-const Entry = struct {
+/// KeyEntry sits in a fixed-capacity slab; the LRU order is threaded
+/// through the `back`/`next` intrusive-list pointers. `valid` flags the
+/// slot as occupied (free slots are not in the list).
+const KeyEntry = struct {
     key_id_buf: [keys.max_key_id_bytes]u8 = undefined,
     key_id_len: usize = 0,
     pk: PublicKey = undefined,
     inserted_at_ns: i128 = 0,
-    /// LRU counter — incremented on every cache access; the lowest is
-    /// the least-recently-used eviction victim.
-    last_used: u64 = 0,
     valid: bool = false,
+    // Intrusive doubly-linked-list links. The tail of the list is the
+    // *most* recently used entry (TB's `DoublyLinkedListType` pushes to
+    // tail). The head (`back == null`) is the LRU eviction victim.
+    back: ?*KeyEntry = null,
+    next: ?*KeyEntry = null,
 };
 
+const LruList = core.intrusive.List(KeyEntry);
+
 pub const Cache = struct {
-    entries: [capacity]Entry = [_]Entry{.{}} ** capacity,
+    entries: [capacity]KeyEntry = [_]KeyEntry{.{}} ** capacity,
     lock: Spinlock = .{},
-    /// Monotonic clock for LRU ordering.
-    tick: u64 = 0,
+    /// LRU order: tail = MRU, head = LRU.
+    lru: LruList = .{},
     /// Diagnostic counters.
     hits: u64 = 0,
     misses: u64 = 0,
@@ -61,12 +68,15 @@ pub const Cache = struct {
     pub fn reset(self: *Cache) void {
         self.lock.lock();
         defer self.lock.unlock();
+        // Drain the LRU list first (clears back/next pointers).
+        while (self.lru.pop()) |_| {}
         var i: u32 = 0;
         while (i < capacity) : (i += 1) {
             self.entries[i].valid = false;
             self.entries[i].key_id_len = 0;
+            self.entries[i].back = null;
+            self.entries[i].next = null;
         }
-        self.tick = 0;
         self.hits = 0;
         self.misses = 0;
         self.evictions = 0;
@@ -74,7 +84,8 @@ pub const Cache = struct {
 
     /// In-memory lookup only. Does NOT trigger a fetch. Returns null on
     /// miss. Honors TTL: a stale entry is treated as a miss and
-    /// invalidated in place.
+    /// invalidated in place. On hit, the entry is moved to the MRU end
+    /// of the LRU list in O(1) via the intrusive list.
     pub fn tryGet(self: *Cache, key_id: []const u8, now_ns: i128) ?PublicKey {
         self.lock.lock();
         defer self.lock.unlock();
@@ -82,20 +93,23 @@ pub const Cache = struct {
             self.misses += 1;
             return null;
         };
-        var e = &self.entries[idx];
+        const e = &self.entries[idx];
         // TTL check.
         if (now_ns - e.inserted_at_ns > default_ttl_ns) {
+            // Stale: drop from list, mark invalid, count miss.
+            self.lru.remove(e);
             e.valid = false;
             self.misses += 1;
             return null;
         }
-        self.tick += 1;
-        e.last_used = self.tick;
+        // Move-to-front (well: move-to-tail, since tail = MRU).
+        self.lru.remove(e);
+        self.lru.push(e);
         self.hits += 1;
         return e.pk;
     }
 
-    /// Insert (or refresh) an entry. Evicts the LRU slot on full.
+    /// Insert (or refresh) an entry. Evicts the LRU head on full.
     pub fn put(self: *Cache, pk: PublicKey, now_ns: i128) void {
         self.lock.lock();
         defer self.lock.unlock();
@@ -104,40 +118,50 @@ pub const Cache = struct {
 
         // Update if present.
         if (self.findLocked(key_id)) |idx| {
-            self.tick += 1;
-            self.entries[idx].pk = pk;
-            self.entries[idx].inserted_at_ns = now_ns;
-            self.entries[idx].last_used = self.tick;
-            self.entries[idx].valid = true;
+            const e = &self.entries[idx];
+            e.pk = pk;
+            e.inserted_at_ns = now_ns;
+            self.lru.remove(e);
+            self.lru.push(e);
             return;
         }
 
-        // Find empty or LRU slot.
-        var victim: u32 = 0;
-        var min_used: u64 = std.math.maxInt(u64);
-        var i: u32 = 0;
-        var any_empty: bool = false;
-        while (i < capacity) : (i += 1) {
-            if (!self.entries[i].valid) {
-                victim = i;
-                any_empty = true;
-                break;
-            }
-            if (self.entries[i].last_used < min_used) {
-                min_used = self.entries[i].last_used;
-                victim = i;
-            }
-        }
-        if (!any_empty) self.evictions += 1;
-
-        self.tick += 1;
-        var e = &self.entries[victim];
+        // Find a free slot. If none, evict the LRU head (front of list).
+        const victim = self.acquireSlotLocked();
+        const e = &self.entries[victim];
         @memcpy(e.key_id_buf[0..key_id.len], key_id);
         e.key_id_len = key_id.len;
         e.pk = pk;
         e.inserted_at_ns = now_ns;
-        e.last_used = self.tick;
         e.valid = true;
+        self.lru.push(e);
+    }
+
+    fn acquireSlotLocked(self: *Cache) u32 {
+        // First try a free slot — O(capacity) but only when not yet full.
+        var i: u32 = 0;
+        while (i < capacity) : (i += 1) {
+            if (!self.entries[i].valid) return i;
+        }
+        // Full: evict the least-recently-used entry. TigerBeetle's
+        // DoublyLinkedListType is LIFO at the tail end, so the LRU is at
+        // the *head* (walk back from tail until `.back == null`). The
+        // walk is bounded by `capacity` and only runs on eviction, which
+        // is rare relative to hits/inserts. Hit move-to-tail and stale-
+        // TTL removal stay O(1).
+        var head: *KeyEntry = self.lru.tail orelse unreachable;
+        var steps: u32 = 0;
+        while (head.back) |b| : (steps += 1) {
+            assertLe(steps, capacity);
+            head = b;
+        }
+        self.lru.remove(head);
+        head.valid = false;
+        self.evictions += 1;
+        const base: [*]KeyEntry = @ptrCast(&self.entries);
+        const offset = (@intFromPtr(head) - @intFromPtr(base)) / @sizeOf(KeyEntry);
+        assertLe(offset, capacity);
+        return @intCast(offset);
     }
 
     fn findLocked(self: *Cache, key_id: []const u8) ?u32 {
@@ -154,12 +178,7 @@ pub const Cache = struct {
     pub fn size(self: *Cache) u32 {
         self.lock.lock();
         defer self.lock.unlock();
-        var n: u32 = 0;
-        var i: u32 = 0;
-        while (i < capacity) : (i += 1) {
-            if (self.entries[i].valid) n += 1;
-        }
-        return n;
+        return @intCast(self.lru.count);
     }
 };
 
@@ -306,6 +325,55 @@ test "Cache eviction picks LRU slot" {
     try testing.expect(cache.tryGet("knew", 0) != null);
     // k0 still present (recently used).
     try testing.expect(cache.tryGet("k0", 0) != null);
+}
+
+test "Cache LRU list keeps MRU at tail and evicts head O(1)" {
+    // Verifies the TigerBeetle intrusive List adoption: every hit must
+    // move the entry to the tail and every full-cache insert must evict
+    // exactly the head (true LRU).
+    var cache: Cache = .{};
+    cache.reset();
+
+    // Fill the cache in order so insertion order == initial LRU order.
+    var name_buf: [32]u8 = undefined;
+    var i: u32 = 0;
+    while (i < capacity) : (i += 1) {
+        const name = std.fmt.bufPrint(&name_buf, "lru{d}", .{i}) catch unreachable;
+        const kid = try KeyId.fromSlice(name);
+        const pair = try keys.generateEd25519FromSeed(kid, keys.testSeed(@intCast(i & 0xff)));
+        cache.put(pair.public, 0);
+    }
+    try testing.expectEqual(capacity, cache.size());
+    // Head of list must be the very first inserted key.
+    try testing.expect(cache.lru.tail != null);
+
+    // Touch lru0 — it must move to the tail (MRU).
+    _ = cache.tryGet("lru0", 0);
+
+    // Insert one more — must evict lru1 (now the LRU head).
+    const new_kid = try KeyId.fromSlice("after");
+    const np = try keys.generateEd25519FromSeed(new_kid, keys.testSeed(0xaa));
+    cache.put(np.public, 0);
+
+    try testing.expectEqual(@as(u64, 1), cache.evictions);
+    try testing.expect(cache.tryGet("lru0", 0) != null);
+    try testing.expect(cache.tryGet("after", 0) != null);
+    // lru1 was evicted.
+    try testing.expect(cache.tryGet("lru1", 0) == null);
+}
+
+test "Cache LRU TTL eviction removes entry from intrusive list" {
+    var cache: Cache = .{};
+    cache.reset();
+    const kid = try KeyId.fromSlice("ttl");
+    const pair = try keys.generateEd25519FromSeed(kid, keys.testSeed(3));
+    cache.put(pair.public, 1000);
+    try testing.expectEqual(@as(u32, 1), cache.size());
+    // Stale read invalidates and removes from the list.
+    const stale = 1000 + 25 * 60 * 60 * std.time.ns_per_s;
+    try testing.expect(cache.tryGet("ttl", stale) == null);
+    try testing.expectEqual(@as(u32, 0), cache.size());
+    try testing.expect(cache.lru.empty());
 }
 
 test "default fetch hook stub returns KeyFetchFailed" {
