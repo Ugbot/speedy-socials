@@ -12,6 +12,10 @@ pub const plugin = @import("plugin.zig");
 pub const connection = @import("connection.zig");
 pub const server = @import("server.zig");
 pub const storage = @import("storage.zig");
+pub const log = @import("log.zig");
+pub const metrics = @import("metrics.zig");
+pub const shutdown = @import("shutdown.zig");
+pub const health = @import("health.zig");
 
 pub const http = struct {
     pub const parser = @import("http/parser.zig");
@@ -41,6 +45,10 @@ test {
     _ = connection;
     _ = server;
     _ = storage;
+    _ = log;
+    _ = metrics;
+    _ = shutdown;
+    _ = health;
     _ = http.parser;
     _ = http.request;
     _ = http.response;

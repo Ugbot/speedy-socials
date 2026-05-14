@@ -123,3 +123,53 @@ pub const max_http_target_bytes: usize = 2048;
 
 /// Listen backlog passed to the OS.
 pub const tcp_listen_backlog: u31 = 1024;
+
+// ── Observability (Phase 7) ─────────────────────────────────────────
+//
+// Logs are the canonical Tiger Style ring-buffer use case: lossy by
+// design. When the drain thread falls behind, the producer overwrites
+// the oldest pending entry rather than blocking the hot path. The ring
+// is sized large enough that overwrite under normal load is rare; a
+// burst that overflows is preferable to back-pressuring a request
+// handler. See `core/log.zig` for the full philosophy.
+
+/// Capacity of the in-memory log ring. Must be a power of two so the
+/// ring can use fast index masking. 4096 entries × ~512 bytes ≈ 2 MiB
+/// worst-case in-memory log buffer.
+pub const log_ring_capacity: u32 = 4096;
+
+/// Maximum length in bytes of a single log message body. Messages
+/// longer than this are truncated, never reallocated.
+pub const max_log_msg_bytes: usize = 256;
+
+/// Maximum structured key-value pairs attached to a single log entry.
+pub const max_log_kv: u32 = 8;
+
+/// Maximum length of a single log KV key or value (UTF-8 bytes).
+pub const max_log_kv_bytes: usize = 64;
+
+/// Maximum log scope label length ("storage", "http", "ap.inbox", ...).
+pub const max_log_scope_bytes: usize = 32;
+
+/// Metrics registry capacity. Each metric is a stable handle assigned
+/// at registration time.
+pub const max_metrics: u32 = 256;
+
+/// Maximum length of a metric name including any plugin prefix.
+pub const max_metric_name_bytes: usize = 64;
+
+/// Maximum length of a metric help string (Prometheus HELP line).
+pub const max_metric_help_bytes: usize = 128;
+
+/// Maximum histogram buckets (LE bucket bounds) per histogram metric.
+pub const max_histogram_buckets: u32 = 16;
+
+/// Maximum phases registered with the shutdown coordinator. Each phase
+/// runs sequentially in registration order on shutdown.
+pub const max_shutdown_phases: u32 = 16;
+
+/// Maximum readiness hooks plugins may register with the health module.
+pub const max_health_hooks: u32 = 16;
+
+/// Maximum length of a shutdown phase / health hook label.
+pub const max_phase_name_bytes: usize = 32;
