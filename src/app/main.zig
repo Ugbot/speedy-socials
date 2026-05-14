@@ -10,6 +10,7 @@ const core = @import("core");
 const echo = @import("protocol_echo");
 const atproto = @import("protocol_atproto");
 const activitypub = @import("protocol_activitypub");
+const mastodon = @import("protocol_mastodon");
 const relay = @import("protocol_relay");
 
 const limits = core.limits;
@@ -130,6 +131,7 @@ pub fn main() !void {
     _ = try registry.register(echo.plugin);
     _ = try registry.register(atproto.plugin);
     _ = try registry.register(activitypub.plugin);
+    _ = try registry.register(mastodon.plugin);
     // Relay registers AFTER its siblings — its `init` calls
     // `Registry.find` for "atproto" and "activitypub" (the sole
     // sibling-lookup carve-out; see src/protocols/relay/plugin.zig).
@@ -167,6 +169,10 @@ pub fn main() !void {
     activitypub.attachDb(db);
     activitypub.attachWorkers(ap_workers);
     activitypub.setHostname("speedy-socials.local");
+
+    // ── Mastodon plugin wiring (W1.3) ─────────────────────────────
+    mastodon.attachDb(db);
+    mastodon.setHostname("speedy-socials.local");
 
     // Start the AP outbox worker by re-running init paths now that the
     // db is attached. The plugin's init has already run with db=null;
@@ -247,5 +253,6 @@ test {
     _ = echo;
     _ = atproto;
     _ = activitypub;
+    _ = mastodon;
     _ = relay;
 }
