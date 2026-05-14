@@ -65,6 +65,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "protocol_echo", .path = "src/protocols/echo/plugin.zig" },
         .{ .name = "protocol_atproto", .path = "src/protocols/atproto/plugin.zig" },
         .{ .name = "protocol_activitypub", .path = "src/protocols/activitypub/plugin.zig" },
+        .{ .name = "protocol_mastodon", .path = "src/protocols/mastodon/plugin.zig" },
         .{ .name = "protocol_relay", .path = "src/protocols/relay/plugin.zig" },
         .{ .name = "protocol_media", .path = "src/protocols/media/plugin.zig" },
     };
@@ -88,6 +89,15 @@ pub fn build(b: *std.Build) void {
     });
     const ap_mod = b.addModule("protocol_activitypub", .{
         .root_source_file = b.path("src/protocols/activitypub/plugin.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "core", .module = core_mod },
+            .{ .name = "sqlite", .module = sqlite_mod },
+        },
+    });
+    const mastodon_mod = b.addModule("protocol_mastodon", .{
+        .root_source_file = b.path("src/protocols/mastodon/plugin.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
@@ -125,6 +135,7 @@ pub fn build(b: *std.Build) void {
     plugin_imports_list.append(b.allocator, .{ .name = "protocol_echo", .module = echo_mod }) catch @panic("OOM");
     plugin_imports_list.append(b.allocator, .{ .name = "protocol_atproto", .module = atproto_mod }) catch @panic("OOM");
     plugin_imports_list.append(b.allocator, .{ .name = "protocol_activitypub", .module = ap_mod }) catch @panic("OOM");
+    plugin_imports_list.append(b.allocator, .{ .name = "protocol_mastodon", .module = mastodon_mod }) catch @panic("OOM");
     plugin_imports_list.append(b.allocator, .{ .name = "protocol_relay", .module = relay_mod }) catch @panic("OOM");
     plugin_imports_list.append(b.allocator, .{ .name = "protocol_media", .module = media_mod }) catch @panic("OOM");
 
@@ -190,7 +201,8 @@ pub fn build(b: *std.Build) void {
         const is_ap = std.mem.eql(u8, pm.name, "protocol_activitypub");
         const is_atproto = std.mem.eql(u8, pm.name, "protocol_atproto");
         const is_media = std.mem.eql(u8, pm.name, "protocol_media");
-        const needs_sqlite = is_ap or is_atproto or is_media;
+        const is_mastodon = std.mem.eql(u8, pm.name, "protocol_mastodon");
+        const needs_sqlite = is_ap or is_atproto or is_media or is_mastodon;
         const mod = if (is_relay) b.createModule(.{
             .root_source_file = b.path(pm.path),
             .target = target,
