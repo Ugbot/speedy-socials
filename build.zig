@@ -32,6 +32,12 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/third_party/tigerbeetle/intrusive/root.zig"),
         .target = target,
         .optimize = optimize,
+        .imports = &.{
+            // The previously-gated PRNG-driven fuzz tests on Stack/List/Queue
+            // need the vendored TB PRNG. Production code paths in the
+            // intrusive collections never reach for it.
+            .{ .name = "tb_prng", .module = tb_prng_mod },
+        },
     });
     const tb_testing_mod = b.addModule("tb_testing", .{
         .root_source_file = b.path("src/third_party/tigerbeetle/testing/root.zig"),
@@ -151,10 +157,18 @@ pub fn build(b: *std.Build) void {
     const tb_testing_tests = b.addTest(.{ .root_module = tb_testing_mod });
     const run_tb_testing_tests = b.addRunArtifact(tb_testing_tests);
 
+    // The vendored intrusive Stack/List/Queue have PRNG-driven fuzz tests
+    // that were gated until `tb_prng` landed. They live in the
+    // tb_intrusive module's own test blocks, so we must run that module
+    // directly.
+    const tb_intrusive_tests = b.addTest(.{ .root_module = tb_intrusive_mod });
+    const run_tb_intrusive_tests = b.addRunArtifact(tb_intrusive_tests);
+
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_core_tests.step);
     test_step.dependOn(&run_app_tests.step);
     test_step.dependOn(&run_tb_testing_tests.step);
+    test_step.dependOn(&run_tb_intrusive_tests.step);
 
     // Per-plugin test step. Each plugin module's tests run independently
     // so that referenced symbols (cid, mst, dag_cbor, …) get pulled in
@@ -197,12 +211,17 @@ pub fn build(b: *std.Build) void {
     }
 
     // ── benchmarks ─────────────────────────────────────────────────
+    // Benches inherit the top-level optimize mode. For production-shape
+    // numbers run `zig build bench -Doptimize=ReleaseFast`. Debug mode
+    // numbers will not meet baseline.json thresholds — that's
+    // intentional, the thresholds are recorded against ReleaseFast.
+    const bench_optimize = optimize;
     const bench_storage = b.addExecutable(.{
         .name = "storage-bench",
         .root_module = b.createModule(.{
             .root_source_file = b.path("bench/storage_bench.zig"),
             .target = target,
-            .optimize = optimize,
+            .optimize = bench_optimize,
             .imports = &.{
                 .{ .name = "core", .module = core_mod },
                 .{ .name = "sqlite", .module = sqlite_mod },
@@ -218,34 +237,89 @@ pub fn build(b: *std.Build) void {
     // They link against `core` (which re-exports the TB-derived TimeSim /
     // SimIo / PacketSimulator under `core.sim`) plus the fuzz helpers
     // under `core.testing.fuzz`.
-    const sim_exe = b.addExecutable(.{
+    const sim_imports = [_]std.Build.Module.Import{
+        .{ .name = "core", .module = core_mod },
+        .{ .name = "protocol_activitypub", .module = ap_mod },
+        .{ .name = "protocol_atproto", .module = atproto_mod },
+        .{ .name = "sqlite", .module = sqlite_mod },
+    };
+
+    const sim_fed_exe = b.addExecutable(.{
         .name = "sim-federate-with-mastodon",
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests/sim/federate_with_mastodon.zig"),
             .target = target,
             .optimize = optimize,
-            .imports = &.{
-                .{ .name = "core", .module = core_mod },
-            },
+            .imports = &sim_imports,
         }),
     });
-    const run_sim = b.addRunArtifact(sim_exe);
-    const sim_step = b.step("sim", "Run simulation tests");
-    sim_step.dependOn(&run_sim.step);
+    const run_sim_fed = b.addRunArtifact(sim_fed_exe);
 
-    // The simulation scenario also runs as a regular `zig build test`
-    // — the `test` block at the bottom of federate_with_mastodon.zig
-    // asserts the same invariants under std.testing.allocator.
-    const sim_tests = b.addTest(.{
+    const sim_fh_exe = b.addExecutable(.{
+        .name = "sim-firehose-subscriber",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/sim/firehose_subscriber.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &sim_imports,
+        }),
+    });
+    const run_sim_fh = b.addRunArtifact(sim_fh_exe);
+
+    const sim_step = b.step("sim", "Run simulation tests");
+    sim_step.dependOn(&run_sim_fed.step);
+    sim_step.dependOn(&run_sim_fh.step);
+
+    // The simulation scenarios also run as regular `zig build test` tests.
+    const sim_fed_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests/sim/federate_with_mastodon.zig"),
             .target = target,
             .optimize = optimize,
+            .imports = &sim_imports,
+        }),
+    });
+    const sim_fh_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/sim/firehose_subscriber.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &sim_imports,
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(sim_fed_tests).step);
+    test_step.dependOn(&b.addRunArtifact(sim_fh_tests).step);
+
+    // ── benchmarks (continued) ─────────────────────────────────────
+    const echo_bench = b.addExecutable(.{
+        .name = "echo-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("bench/echo_bench.zig"),
+            .target = target,
+            .optimize = bench_optimize,
             .imports = &.{
                 .{ .name = "core", .module = core_mod },
             },
         }),
     });
-    const run_sim_tests = b.addRunArtifact(sim_tests);
-    test_step.dependOn(&run_sim_tests.step);
+    const run_echo_bench = b.addRunArtifact(echo_bench);
+
+    const bench_runner = b.addExecutable(.{
+        .name = "bench-runner",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("bench/bench_runner.zig"),
+            .target = target,
+            .optimize = bench_optimize,
+            .imports = &.{
+                .{ .name = "core", .module = core_mod },
+                .{ .name = "sqlite", .module = sqlite_mod },
+            },
+        }),
+    });
+    const run_bench_runner = b.addRunArtifact(bench_runner);
+    // Echo bench must finish FIRST so the runner can splice its results.
+    run_bench_runner.step.dependOn(&run_echo_bench.step);
+
+    const all_bench_step = b.step("bench", "Run all benchmarks and write bench/results.json");
+    all_bench_step.dependOn(&run_bench_runner.step);
 }

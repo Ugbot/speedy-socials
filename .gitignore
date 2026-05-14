@@ -3,3 +3,5 @@ zig-out/
 zig-pkg/
 *.o
 .claude/worktrees/
+bench/.echo_bench_results.json
+bench/results.json

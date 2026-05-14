@@ -267,8 +267,65 @@ test "Queue: push/pop/peek/remove/empty" {
     try testing.expect(fifo.empty());
 }
 
-// TODO: re-enable when core.prng lands (TB Tranche 3). Upstream's "Queue: fuzz"
-// test depends on stdx.PRNG, stdx.RingBufferType, and testing/fuzz.zig.
-// Adoption-site tests in src/protocols/activitypub/outbox_worker.zig and
-// src/core/workers.zig exercise push, pop, contains, remove, and the
-// named-queue diagnostic surface.
+// PRNG-driven differential fuzz: mirror the Queue's contents in an
+// ArrayList model (FIFO order, front == index 0) and assert
+// push/pop/peek/contains/remove agree across many random operations.
+// Re-enabled now that `tb_prng` is vendored.
+test "Queue: fuzz against ArrayList model" {
+    const testing = std.testing;
+    const PRNG = @import("tb_prng");
+
+    const Item = struct { id: u32, link: QueueType(@This()).Link = .{} };
+    const cap: u32 = 24;
+    var pool: [cap]Item = undefined;
+    for (&pool, 0..) |*it, i| it.* = .{ .id = @intCast(i) };
+
+    var q = QueueType(Item).init(.{ .name = "fuzz", .verify_push = true });
+    var model: std.ArrayList(*Item) = .empty;
+    defer model.deinit(testing.allocator);
+
+    var prng = PRNG.from_seed(0xCAFEBABE_DEADD00D);
+    var op: u32 = 0;
+    const ops_total: u32 = 4_000;
+    while (op < ops_total) : (op += 1) {
+        const choice = prng.int_inclusive(u32, 99);
+        if (choice < 50 and model.items.len < cap) {
+            // Pick an item not in queue.
+            const start = prng.int_inclusive(u32, cap - 1);
+            var picked: ?*Item = null;
+            var k: u32 = 0;
+            while (k < cap) : (k += 1) {
+                const idx = (start + k) % cap;
+                const c = &pool[idx];
+                if (c.link.next == null and !q.contains(c)) {
+                    picked = c;
+                    break;
+                }
+            }
+            if (picked) |p| {
+                q.push(p);
+                try model.append(testing.allocator, p);
+                try testing.expect(q.contains(p));
+            }
+        } else if (choice < 80 and model.items.len > 0) {
+            // pop (FIFO: front is first element).
+            const expected = model.items[0];
+            const got = q.pop().?;
+            try testing.expectEqual(expected, got);
+            _ = model.orderedRemove(0);
+        } else if (model.items.len > 0) {
+            // remove arbitrary element.
+            const idx = prng.int_inclusive(u32, @as(u32, @intCast(model.items.len - 1)));
+            const victim = model.items[idx];
+            q.remove(victim);
+            _ = model.orderedRemove(idx);
+        }
+        try testing.expectEqual(@as(u64, model.items.len), q.count());
+        try testing.expectEqual(model.items.len == 0, q.empty());
+        if (model.items.len > 0) {
+            try testing.expectEqual(@as(?*Item, model.items[0]), q.peek());
+            try testing.expectEqual(@as(?*Item, model.items[model.items.len - 1]), q.peek_last());
+        }
+    }
+    while (q.pop() != null) {}
+}

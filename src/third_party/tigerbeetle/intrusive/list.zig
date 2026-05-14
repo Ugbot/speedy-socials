@@ -165,7 +165,61 @@ test "DoublyLinkedList LIFO" {
     try std.testing.expectEqual(null, list.pop());
 }
 
-// TODO: re-enable when core.prng lands (TB Tranche 3). Upstream's
-// "DoublyLinkedList fuzz" test depends on stdx.PRNG + stdx.BoundedArrayType.
-// Adoption-site tests in src/protocols/activitypub/key_cache.zig exercise
-// push, pop, and middle-remove via the LRU cache.
+// PRNG-driven differential fuzz: mirror the DoublyLinkedList's contents
+// in an ArrayList model and assert push/pop/remove agree across many
+// random operations. Re-enabled now that `tb_prng` is vendored.
+test "DoublyLinkedList: fuzz against ArrayList model" {
+    const testing = std.testing;
+    const PRNG = @import("tb_prng");
+
+    const Node = struct { id: u32, back: ?*@This() = null, next: ?*@This() = null };
+    const List = DoublyLinkedListType(Node, .back, .next);
+
+    const cap: u32 = 24;
+    var pool: [cap]Node = undefined;
+    for (&pool, 0..) |*n, i| n.* = .{ .id = @intCast(i) };
+
+    var list = List{};
+    var model: std.ArrayList(*Node) = .empty;
+    defer model.deinit(testing.allocator);
+
+    var prng = PRNG.from_seed(0xDEAD_BEEF_FACE_F00D);
+    var op: u32 = 0;
+    const ops_total: u32 = 4_000;
+    while (op < ops_total) : (op += 1) {
+        // Choose: 0=push, 1=pop, 2=remove (if non-empty).
+        const choice = prng.int_inclusive(u32, 99);
+        if (choice < 45 and model.items.len < cap) {
+            // Pick an item not in list. Linear scan over pool.
+            const start = prng.int_inclusive(u32, cap - 1);
+            var picked: ?*Node = null;
+            var k: u32 = 0;
+            while (k < cap) : (k += 1) {
+                const idx = (start + k) % cap;
+                const c = &pool[idx];
+                if (c.back == null and c.next == null and list.tail != c) {
+                    picked = c;
+                    break;
+                }
+            }
+            if (picked) |p| {
+                list.push(p);
+                try model.append(testing.allocator, p);
+            }
+        } else if (choice < 80 and model.items.len > 0) {
+            const expected = model.items[model.items.len - 1];
+            const got = list.pop().?;
+            try testing.expectEqual(expected, got);
+            _ = model.pop();
+        } else if (model.items.len > 0) {
+            // Middle-remove.
+            const idx = prng.int_inclusive(u32, @as(u32, @intCast(model.items.len - 1)));
+            const victim = model.items[idx];
+            list.remove(victim);
+            _ = model.orderedRemove(idx);
+        }
+        try testing.expectEqual(@as(u32, @intCast(model.items.len)), list.count);
+        try testing.expectEqual(model.items.len == 0, list.empty());
+    }
+    while (list.pop() != null) {}
+}
