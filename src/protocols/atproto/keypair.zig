@@ -1,5 +1,16 @@
 //! Ed25519 + secp256k1 keypair primitives for AT Protocol.
 //!
+//! The canonical Ed25519 + secp256k1 + multibase implementations live
+//! under `core.crypto` (see `src/core/crypto/README.md`). This module
+//! is the AT-flavored shim layer that preserves the protocol-specific
+//! API the rest of the AT plugin already depends on:
+//!
+//!   * `did:key:` encode + parse (multibase + multicodec wrapper)
+//!   * struct shapes the routes / repo / firehose pieces import.
+//!
+//! Both Ed25519 and secp256k1 operations now route through
+//! `core.crypto.{ed25519,secp256k1}` so we have a single audit point.
+//!
 //! AT Protocol production accounts use secp256k1 (ES256K) or P-256
 //! (ES256). Bridging deployments (e.g. speedy-socials as an AP↔AT relay)
 //! sign their *own* identity with Ed25519, which is the only curve the
@@ -45,41 +56,39 @@ pub const Ed25519KeyPair = struct {
     public_key: [ed25519_public_len]u8,
     secret_key: [ed25519_secret_len]u8,
 
-    /// Generate a new keypair from a 32-byte seed.
+    /// Generate a new keypair from a 32-byte seed (delegates to
+    /// `core.crypto.ed25519`).
     pub fn fromSeed(seed: [32]u8) Ed25519KeyPair {
-        const kp = std.crypto.sign.Ed25519.KeyPair.generateDeterministic(seed) catch unreachable;
-        return .{
-            .public_key = kp.public_key.bytes,
-            .secret_key = kp.secret_key.bytes,
-        };
+        const kp = core.crypto.ed25519.fromSeed(seed) catch unreachable;
+        return .{ .public_key = kp.public_key, .secret_key = kp.secret_key };
     }
 
     pub fn sign(self: Ed25519KeyPair, message: []const u8) [ed25519_signature_len]u8 {
-        const sk = std.crypto.sign.Ed25519.SecretKey.fromBytes(self.secret_key) catch unreachable;
-        const kp = std.crypto.sign.Ed25519.KeyPair.fromSecretKey(sk) catch unreachable;
-        const sig = kp.sign(message, null) catch unreachable;
-        return sig.toBytes();
+        return core.crypto.ed25519.sign(self.secret_key, message);
     }
 };
 
 pub fn verifyEd25519(message: []const u8, signature: [ed25519_signature_len]u8, public_key: [ed25519_public_len]u8) bool {
-    const pk = std.crypto.sign.Ed25519.PublicKey.fromBytes(public_key) catch return false;
-    const sig = std.crypto.sign.Ed25519.Signature.fromBytes(signature);
-    sig.verify(message, pk) catch return false;
-    return true;
+    return core.crypto.ed25519.verify(public_key, message, signature);
 }
 
 // ── secp256k1 (stub) ───────────────────────────────────────────────
 
-/// Sign + verify with secp256k1 require deterministic ECDSA + low-S
-/// normalization to be spec-compliant. Until those land Tiger Style in
-/// `core/crypto/`, we surface a typed error.
-pub fn signSecp256k1(_: []const u8, _: [32]u8) AtpError![64]u8 {
-    return error.NotImplemented;
+/// secp256k1 sign + verify, delegating to `core.crypto.secp256k1` for
+/// the low-S-normalised ECDSA-SHA256 implementation. The AT Protocol
+/// spec mandates low-S form; that requirement lives inside the
+/// consolidated `core.crypto` module so it is enforced uniformly
+/// regardless of caller.
+pub fn signSecp256k1(message: []const u8, secret_key: [32]u8) AtpError![64]u8 {
+    return core.crypto.secp256k1.sign(message, secret_key) catch return error.NotImplemented;
 }
 
-pub fn verifySecp256k1(_: []const u8, _: [64]u8, _: [secp256k1_pubkey_compressed_len]u8) AtpError!bool {
-    return error.NotImplemented;
+pub fn verifySecp256k1(message: []const u8, signature: [64]u8, public_key: [secp256k1_pubkey_compressed_len]u8) AtpError!bool {
+    core.crypto.secp256k1.verify(message, signature, public_key) catch |e| switch (e) {
+        error.BadSecretKey, error.BadPublicKey, error.BadSignature => return false,
+        error.NonLowS, error.VerifyFailed => return false,
+    };
+    return true;
 }
 
 // ── did:key encoding (Ed25519 + secp256k1 raw) ─────────────────────
@@ -315,16 +324,15 @@ test "did:key: secp256k1 raw bytes roundtrip" {
     try std.testing.expectEqualSlices(u8, pub_compressed[0..], parsed.public_key);
 }
 
-test "secp256k1: sign+verify stubs return NotImplemented" {
+test "secp256k1: sign + verify roundtrip via core.crypto" {
     var sk: [32]u8 = undefined;
     @memset(&sk, 1);
-    try std.testing.expectError(error.NotImplemented, signSecp256k1("x", sk));
-
-    var pk: [secp256k1_pubkey_compressed_len]u8 = undefined;
-    var sig: [64]u8 = undefined;
-    @memset(&pk, 0);
-    @memset(&sig, 0);
-    try std.testing.expectError(error.NotImplemented, verifySecp256k1("x", sig, pk));
+    sk[0] = 0; // ensure < curve order
+    const pk = try core.crypto.secp256k1.derivePublic(sk);
+    const msg = "atproto secp test";
+    const sig = try signSecp256k1(msg, sk);
+    try std.testing.expect(try verifySecp256k1(msg, sig, pk));
+    try std.testing.expect(!try verifySecp256k1("atproto secp tesT", sig, pk));
 }
 
 test "did:key: parseDidKey rejects malformed prefix" {

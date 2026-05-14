@@ -21,6 +21,16 @@ pub const health = @import("health.zig");
 pub const workers = @import("workers.zig");
 pub const intrusive = @import("intrusive.zig");
 pub const sim = @import("sim.zig");
+pub const http_client = @import("http_client.zig");
+
+pub const crypto = struct {
+    pub const ed25519 = @import("crypto/ed25519.zig");
+    pub const multibase = @import("crypto/multibase.zig");
+    pub const multicodec = @import("crypto/multicodec.zig");
+    pub const rsa = @import("crypto/rsa.zig");
+    pub const secp256k1 = @import("crypto/secp256k1.zig");
+    pub const argon2id = @import("crypto/argon2id.zig");
+};
 
 pub const testing = struct {
     pub const fuzz = @import("testing/fuzz.zig");
@@ -63,6 +73,13 @@ test {
     _ = workers;
     _ = intrusive;
     _ = sim;
+    _ = http_client;
+    _ = crypto.ed25519;
+    _ = crypto.multibase;
+    _ = crypto.multicodec;
+    _ = crypto.rsa;
+    _ = crypto.secp256k1;
+    _ = crypto.argon2id;
     _ = testing.fuzz;
     _ = http.parser;
     _ = http.request;

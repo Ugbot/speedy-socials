@@ -168,6 +168,27 @@ pub fn main() !void {
     activitypub.attachWorkers(ap_workers);
     activitypub.setHostname("speedy-socials.local");
 
+    // Wire the RSA verify hook so ActivityPub HTTP signatures with
+    // `alg=rsa-sha256` actually verify (Mastodon's default). The hook
+    // lives in `core.crypto.rsa`; until W1.2 it was a stub that returned
+    // `SignatureInvalid` for every RSA-signed inbox payload.
+    activitypub.keys.setRsaVerifyHook(core.crypto.rsa.verifyPkcs1v15Sha256);
+    log_ptr.info("boot", "rsa verify hook wired (core.crypto.rsa.verifyPkcs1v15Sha256)");
+
+    // Build the outbound HTTPS client. It shares a dedicated 4-thread
+    // pool so federation fetches don't contend with inbox workers.
+    // Until a TLS backend is wired in, `https://` requests fail with
+    // `error.TlsUnavailable`; plaintext `http://` works in full.
+    const http_workers = try allocator.create(core.workers.Pool(4));
+    defer allocator.destroy(http_workers);
+    http_workers.initInPlace();
+    try http_workers.start();
+    defer http_workers.stop();
+
+    var http_client = core.http_client.Client.init(io);
+    _ = &http_client;
+    log_ptr.info("boot", "outbound http client + worker pool ready");
+
     // Start the AP outbox worker by re-running init paths now that the
     // db is attached. The plugin's init has already run with db=null;
     // since the worker thread is idempotent we kick it now.

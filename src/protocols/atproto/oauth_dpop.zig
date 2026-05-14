@@ -262,8 +262,107 @@ pub fn signProof(
     return out[0..pos];
 }
 
-pub fn signProofEs256(_: []const u8, _: []const u8, _: i64, _: []const u8, _: []u8) ProofError![]const u8 {
-    return error.NotImplemented;
+// ── ES256 (P-256 ECDSA-SHA256) DPoP proofs ────────────────────────────
+
+const Ecdsa256 = std.crypto.sign.ecdsa.EcdsaP256Sha256;
+
+pub const es256_secret_length: usize = Ecdsa256.SecretKey.encoded_length; // 32
+pub const es256_public_length: usize = Ecdsa256.PublicKey.compressed_sec1_encoded_length; // 33
+pub const es256_signature_length: usize = Ecdsa256.Signature.encoded_length; // 64
+
+/// Sign a DPoP proof using ES256 (alg=ES256). The header includes the
+/// `JWK` member with the P-256 public key in standard JWK form.
+pub fn signProofEs256(
+    secret_key: [es256_secret_length]u8,
+    public_compressed: [es256_public_length]u8,
+    htm: []const u8,
+    htu: []const u8,
+    iat: i64,
+    jti: []const u8,
+    out: []u8,
+) ProofError![]const u8 {
+    if (out.len < auth.max_jwt_bytes) return error.BadClaims;
+
+    // Decompress the compressed SEC1 point into (x, y).
+    const pk = Ecdsa256.PublicKey.fromSec1(&public_compressed) catch return error.BadClaims;
+    const uncompressed = pk.toUncompressedSec1();
+    // uncompressed = 0x04 || X (32) || Y (32)
+    var x_b64: [44]u8 = undefined;
+    var y_b64: [44]u8 = undefined;
+    const xn = b64UrlEncodeShim(uncompressed[1..33], &x_b64);
+    const yn = b64UrlEncodeShim(uncompressed[33..65], &y_b64);
+
+    // JWS header: {"alg":"ES256","typ":"dpop+jwt","jwk":{"crv":"P-256","kty":"EC","x":"…","y":"…"}}
+    var header_buf: [256]u8 = undefined;
+    const header_json = std.fmt.bufPrint(
+        &header_buf,
+        "{{\"alg\":\"ES256\",\"typ\":\"dpop+jwt\",\"jwk\":{{\"crv\":\"P-256\",\"kty\":\"EC\",\"x\":\"{s}\",\"y\":\"{s}\"}}}}",
+        .{ x_b64[0..xn], y_b64[0..yn] },
+    ) catch return error.BadClaims;
+
+    var payload_buf: [512]u8 = undefined;
+    const payload_json = std.fmt.bufPrint(
+        &payload_buf,
+        "{{\"htm\":\"{s}\",\"htu\":\"{s}\",\"iat\":{d},\"jti\":\"{s}\"}}",
+        .{ htm, htu, iat, jti },
+    ) catch return error.BadClaims;
+
+    var pos: usize = 0;
+    pos += b64UrlEncodeShim(header_json, out[pos..]);
+    if (pos >= out.len) return error.BadClaims;
+    out[pos] = '.';
+    pos += 1;
+    pos += b64UrlEncodeShim(payload_json, out[pos..]);
+
+    // Sign the signing input header.payload with ES256.
+    const sk = Ecdsa256.SecretKey.fromBytes(secret_key) catch return error.BadClaims;
+    const kp = Ecdsa256.KeyPair.fromSecretKey(sk) catch return error.BadClaims;
+    const sig = kp.sign(out[0..pos], null) catch return error.BadClaims;
+    const sig_bytes = sig.toBytes();
+    if (pos + 1 + 86 > out.len) return error.BadClaims;
+    out[pos] = '.';
+    pos += 1;
+    pos += b64UrlEncodeShim(&sig_bytes, out[pos..]);
+    return out[0..pos];
+}
+
+/// Verify an ES256 DPoP proof against the public key embedded in the
+/// header JWK. `expected_htm` / `expected_htu` / `now_unix` follow the
+/// same semantics as `Verifier.verifyProof`.
+pub fn verifyProofEs256(
+    proof_jwt: []const u8,
+    public_compressed: [es256_public_length]u8,
+    expected_htm: []const u8,
+    expected_htu: []const u8,
+    now_unix: i64,
+) ProofError!void {
+    const dot1 = std.mem.indexOfScalar(u8, proof_jwt, '.') orelse return error.Malformed;
+    const rest = proof_jwt[dot1 + 1 ..];
+    const dot2_rel = std.mem.indexOfScalar(u8, rest, '.') orelse return error.Malformed;
+    const dot2 = dot1 + 1 + dot2_rel;
+
+    const payload_part = proof_jwt[dot1 + 1 .. dot2];
+    const sig_part = proof_jwt[dot2 + 1 ..];
+
+    var sig_bytes: [es256_signature_length]u8 = undefined;
+    const sig_n = b64UrlDecode(sig_part, &sig_bytes) catch return error.Malformed;
+    if (sig_n != es256_signature_length) return error.Malformed;
+
+    const pk = Ecdsa256.PublicKey.fromSec1(&public_compressed) catch return error.BadSignature;
+    const sig = Ecdsa256.Signature.fromBytes(sig_bytes);
+    sig.verify(proof_jwt[0..dot2], pk) catch return error.BadSignature;
+
+    var payload_dec: [1024]u8 = undefined;
+    const pn = b64UrlDecode(payload_part, &payload_dec) catch return error.Malformed;
+    const payload = payload_dec[0..pn];
+
+    const htm = extractString(payload, "htm") catch return error.BadClaims;
+    const htu = extractString(payload, "htu") catch return error.BadClaims;
+    const iat = extractInt(payload, "iat") catch return error.BadClaims;
+    if (!std.mem.eql(u8, htm, expected_htm)) return error.BadClaims;
+    if (!std.mem.eql(u8, htu, expected_htu)) return error.BadClaims;
+    if (now_unix - iat > dpop_max_age_seconds) return error.Stale;
+    if (now_unix < iat - 5) return error.Stale;
 }
 
 // ── Tests ──────────────────────────────────────────────────────────
@@ -313,9 +412,47 @@ test "dpop: htm mismatch rejected" {
     try testing.expectError(error.BadClaims, v.verifyProof(proof, kp.public_key, "GET", "https://pds.test/m", 1010));
 }
 
-test "dpop: es256 stub returns NotImplemented" {
+test "dpop: es256 sign + verify round-trip" {
+    // Generate a deterministic ES256 keypair.
+    var seed: [Ecdsa256.KeyPair.seed_length]u8 = undefined;
+    @memset(&seed, 0x55);
+    const kp = try Ecdsa256.KeyPair.generateDeterministic(seed);
+    const compressed = kp.public_key.toCompressedSec1();
+
     var buf: [auth.max_jwt_bytes]u8 = undefined;
-    try testing.expectError(error.NotImplemented, signProofEs256("POST", "x", 1, "j", &buf));
+    const proof = try signProofEs256(
+        kp.secret_key.toBytes(),
+        compressed,
+        "POST",
+        "https://pds.test/oauth/token",
+        2000,
+        "es256-1",
+        &buf,
+    );
+    try verifyProofEs256(proof, compressed, "POST", "https://pds.test/oauth/token", 2005);
+    try testing.expectError(error.BadClaims, verifyProofEs256(proof, compressed, "GET", "https://pds.test/oauth/token", 2005));
+}
+
+test "dpop: es256 rejects tampered signature" {
+    var seed: [Ecdsa256.KeyPair.seed_length]u8 = undefined;
+    @memset(&seed, 0x56);
+    const kp = try Ecdsa256.KeyPair.generateDeterministic(seed);
+    const compressed = kp.public_key.toCompressedSec1();
+    var buf: [auth.max_jwt_bytes]u8 = undefined;
+    const proof = try signProofEs256(
+        kp.secret_key.toBytes(),
+        compressed,
+        "POST",
+        "https://pds.test/oauth/token",
+        2000,
+        "es256-tamper",
+        &buf,
+    );
+    // Flip the last character of the signature segment.
+    var copy: [auth.max_jwt_bytes]u8 = undefined;
+    @memcpy(copy[0..proof.len], proof);
+    copy[proof.len - 1] = if (copy[proof.len - 1] == 'A') 'B' else 'A';
+    try testing.expectError(error.BadSignature, verifyProofEs256(copy[0..proof.len], compressed, "POST", "https://pds.test/oauth/token", 2005));
 }
 
 test "dpop: jwk thumbprint stable for same key" {
