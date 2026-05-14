@@ -1,5 +1,15 @@
 # 🚀 Speedy Socials - Mastodon Implementation Feature TODO
 
+> **Legacy notice retired 2026-05-14.** The "completed features" list
+> below was written against the legacy monolithic codebase (`src/*.zig`,
+> `src/api/`, `src/relay/`, `lib/atproto/`, `lib/zat/`) which was deleted
+> in Phase 8 of the Tiger Style rewrite. Items below should be
+> re-validated against the new plugin layout under `src/core/`,
+> `src/app/`, and `src/protocols/`. See
+> `docs/adr/003-fork-protocol-libs.md` and
+> `docs/phase8-retirement-inventory.md`.
+
+
 ## ✅ **COMPLETED FEATURES**
 
 ### Core Infrastructure
