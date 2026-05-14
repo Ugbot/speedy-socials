@@ -77,3 +77,34 @@ pub const AtpError = error{
     MstInvariant,
     CommitInvalid,
 };
+
+pub const ObsError = error{
+    /// The metrics registry is full at compile-time-declared `max_metrics`.
+    TooManyMetrics,
+    /// A metric name was longer than `max_metric_name_bytes`.
+    MetricNameTooLong,
+    /// A metric help string was longer than `max_metric_help_bytes`.
+    MetricHelpTooLong,
+    /// A histogram was registered with too many bucket boundaries.
+    TooManyBuckets,
+    /// A histogram was registered with non-monotonic bucket boundaries.
+    BucketsNotMonotonic,
+    /// A metric with the same name + kind was already registered.
+    DuplicateMetric,
+    /// MetricId did not refer to a registered metric (or wrong kind).
+    UnknownMetric,
+    /// Wrong metric kind for the call (e.g. `observe` on a counter).
+    WrongMetricKind,
+    /// Output writer ran out of space while exporting Prometheus text.
+    ExportBufferFull,
+    /// Too many shutdown phases registered (`max_shutdown_phases`).
+    TooManyPhases,
+    /// Too many ready hooks registered (`max_health_hooks`).
+    TooManyHooks,
+    /// Phase / hook label longer than `max_phase_name_bytes`.
+    LabelTooLong,
+    /// A ready hook reported NotReady — `/readyz` returns 503.
+    NotReady,
+    /// Signal handler installation failed.
+    SignalSetupFailed,
+};
