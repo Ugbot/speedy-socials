@@ -29,6 +29,14 @@ const Io = std.Io;
 const net = std.Io.net;
 const TlsError = @import("errors.zig").TlsError;
 
+/// Outbound TLS backend (client-side handshake via std.crypto.tls.Client).
+/// See `src/core/tls/native_outbound.zig`.
+pub const native_outbound = @import("tls/native_outbound.zig");
+
+/// Inbound TLS backend stub. Zig 0.16's stdlib has no server-side TLS;
+/// see `src/core/tls/native_inbound.zig` and `tls/README.md`.
+pub const native_inbound = @import("tls/native_inbound.zig");
+
 pub const TlsBackend = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
@@ -88,6 +96,12 @@ pub const StubTlsBackend = struct {
 // ── tests ──────────────────────────────────────────────────────────────
 
 const testing = std.testing;
+
+test {
+    // Pull submodule tests into this module's test binary.
+    _ = native_outbound;
+    _ = native_inbound;
+}
 
 test "PlainBackend.wrap_stream is the identity function" {
     var plain: PlainBackend = .{};
