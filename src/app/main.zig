@@ -189,6 +189,15 @@ pub fn main() !void {
 
     var http_client = core.http_client.Client.init(io);
     _ = &http_client;
+
+    // Wire the native outbound TLS backend (Zig 0.16 std.crypto.tls).
+    // Server-side TLS is not implemented in 0.16 stdlib; see
+    // `src/core/tls/README.md` for the BoringSSL follow-up.
+    var tls_backend_state = try core.tls.native_outbound.NativeOutboundBackend.init(allocator, io);
+    defer tls_backend_state.deinit();
+    core.http_client.setTlsBackend(tls_backend_state.backend());
+    log_ptr.info("boot", "tls backend wired (native outbound)");
+
     log_ptr.info("boot", "outbound http client + worker pool ready");
 
     // ── Mastodon plugin wiring (W1.3) ─────────────────────────────
