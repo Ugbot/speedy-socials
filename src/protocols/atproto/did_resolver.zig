@@ -35,6 +35,24 @@ pub const HttpFetcher = *const fn (
 
 pub const ResolverError = AtpError || error{NotFound};
 
+// ── Module-level fetcher hook ─────────────────────────────────────────
+//
+// The composition root wires a real HTTP-backed fetcher at boot via
+// `setFetcher`. Code paths that don't have a `Resolver` instance handy
+// (e.g. firehose plumbing that needs to resolve a DID inline) can call
+// `getFetcher` to discover the production fetcher. Tests can override
+// per-test by saving and restoring the previous value.
+
+var module_fetcher: ?HttpFetcher = null;
+
+pub fn setFetcher(f: ?HttpFetcher) void {
+    module_fetcher = f;
+}
+
+pub fn getFetcher() ?HttpFetcher {
+    return module_fetcher;
+}
+
 pub const Resolver = struct {
     fetcher: HttpFetcher,
     plc_directory: []const u8 = default_plc_directory,

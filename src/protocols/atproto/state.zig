@@ -35,6 +35,11 @@ pub const State = struct {
     jwt_key: keypair.Ed25519KeyPair = undefined,
     /// Monotonic TID generator (one per process).
     tid_state: tid.State = undefined,
+
+    /// Outbound HTTP client wired by the composition root. Null until
+    /// `attachHttpClient` is called. The DID resolver fetcher closure
+    /// reads it; it fails closed (NotFound) when null.
+    http_client: ?*core.http_client.Client = null,
 };
 
 var instance: State = .{};
@@ -63,6 +68,10 @@ pub fn attachDb(db: *c.sqlite3) void {
 
 pub fn attachWorkers(pool: *anyopaque) void {
     instance.workers = pool;
+}
+
+pub fn attachHttpClient(client: *core.http_client.Client) void {
+    instance.http_client = client;
 }
 
 pub fn get() *State {

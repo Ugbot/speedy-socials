@@ -47,6 +47,8 @@ pub const actor = @import("actor.zig");
 pub const key_cache = @import("key_cache.zig");
 pub const delivery = @import("delivery.zig");
 pub const outbox_worker = @import("outbox_worker.zig");
+pub const key_fetcher_http = @import("key_fetcher_http.zig");
+pub const http_delivery = @import("http_delivery.zig");
 
 // ──────────────────────────────────────────────────────────────────────
 // Public composition-root API
@@ -62,6 +64,14 @@ pub fn attachWorkers(pool: *state.PoolType) void {
 
 pub fn setHostname(name: []const u8) void {
     state.setHostname(name);
+}
+
+/// Bind the outbound HTTP client used by the federation hooks (key
+/// cache fetch + outbox delivery). Stored in module-level state so the
+/// hook trampolines — which the existing hook ABI does not let us
+/// extend with a context pointer — can find it.
+pub fn attachHttpClient(client: *core.http_client.Client) void {
+    state.attachHttpClient(client);
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -117,6 +127,8 @@ test {
     _ = key_cache;
     _ = delivery;
     _ = outbox_worker;
+    _ = key_fetcher_http;
+    _ = http_delivery;
 }
 
 test "activitypub plugin registers" {

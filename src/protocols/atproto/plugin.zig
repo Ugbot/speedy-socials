@@ -69,6 +69,10 @@ pub fn attachWorkers(pool: *anyopaque) void {
     state.attachWorkers(pool);
 }
 
+pub fn attachHttpClient(client: *core.http_client.Client) void {
+    state.attachHttpClient(client);
+}
+
 pub const plugin: Plugin = .{
     .name = "atproto",
     .version = 1,
