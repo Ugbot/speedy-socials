@@ -3,10 +3,7 @@
     .version = "0.0.0",
     .fingerprint = 0x91f6e54618b15db1,
     .minimum_zig_version = "0.16.0",
-    .dependencies = .{
-        .sqlite = .{ .path = "third_party/zig-sqlite" },
-        .atproto = .{ .path = "lib/atproto" },
-    },
+    .dependencies = .{},
     .paths = .{
         "build.zig",
         "build.zig.zon",
