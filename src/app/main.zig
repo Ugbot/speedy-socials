@@ -37,9 +37,25 @@ pub fn main() !void {
     var rng = core.rng.Rng.initFromOs();
     std.debug.print("rng seed: 0x{x}\n", .{rng.seed});
 
+    // ── storage subsystem ──────────────────────────────────────────
+    // Open the SQLite writer connection + spin up the writer thread.
+    // Plugins push queries onto `channel`; the writer drains them.
+    const db_path: [:0]const u8 = "./speedy_socials.db";
+    const db = try core.storage.sqlite.openWriter(db_path);
+    defer core.storage.sqlite.closeDb(db);
+
+    var stmt_table = core.storage.StmtTable.init();
+    defer stmt_table.finalizeAll();
+
+    var channel = core.storage.Channel.init();
+    var writer = core.storage.Writer.init(db, &stmt_table, &channel);
+
+    var handle = core.storage.Handle.init(&channel, &stmt_table);
+
     var ctx: core.plugin.Context = .{
         .clock = real_clock.clock(),
         .rng = &rng,
+        .storage = &handle,
     };
 
     // Register plugins. New protocol → new entry here. Core unchanged.
@@ -49,6 +65,18 @@ pub fn main() !void {
     try registry.initAll(&ctx);
     defer registry.deinitAll(&ctx);
 
+    // ── schema migrations ──────────────────────────────────────────
+    var schema = core.storage.Schema.init();
+    try schema.register(core.storage.bootstrap_migration);
+    try registry.registerAllSchemas(&ctx, &schema);
+    try schema.applyAll(db);
+
+    // ── prepared statements + writer thread ────────────────────────
+    try stmt_table.prepareAll(db);
+    try writer.start();
+    defer writer.stop();
+
+    // ── HTTP server ────────────────────────────────────────────────
     var router = core.http.router.Router.init();
     try registry.registerAllRoutes(&ctx, &router);
 

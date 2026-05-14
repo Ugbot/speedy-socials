@@ -11,6 +11,7 @@ pub const rng = @import("rng.zig");
 pub const plugin = @import("plugin.zig");
 pub const connection = @import("connection.zig");
 pub const server = @import("server.zig");
+pub const storage = @import("storage.zig");
 
 pub const http = struct {
     pub const parser = @import("http/parser.zig");
@@ -31,6 +32,7 @@ test {
     _ = plugin;
     _ = connection;
     _ = server;
+    _ = storage;
     _ = http.parser;
     _ = http.request;
     _ = http.response;

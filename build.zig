@@ -4,17 +4,21 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // ── sqlite (vendored) ──────────────────────────────────────────
+    const sqlite_dep = b.dependency("sqlite", .{ .target = target, .optimize = optimize });
+    const sqlite_mod = sqlite_dep.module("sqlite");
+
     // ── core module ────────────────────────────────────────────────
     const core_mod = b.addModule("core", .{
         .root_source_file = b.path("src/core/root.zig"),
         .target = target,
         .optimize = optimize,
+        .imports = &.{
+            .{ .name = "sqlite", .module = sqlite_mod },
+        },
     });
 
     // ── plugin modules ─────────────────────────────────────────────
-    // Each plugin is its own module that imports `core`. The
-    // composition root (`src/app/main.zig`) imports each plugin by
-    // module name. New protocol = new module here + one line in app.
     const plugin_modules = [_]struct { name: []const u8, path: []const u8 }{
         .{ .name = "protocol_echo", .path = "src/protocols/echo/plugin.zig" },
     };
@@ -55,8 +59,6 @@ pub fn build(b: *std.Build) void {
     run_step.dependOn(&run_cmd.step);
 
     // ── tests ──────────────────────────────────────────────────────
-    // Legacy src/ stays in the tree as a reference but is not in the
-    // build graph; it will be deleted in Phase 8.
     const core_tests = b.addTest(.{ .root_module = core_mod });
     const run_core_tests = b.addRunArtifact(core_tests);
 
@@ -73,4 +75,21 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_core_tests.step);
     test_step.dependOn(&run_app_tests.step);
+
+    // ── benchmarks ─────────────────────────────────────────────────
+    const bench_storage = b.addExecutable(.{
+        .name = "storage-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("bench/storage_bench.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "core", .module = core_mod },
+                .{ .name = "sqlite", .module = sqlite_mod },
+            },
+        }),
+    });
+    const run_bench_storage = b.addRunArtifact(bench_storage);
+    const bench_step = b.step("bench-storage", "Run the storage layer benchmark");
+    bench_step.dependOn(&run_bench_storage.step);
 }
