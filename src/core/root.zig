@@ -9,6 +9,7 @@ pub const static = @import("static.zig");
 pub const arena = @import("arena.zig");
 pub const clock = @import("clock.zig");
 pub const rng = @import("rng.zig");
+pub const prng = @import("prng.zig");
 pub const plugin = @import("plugin.zig");
 pub const connection = @import("connection.zig");
 pub const server = @import("server.zig");
@@ -44,6 +45,7 @@ test {
     _ = arena;
     _ = clock;
     _ = rng;
+    _ = prng;
     _ = plugin;
     _ = connection;
     _ = server;

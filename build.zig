@@ -23,6 +23,11 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const tb_prng_mod = b.addModule("tb_prng", .{
+        .root_source_file = b.path("src/third_party/tigerbeetle/prng/prng.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
 
     // ── core module ────────────────────────────────────────────────
     const core_mod = b.addModule("core", .{
@@ -33,6 +38,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "sqlite", .module = sqlite_mod },
             .{ .name = "tigerbeetle_static_allocator", .module = tb_static_alloc_mod },
             .{ .name = "tigerbeetle_counting_allocator", .module = tb_counting_alloc_mod },
+            .{ .name = "tb_prng", .module = tb_prng_mod },
         },
     });
 

@@ -36,24 +36,50 @@ pub const max_payload_inline_bytes: usize = 8 * 1024;
 pub const max_inbox_bytes: usize = 512;
 pub const max_key_id_bytes: usize = 256;
 
-/// Backoff schedule: `1s, 4s, 16s, 64s, 256s, 1024s, 4096s, 16384s`.
-/// Each attempt n is delayed by 4^n seconds.
-pub fn computeBackoffSec(attempts: u32, rng: ?*core.rng.Rng) i64 {
+/// Maximum backoff (16h) — same cap as the legacy schedule.
+pub const max_backoff_sec: i64 = 16 * 3600;
+
+/// Backoff base schedule: `1s, 4s, 16s, 64s, 256s, 1024s, 4096s, 16384s`.
+/// Each attempt n is delayed by 4^n seconds, capped at 16h.
+fn baseBackoffSec(attempts: u32) i64 {
     var base: i64 = 1;
     var i: u32 = 0;
     while (i < attempts and i < 12) : (i += 1) base *= 4;
-    if (base > 16 * 3600) base = 16 * 3600;
-    // Jitter ±25%.
-    if (rng) |r| {
-        const jitter_range = @divTrunc(base, 4);
-        if (jitter_range > 0) {
-            const raw = r.random().int(u64) % @as(u64, @intCast(jitter_range * 2 + 1));
-            const off = @as(i64, @intCast(raw)) - jitter_range;
-            base += off;
-        }
-    }
-    if (base < 1) base = 1;
+    if (base > max_backoff_sec) base = max_backoff_sec;
     return base;
+}
+
+/// Compute the delay before the next delivery retry.
+///
+/// The base schedule is exponential (4^attempt seconds, capped at 16h).
+/// Jitter is applied via TigerBeetle's `Ratio` + `exponential` helpers
+/// so the distribution is *honest* (memoryless thundering-herd avoidance)
+/// rather than the previous uniform ±25% window. The exponential draw
+/// is squashed to a Ratio in `[0, 1]` and used to interpolate between
+/// `base * 0.75` and `base * 1.25`, preserving the ±25% bound the
+/// previous implementation advertised while improving the spectral
+/// shape (more samples near the centre, long-tail jitter is rare).
+pub fn computeBackoffSec(attempts: u32, rng: ?*core.rng.Rng) i64 {
+    const base = baseBackoffSec(attempts);
+    var jittered: i64 = base;
+    if (rng) |r| {
+        // Squash an exponential(mean=1) draw to [0, 1] with a generous
+        // saturating cap at 4 standard means — this discards the tail
+        // beyond ~1% probability and keeps jitter bounded.
+        const raw = r.exponential(1.0);
+        const clipped: f64 = if (raw > 4.0) 4.0 else raw;
+        const u_num: u64 = @intFromFloat(@round((clipped / 4.0) * 1_000_000.0));
+        const u = core.rng.ratio(@min(u_num, @as(u64, 1_000_000)), 1_000_000);
+        // Decide direction with a fair coin via TB `chance(1/2)`.
+        const positive = r.chance(core.rng.ratio(1, 2));
+        // Magnitude of offset in [0, base/4].
+        const max_off: i64 = @divTrunc(base, 4);
+        const off_mag: i64 = @intCast(@divTrunc(@as(i64, @intCast(u.numerator)) * max_off, @as(i64, @intCast(u.denominator))));
+        jittered = if (positive) base + off_mag else base - off_mag;
+    }
+    if (jittered < 1) jittered = 1;
+    if (jittered > max_backoff_sec) jittered = max_backoff_sec;
+    return jittered;
 }
 
 /// Outcome the delivery hook returns to the worker.
@@ -336,6 +362,37 @@ test "computeBackoffSec applies bounded jitter" {
     const v = computeBackoffSec(2, &r);
     // 16s ±25% = 12..20.
     try testing.expect(v >= 12 and v <= 20);
+}
+
+test "computeBackoffSec base schedule is monotone non-decreasing" {
+    // Without rng: every step is ≥ previous, and the schedule caps at
+    // max_backoff_sec (16h = 57600s).
+    var prev: i64 = 0;
+    var attempt: u32 = 0;
+    while (attempt < 20) : (attempt += 1) {
+        const v = computeBackoffSec(attempt, null);
+        try testing.expect(v >= prev);
+        try testing.expect(v <= max_backoff_sec);
+        prev = v;
+    }
+    // The cap is actually hit.
+    try testing.expectEqual(max_backoff_sec, computeBackoffSec(20, null));
+}
+
+test "computeBackoffSec jitter stays within ±25% of base across many seeds" {
+    // Sample over 1000 random seeds at attempts ≥ 4 (so base is large
+    // enough for jitter to be non-trivial) and verify the result is
+    // always inside the documented band.
+    const base_at_4 = computeBackoffSec(4, null);
+    const lo: i64 = base_at_4 - @divTrunc(base_at_4, 4);
+    const hi: i64 = base_at_4 + @divTrunc(base_at_4, 4);
+    var seed: u64 = 1;
+    while (seed < 1001) : (seed += 1) {
+        var r = Rng.init(seed *% 0x9E37_79B1_7F4A_7C15);
+        const v = computeBackoffSec(4, &r);
+        try testing.expect(v >= lo);
+        try testing.expect(v <= hi);
+    }
 }
 
 const TestDeliver = struct {
