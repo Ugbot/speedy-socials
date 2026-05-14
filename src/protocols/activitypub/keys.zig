@@ -138,10 +138,11 @@ pub fn generateEd25519FromSeed(
     key_id: KeyId,
     seed: [Ed25519.KeyPair.seed_length]u8,
 ) FedError!struct { public: PublicKey, private: PrivateKey } {
-    const kp = Ed25519.KeyPair.generateDeterministic(seed) catch return error.SignatureMalformed;
+    // Delegate to the canonical implementation in `core.crypto.ed25519`.
+    const kp = core.crypto.ed25519.fromSeed(seed) catch return error.SignatureMalformed;
     return .{
-        .public = PublicKey.ed25519FromBytes(key_id, kp.public_key.toBytes()),
-        .private = PrivateKey.ed25519FromBytes(key_id, kp.secret_key.toBytes()),
+        .public = PublicKey.ed25519FromBytes(key_id, kp.public_key),
+        .private = PrivateKey.ed25519FromBytes(key_id, kp.secret_key),
     };
 }
 
