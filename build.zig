@@ -33,6 +33,11 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const tb_testing_mod = b.addModule("tb_testing", .{
+        .root_source_file = b.path("src/third_party/tigerbeetle/testing/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
 
     // ── core module ────────────────────────────────────────────────
     const core_mod = b.addModule("core", .{
@@ -45,6 +50,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "tigerbeetle_counting_allocator", .module = tb_counting_alloc_mod },
             .{ .name = "tb_prng", .module = tb_prng_mod },
             .{ .name = "tb_intrusive", .module = tb_intrusive_mod },
+            .{ .name = "tb_testing", .module = tb_testing_mod },
         },
     });
 
@@ -138,9 +144,17 @@ pub fn build(b: *std.Build) void {
     });
     const run_app_tests = b.addRunArtifact(app_tests);
 
+    // Tests for the vendored TB simulation primitives must run against
+    // the tb_testing module directly — `zig test` only executes test
+    // blocks in the module being compiled, so referencing them from
+    // core's root.zig is not enough.
+    const tb_testing_tests = b.addTest(.{ .root_module = tb_testing_mod });
+    const run_tb_testing_tests = b.addRunArtifact(tb_testing_tests);
+
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_core_tests.step);
     test_step.dependOn(&run_app_tests.step);
+    test_step.dependOn(&run_tb_testing_tests.step);
 
     // Per-plugin test step. Each plugin module's tests run independently
     // so that referenced symbols (cid, mst, dag_cbor, …) get pulled in
@@ -198,4 +212,40 @@ pub fn build(b: *std.Build) void {
     const run_bench_storage = b.addRunArtifact(bench_storage);
     const bench_step = b.step("bench-storage", "Run the storage layer benchmark");
     bench_step.dependOn(&run_bench_storage.step);
+
+    // ── simulation harness ─────────────────────────────────────────
+    // `zig build sim` runs the federation scenario(s) in tests/sim/.
+    // They link against `core` (which re-exports the TB-derived TimeSim /
+    // SimIo / PacketSimulator under `core.sim`) plus the fuzz helpers
+    // under `core.testing.fuzz`.
+    const sim_exe = b.addExecutable(.{
+        .name = "sim-federate-with-mastodon",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/sim/federate_with_mastodon.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "core", .module = core_mod },
+            },
+        }),
+    });
+    const run_sim = b.addRunArtifact(sim_exe);
+    const sim_step = b.step("sim", "Run simulation tests");
+    sim_step.dependOn(&run_sim.step);
+
+    // The simulation scenario also runs as a regular `zig build test`
+    // — the `test` block at the bottom of federate_with_mastodon.zig
+    // asserts the same invariants under std.testing.allocator.
+    const sim_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/sim/federate_with_mastodon.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "core", .module = core_mod },
+            },
+        }),
+    });
+    const run_sim_tests = b.addRunArtifact(sim_tests);
+    test_step.dependOn(&run_sim_tests.step);
 }

@@ -20,6 +20,11 @@ pub const shutdown = @import("shutdown.zig");
 pub const health = @import("health.zig");
 pub const workers = @import("workers.zig");
 pub const intrusive = @import("intrusive.zig");
+pub const sim = @import("sim.zig");
+
+pub const testing = struct {
+    pub const fuzz = @import("testing/fuzz.zig");
+};
 
 pub const http = struct {
     pub const parser = @import("http/parser.zig");
@@ -57,6 +62,8 @@ test {
     _ = health;
     _ = workers;
     _ = intrusive;
+    _ = sim;
+    _ = testing.fuzz;
     _ = http.parser;
     _ = http.request;
     _ = http.response;

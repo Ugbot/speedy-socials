@@ -122,6 +122,55 @@ pub const SimClock = struct {
     }
 };
 
+/// Adapter from the vendored `TimeSim` (TigerBeetle simulation harness) to
+/// the local `Clock` vtable, so federation backoff / retry timers can be
+/// exercised against realistic drift (linear, periodic, step, non-ideal)
+/// without leaving the `Clock` abstraction.
+pub const TimeSimClock = struct {
+    sim: *@import("tb_testing").time.TimeSim,
+
+    pub fn init(sim: *@import("tb_testing").time.TimeSim) TimeSimClock {
+        return .{ .sim = sim };
+    }
+
+    fn monotonic(ptr: *anyopaque) MonoNanos {
+        const self: *TimeSimClock = @ptrCast(@alignCast(ptr));
+        return self.sim.monotonic();
+    }
+
+    fn wall(ptr: *anyopaque) WallNanos {
+        const self: *TimeSimClock = @ptrCast(@alignCast(ptr));
+        return @as(WallNanos, self.sim.realtime());
+    }
+
+    pub fn clock(self: *TimeSimClock) Clock {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .monotonic_ns = monotonic,
+                .wall_ns = wall,
+            },
+        };
+    }
+};
+
+test "TimeSimClock proxies TimeSim through Clock vtable" {
+    const time_sim_mod = @import("tb_testing").time;
+    var ts = time_sim_mod.TimeSim.init(.{
+        .resolution = std.time.ns_per_ms,
+        .offset_type = .linear,
+        .offset_coefficient_A = 0,
+        .offset_coefficient_B = 0,
+        .epoch = 1_700_000_000 * std.time.ns_per_s,
+    });
+    var tsc = TimeSimClock.init(&ts);
+    const c = tsc.clock();
+    try std.testing.expectEqual(@as(MonoNanos, 0), c.monotonicNs());
+    ts.tick();
+    try std.testing.expectEqual(@as(MonoNanos, std.time.ns_per_ms), c.monotonicNs());
+    try std.testing.expectEqual(@as(i64, 1_700_000_000), c.wallUnix());
+}
+
 test "SimClock advances deterministically" {
     var sc = SimClock.init(1_700_000_000);
     const c = sc.clock();
