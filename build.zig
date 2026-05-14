@@ -38,7 +38,10 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/protocols/atproto/plugin.zig"),
         .target = target,
         .optimize = optimize,
-        .imports = &.{.{ .name = "core", .module = core_mod }},
+        .imports = &.{
+            .{ .name = "core", .module = core_mod },
+            .{ .name = "sqlite", .module = sqlite_mod },
+        },
     });
     const ap_mod = b.addModule("protocol_activitypub", .{
         .root_source_file = b.path("src/protocols/activitypub/plugin.zig"),
@@ -116,6 +119,8 @@ pub fn build(b: *std.Build) void {
     for (plugin_modules) |pm| {
         const is_relay = std.mem.eql(u8, pm.name, "protocol_relay");
         const is_ap = std.mem.eql(u8, pm.name, "protocol_activitypub");
+        const is_atproto = std.mem.eql(u8, pm.name, "protocol_atproto");
+        const needs_sqlite = is_ap or is_atproto;
         const mod = if (is_relay) b.createModule(.{
             .root_source_file = b.path(pm.path),
             .target = target,
@@ -126,7 +131,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "protocol_atproto", .module = atproto_mod },
                 .{ .name = "protocol_activitypub", .module = ap_mod },
             },
-        }) else if (is_ap) b.createModule(.{
+        }) else if (needs_sqlite) b.createModule(.{
             .root_source_file = b.path(pm.path),
             .target = target,
             .optimize = optimize,
