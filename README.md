@@ -193,3 +193,23 @@ curl http://127.0.0.1:8080/.well-known/webfinger?resource=acct:demo@speedy-socia
 5. **Federation**: Built-in ActivityPub from the ground up
 
 This is a **complete, production-ready Mastodon implementation** that demonstrates the power of Zig for building high-performance web applications! 🎉
+
+## Copyright
+
+Copyright © 2025–2026 Ben Gamble. The contents of this repository,
+except where otherwise noted, are licensed under the terms in the
+top-level [`LICENSE`](LICENSE) file.
+
+Third-party components retain their own copyrights and licenses. See
+[`NOTICE`](NOTICE) for the full attribution, and the `LICENSE` files
+under each `third_party/` subtree (e.g.
+[`third_party/zig-sqlite/LICENSE`](third_party/zig-sqlite/LICENSE),
+[`src/third_party/tigerbeetle/LICENSE`](src/third_party/tigerbeetle/LICENSE))
+for the original license text.
+
+The vendored TigerBeetle utilities are distributed under the Apache
+License, Version 2.0, copyright Tigerbeetle, Inc. The original sources
+live at <https://github.com/tigerbeetle/tigerbeetle>; the imported
+commit is recorded in `NOTICE` and in
+`docs/adr/004-vendor-tigerbeetle.md`. No cross-licensing of project
+code with vendored code is implied.

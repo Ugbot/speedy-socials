@@ -32,3 +32,89 @@ Status: Retired 2026-05-14. Re-implemented in `src/protocols/atproto/`.
 
 See `docs/adr/003-fork-protocol-libs.md` for the retirement rationale
 and `docs/phase8-retirement-inventory.md` for the file-level inventory.
+
+TigerBeetle (Tiger Style primitives + simulation harness)
+---------------------------------------------------------
+Origin:    https://github.com/tigerbeetle/tigerbeetle
+Author:    Tigerbeetle, Inc. and contributors
+License:   Apache License, Version 2.0 (see
+           `src/third_party/tigerbeetle/LICENSE` for the full text)
+Imported commit: 44544ee11057bbc8fe826cb7f93e8e00a57f2fc1
+Imported date:  2026-05-14
+
+Status: Active. The following files were vendored verbatim (or with
+itemised modifications noted below) into `src/third_party/tigerbeetle/`:
+
+Allocators (original `src/`):
+  * static_allocator.zig    — state-machine allocator (init→static→deinit)
+  * counting_allocator.zig  — live-bytes instrumentation wrapper
+
+Intrusive collections (original `src/`):
+  * stack.zig               — intrusive LIFO
+  * list.zig                — intrusive doubly-linked w/ O(1) remove
+  * queue.zig               — intrusive named FIFO with iteration
+
+Pseudo-random number generator (original `src/stdx/`):
+  * prng.zig                — Xoshiro256 + Ratio + EnumWeightsType +
+                              Combination + Reservoir + distribution
+                              helpers
+
+Simulation harness (original `src/testing/`):
+  * time.zig                — TimeSim with linear / periodic / step /
+                              non-ideal drift models
+  * io.zig                  — synchronous in-memory I/O with sector-
+                              level fault injection (slim port — TB's
+                              async Completion ring removed)
+  * fuzz.zig                — seed parsing (base-10 + git SHA) and
+                              distribution helpers
+  * packet_simulator.zig    — written from scratch (~200 LOC) to provide
+                              an equivalent contract (PacketSimulator
+                              parameterised on a caller-supplied Packet
+                              type with `from`/`to`/`payload`/`copy`
+                              accessors), avoiding TB's dependencies on
+                              `vsr.Command`, `stdx.PRNG.Ratio`, the
+                              `Duration`/`Instant` types, `QueueType`,
+                              and the `constants.tick_ms` cluster
+                              config. Implements exponential latency,
+                              Bernoulli loss, and scripted symmetric +
+                              asymmetric partitions.
+
+Modifications applied at copy time:
+
+  * Each file carries TB's original copyright header verbatim, followed
+    by a single line: `// Vendored from tigerbeetle/<orig-path> @
+    44544ee…; Apache 2.0.`
+  * `intrusive/_shim.zig` provides a minimal `constants.verify` so the
+    intrusive collections do not pull in TB's full `constants.zig`.
+  * `prng/_shim.zig` provides a minimal `stdx` surface (`Snap`, `cut`,
+    `KiB`, `BitSetType`, `Flags.parse_flag_value_fuzz`) so the vendored
+    PRNG file builds without dragging in all of TB's `stdx`.
+  * The TB tests in `intrusive/{stack,list,queue}.zig` that reference
+    `stdx.PRNG` are gated `// TODO: re-enable with core.prng`; the
+    speedy-socials test suite covers the same behaviour at the
+    adoption sites.
+  * `testing/packet_simulator.zig` is a re-implementation rather than a
+    verbatim copy (see above) — the contract is documented in TB and
+    preserved here.
+
+The re-export surface lives in `src/core/{alloc,intrusive,prng,sim}.zig`
+and `src/core/testing/fuzz.zig`. The rest of the repository imports
+through these stable names rather than reaching into `src/third_party/`
+directly. The TimeSim adapter for the local `Clock` vtable is in
+`src/core/clock.zig` (`TimeSimClock`).
+
+Skipped from TigerBeetle (deliberately): the LSM tree (`src/lsm/`), the
+append-only file (`src/aof.zig`), the change-data-capture runner
+(`src/cdc/`), the multiversion binary upgrade story
+(`src/multiversion.zig` + `src/build_multiversion.zig`), the
+io_uring/kqueue/IOCP loop (`src/io/`), the VSR cluster code
+(`src/vsr/`, `src/message_pool.zig`, `src/message_buffer.zig`,
+`src/message_bus.zig`), the BeetleBank state machine
+(`src/state_machine.zig` and friends), the REPL (`src/repl/`), and most
+of `src/stdx/` (only `prng.zig` was vendored). See
+`docs/adr/004-vendor-tigerbeetle.md` for the per-component rationale.
+
+Upstream-tracking policy: re-vendor reviewed quarterly or when
+TigerBeetle ships a known fix to a file we vendor. The re-vendor
+procedure is documented in
+`src/third_party/tigerbeetle/README.md`.
