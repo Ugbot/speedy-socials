@@ -23,23 +23,51 @@ pub fn build(b: *std.Build) void {
         .{ .name = "protocol_echo", .path = "src/protocols/echo/plugin.zig" },
         .{ .name = "protocol_atproto", .path = "src/protocols/atproto/plugin.zig" },
         .{ .name = "protocol_activitypub", .path = "src/protocols/activitypub/plugin.zig" },
+        .{ .name = "protocol_relay", .path = "src/protocols/relay/plugin.zig" },
     };
 
     var plugin_imports_list: std.ArrayList(std.Build.Module.Import) = .empty;
     defer plugin_imports_list.deinit(b.allocator);
     plugin_imports_list.append(b.allocator, .{ .name = "core", .module = core_mod }) catch @panic("OOM");
 
-    for (plugin_modules) |pm| {
-        const mod = b.addModule(pm.name, .{
-            .root_source_file = b.path(pm.path),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "core", .module = core_mod },
-            },
-        });
-        plugin_imports_list.append(b.allocator, .{ .name = pm.name, .module = mod }) catch @panic("OOM");
-    }
+    // Build the non-relay plugin modules first so that the relay can
+    // import them. The relay is the only plugin that explicitly depends
+    // on sibling plugins (see ADR-002 + the sibling-lookup carve-out in
+    // src/protocols/relay/plugin.zig).
+    const atproto_mod = b.addModule("protocol_atproto", .{
+        .root_source_file = b.path("src/protocols/atproto/plugin.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "core", .module = core_mod }},
+    });
+    const ap_mod = b.addModule("protocol_activitypub", .{
+        .root_source_file = b.path("src/protocols/activitypub/plugin.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "core", .module = core_mod }},
+    });
+    const echo_mod = b.addModule("protocol_echo", .{
+        .root_source_file = b.path("src/protocols/echo/plugin.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "core", .module = core_mod }},
+    });
+    const relay_mod = b.addModule("protocol_relay", .{
+        .root_source_file = b.path("src/protocols/relay/plugin.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "core", .module = core_mod },
+            .{ .name = "sqlite", .module = sqlite_mod },
+            .{ .name = "protocol_atproto", .module = atproto_mod },
+            .{ .name = "protocol_activitypub", .module = ap_mod },
+        },
+    });
+
+    plugin_imports_list.append(b.allocator, .{ .name = "protocol_echo", .module = echo_mod }) catch @panic("OOM");
+    plugin_imports_list.append(b.allocator, .{ .name = "protocol_atproto", .module = atproto_mod }) catch @panic("OOM");
+    plugin_imports_list.append(b.allocator, .{ .name = "protocol_activitypub", .module = ap_mod }) catch @panic("OOM");
+    plugin_imports_list.append(b.allocator, .{ .name = "protocol_relay", .module = relay_mod }) catch @panic("OOM");
 
     const plugin_imports = plugin_imports_list.items;
 
@@ -80,9 +108,21 @@ pub fn build(b: *std.Build) void {
 
     // Per-plugin test step. Each plugin module's tests run independently
     // so that referenced symbols (cid, mst, dag_cbor, …) get pulled in
-    // and their `test` blocks execute.
+    // and their `test` blocks execute. The relay is the only plugin
+    // that needs its siblings + sqlite available at test time.
     for (plugin_modules) |pm| {
-        const mod = b.createModule(.{
+        const is_relay = std.mem.eql(u8, pm.name, "protocol_relay");
+        const mod = if (is_relay) b.createModule(.{
+            .root_source_file = b.path(pm.path),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "core", .module = core_mod },
+                .{ .name = "sqlite", .module = sqlite_mod },
+                .{ .name = "protocol_atproto", .module = atproto_mod },
+                .{ .name = "protocol_activitypub", .module = ap_mod },
+            },
+        }) else b.createModule(.{
             .root_source_file = b.path(pm.path),
             .target = target,
             .optimize = optimize,

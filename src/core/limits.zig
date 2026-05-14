@@ -75,8 +75,16 @@ pub const worker_pool_size: u32 = 8;
 /// Per-worker arena size.
 pub const worker_arena_bytes: usize = 64 * 1024;
 
-/// Maximum queued jobs across the worker pool.
+/// Maximum queued jobs across the worker pool. Must be a power of two
+/// because the underlying queue is backed by `static.BoundedMpsc` which
+/// uses `static.FixedRingBuffer` (requires power-of-two capacity for fast
+/// index masking).
 pub const max_queued_jobs: u32 = 1024;
+
+/// Maximum time a submitter will block in `Completion.wait` before
+/// declaring the job stuck. 5 seconds covers the longest reasonable
+/// blocking I/O operation (HTTP key fetch with redirects, DNS retry).
+pub const pool_completion_timeout_ns: u64 = 5 * 1_000_000_000;
 
 /// Maximum SQLite prepared statements registered at startup.
 pub const max_prepared_stmts: u32 = 256;

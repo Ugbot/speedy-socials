@@ -10,6 +10,7 @@ const core = @import("core");
 const echo = @import("protocol_echo");
 const atproto = @import("protocol_atproto");
 const activitypub = @import("protocol_activitypub");
+const relay = @import("protocol_relay");
 
 const limits = core.limits;
 const Connection = core.connection.Connection;
@@ -111,6 +112,14 @@ pub fn main() !void {
     _ = try registry.register(echo.plugin);
     _ = try registry.register(atproto.plugin);
     _ = try registry.register(activitypub.plugin);
+    // Relay registers AFTER its siblings — its `init` calls
+    // `Registry.find` for "atproto" and "activitypub" (the sole
+    // sibling-lookup carve-out; see src/protocols/relay/plugin.zig).
+    _ = try registry.register(relay.plugin);
+
+    // Hand the relay the registry pointer so it can do its one-time
+    // sibling lookup during `initAll`.
+    relay.attachRegistry(&registry);
 
     try registry.initAll(&ctx);
     defer registry.deinitAll(&ctx);
@@ -125,6 +134,10 @@ pub fn main() !void {
     try stmt_table.prepareAll(db);
     try writer.start();
     defer writer.stop();
+
+    // Relay's admin queries reuse the writer connection — they are
+    // rare, admin-bound, and synchronous (good enough for Phase 5).
+    relay.state.attachDb(db);
 
     // ── HTTP server ────────────────────────────────────────────────
     var router = core.http.router.Router.init();
@@ -172,4 +185,5 @@ test {
     _ = echo;
     _ = atproto;
     _ = activitypub;
+    _ = relay;
 }

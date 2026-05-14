@@ -120,6 +120,26 @@ pub const WsError = error{
     StreamKeyTooLong,
 };
 
+pub const RelayError = error{
+    /// A protocol record/activity arrived that we have no translator for.
+    UnsupportedKind,
+    /// Translator produced output that overflowed the caller-supplied arena.
+    TranslationBufferTooSmall,
+    /// AT record JSON did not parse / lacked required fields.
+    BadAtRecord,
+    /// AP activity JSON did not parse / lacked required fields.
+    BadApActivity,
+    /// The relay's sibling-lookup found neither `atproto` nor `activitypub`.
+    /// Boot must register them BEFORE the relay plugin.
+    SiblingPluginMissing,
+    /// Identity-map upsert failed at the storage layer.
+    IdentityMapFailed,
+    /// Subscription state machine got an invalid transition.
+    BadSubscriptionState,
+    /// Subscription not found in the table.
+    SubscriptionNotFound,
+};
+
 pub const ObsError = error{
     /// The metrics registry is full at compile-time-declared `max_metrics`.
     TooManyMetrics,
