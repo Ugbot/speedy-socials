@@ -29,6 +29,12 @@ fn flushLogsPhase(ud: ?*anyopaque) anyerror!void {
     try core.log.flushToStderr(log_ptr);
 }
 
+/// Shutdown phase: signal the AP outbox worker to drain before we
+/// close storage.
+fn flushApOutboxPhase(_: ?*anyopaque) anyerror!void {
+    activitypub.state.get().outbox.signalStop();
+}
+
 pub fn main() !void {
     // GPA only exists during boot, for the big static pool allocation.
     // After `serve()` starts, no further allocations occur on the hot
@@ -138,6 +144,29 @@ pub fn main() !void {
     // Relay's admin queries reuse the writer connection — they are
     // rare, admin-bound, and synchronous (good enough for Phase 5).
     relay.state.attachDb(db);
+
+    // ── ActivityPub worker pool + state wiring (Phase 3b) ──────────
+    const ap_workers = try allocator.create(activitypub.state.PoolType);
+    defer allocator.destroy(ap_workers);
+    ap_workers.initInPlace();
+    try ap_workers.start();
+    defer ap_workers.stop();
+
+    activitypub.attachDb(db);
+    activitypub.attachWorkers(ap_workers);
+    activitypub.setHostname("speedy-socials.local");
+
+    // Start the AP outbox worker by re-running init paths now that the
+    // db is attached. The plugin's init has already run with db=null;
+    // since the worker thread is idempotent we kick it now.
+    {
+        const st = activitypub.state.get();
+        if (!st.outbox.running.load(.acquire)) {
+            st.outbox.start(db, real_clock.clock(), &rng) catch {};
+        }
+    }
+
+    try shutdown.addPhase("flush_ap_outbox", flushApOutboxPhase, null);
 
     // ── HTTP server ────────────────────────────────────────────────
     var router = core.http.router.Router.init();
