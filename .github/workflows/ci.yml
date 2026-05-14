@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    name: build + test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    env:
+      ZIG_VERSION: "0.16.0"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Zig ${{ env.ZIG_VERSION }}
+        uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Cache Zig global cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/zig
+            ~/AppData/Local/zig
+            ~/Library/Caches/zig
+          key: zig-global-${{ runner.os }}-${{ env.ZIG_VERSION }}-${{ hashFiles('build.zig.zon') }}
+          restore-keys: |
+            zig-global-${{ runner.os }}-${{ env.ZIG_VERSION }}-
+
+      - name: Cache Zig local cache
+        uses: actions/cache@v4
+        with:
+          path: .zig-cache
+          key: zig-local-${{ runner.os }}-${{ env.ZIG_VERSION }}-${{ hashFiles('build.zig', 'build.zig.zon') }}-${{ hashFiles('src/**/*.zig', 'tests/**/*.zig', 'bench/**/*.zig') }}
+          restore-keys: |
+            zig-local-${{ runner.os }}-${{ env.ZIG_VERSION }}-${{ hashFiles('build.zig', 'build.zig.zon') }}-
+            zig-local-${{ runner.os }}-${{ env.ZIG_VERSION }}-
+
+      - name: Zig version
+        run: zig version
+
+      - name: Build
+        run: zig build
+
+      - name: Test
+        run: zig build test --summary all
+
+      - name: Simulation
+        run: zig build sim
+
+      - name: Benchmark (storage)
+        run: zig build bench-storage
