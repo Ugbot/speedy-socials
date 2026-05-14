@@ -13,6 +13,7 @@ pub const prng = @import("prng.zig");
 pub const plugin = @import("plugin.zig");
 pub const connection = @import("connection.zig");
 pub const server = @import("server.zig");
+pub const tls = @import("tls.zig");
 pub const storage = @import("storage.zig");
 pub const log = @import("log.zig");
 pub const metrics = @import("metrics.zig");
@@ -40,6 +41,7 @@ pub const ws = struct {
     pub const messages = @import("ws/messages.zig");
     pub const event_ring = @import("ws/event_ring.zig");
     pub const registry = @import("ws/registry.zig");
+    pub const upgrade_router = @import("ws/upgrade_router.zig");
 };
 
 test {
@@ -55,6 +57,7 @@ test {
     _ = plugin;
     _ = connection;
     _ = server;
+    _ = tls;
     _ = storage;
     _ = log;
     _ = metrics;
@@ -74,4 +77,5 @@ test {
     _ = ws.messages;
     _ = ws.event_ring;
     _ = ws.registry;
+    _ = ws.upgrade_router;
 }

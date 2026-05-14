@@ -106,7 +106,13 @@ pub const Builder = struct {
         try self.startStatus(status);
         try self.header("Content-Type", content_type);
         try self.headerFmt("Content-Length", "{d}", .{payload.len});
-        try self.header("Connection", "close");
+        // HTTP/1.1 keep-alive is the default per RFC 7230 §6.3, but
+        // emitting the header explicitly lets old clients + intermediaries
+        // make the right call. The server's keep-alive inner loop relies
+        // on handlers NOT declaring close here; handlers that want to
+        // force-close should call `header("Connection", "close")` after
+        // a manual `startStatus`.
+        try self.header("Connection", "keep-alive");
         try self.finishHeaders();
         try self.body(payload);
     }
