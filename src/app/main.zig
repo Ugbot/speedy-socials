@@ -11,6 +11,7 @@ const echo = @import("protocol_echo");
 const atproto = @import("protocol_atproto");
 const activitypub = @import("protocol_activitypub");
 const relay = @import("protocol_relay");
+const media = @import("protocol_media");
 
 const limits = core.limits;
 const Connection = core.connection.Connection;
@@ -134,6 +135,7 @@ pub fn main() !void {
     // `Registry.find` for "atproto" and "activitypub" (the sole
     // sibling-lookup carve-out; see src/protocols/relay/plugin.zig).
     _ = try registry.register(relay.plugin);
+    _ = try registry.register(media.plugin);
 
     // Hand the relay the registry pointer so it can do its one-time
     // sibling lookup during `initAll`.
@@ -188,6 +190,11 @@ pub fn main() !void {
 
     atproto.attachDb(db);
     atproto.attachWorkers(&atp_workers);
+
+    // ── Media plugin wiring (W1.4) ─────────────────────────────────
+    media.attachDb(db);
+    media.setBaseUrl("http://127.0.0.1:8080");
+    media.setMediaRoot("./media");
 
     // ── HTTP server ────────────────────────────────────────────────
     var router = core.http.router.Router.init();
@@ -256,4 +263,5 @@ test {
     _ = atproto;
     _ = activitypub;
     _ = relay;
+    _ = media;
 }
