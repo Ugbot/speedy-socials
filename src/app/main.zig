@@ -196,6 +196,13 @@ pub fn main() !void {
     try core.health.registerRoutes(&router, std.math.maxInt(u16));
     try registry.registerAllRoutes(&ctx, &router);
 
+    // ── WebSocket upgrade router ───────────────────────────────────
+    // Plugins that own a WS path (AT subscribeRepos, Mastodon
+    // streaming, future bridges) register here. Frozen before the
+    // server starts so the accept loop sees an immutable router.
+    var ws_upgrade_router = core.ws.upgrade_router.WsUpgradeRouter.init();
+    try registry.registerAllWsUpgrades(&ctx, &ws_upgrade_router);
+
     // ── Lock down the boot allocator ───────────────────────────────
     // From here on, the static allocator panics on any `alloc`/`resize`
     // call. The hot path is required to be allocation-free; this is the
@@ -213,6 +220,7 @@ pub fn main() !void {
         io,
         &ctx,
         &router,
+        &ws_upgrade_router,
         pool,
     );
     defer server.deinit();

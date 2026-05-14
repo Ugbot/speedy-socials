@@ -62,6 +62,18 @@ pub const max_plugins: u32 = 16;
 /// Maximum number of HTTP routes registered across all plugins.
 pub const max_routes: u32 = 256;
 
+/// Maximum number of WebSocket upgrade routes registered across all
+/// plugins. Each WS upgrade route is owned by one plugin and dispatches
+/// the connection after a successful 101 handshake. See
+/// `core/ws/upgrade_router.zig`.
+pub const max_ws_routes: u32 = 32;
+
+/// Maximum number of HTTP/1.1 requests served over a single TCP
+/// connection before the server closes it. Bounds the keep-alive
+/// inner loop in `core/server.zig`. Beyond this we send
+/// `Connection: close` on the final response and tear the socket down.
+pub const max_requests_per_connection: u32 = 100;
+
 /// Maximum length of a single HTTP route pattern (e.g. "/users/:u/inbox").
 pub const max_route_pattern_bytes: usize = 128;
 

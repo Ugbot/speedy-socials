@@ -13,6 +13,7 @@ const limits = @import("limits.zig");
 const errors = @import("errors.zig");
 const PluginError = errors.PluginError;
 const Router = @import("http/router.zig").Router;
+const WsUpgradeRouter = @import("ws/upgrade_router.zig").WsUpgradeRouter;
 const Clock = @import("clock.zig").Clock;
 const Rng = @import("rng.zig").Rng;
 const storage_mod = @import("storage.zig");
@@ -57,6 +58,13 @@ pub const Plugin = struct {
     deinit: *const fn (state: ?*anyopaque, ctx: *Context) void,
 
     register_routes: ?*const fn (state: ?*anyopaque, ctx: *Context, router: *Router, plugin_index: u16) anyerror!void = null,
+
+    /// Optional: register WebSocket upgrade routes. Plugins use this to
+    /// own a path's upgrade handshake + frame codec (AT subscribeRepos,
+    /// Mastodon streaming, future bridges). The hook is additive and
+    /// optional — its presence does not bump `plugin_abi_version`.
+    /// Patterns follow the same syntax as the HTTP router.
+    register_ws_upgrade: ?*const fn (state: ?*anyopaque, ctx: *Context, router: *WsUpgradeRouter, plugin_index: u16) anyerror!void = null,
 
     /// Called once at boot before migrations run. Plugins push their
     /// `Migration` entries into the shared `Schema`. Phase 2.
@@ -128,6 +136,20 @@ pub const Registry = struct {
         while (i < self.count) : (i += 1) {
             const e = self.entries[i];
             if (e.register_routes) |hook| {
+                try hook(e.state, ctx, router, i);
+            }
+        }
+        router.freeze();
+    }
+
+    /// Invoke every plugin's optional `register_ws_upgrade` hook and
+    /// freeze the upgrade router. Boot must call this before the server
+    /// starts accepting; the server treats the router as read-only.
+    pub fn registerAllWsUpgrades(self: *Registry, ctx: *Context, router: *WsUpgradeRouter) !void {
+        var i: u16 = 0;
+        while (i < self.count) : (i += 1) {
+            const e = self.entries[i];
+            if (e.register_ws_upgrade) |hook| {
                 try hook(e.state, ctx, router, i);
             }
         }

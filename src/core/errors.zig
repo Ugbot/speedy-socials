@@ -118,6 +118,21 @@ pub const WsError = error{
     RegistryShardFull,
     SubscriptionNotFound,
     StreamKeyTooLong,
+    // Upgrade dispatch — server.zig consults the WsUpgradeRouter when
+    // a request bears `Upgrade: websocket`. These errors surface from
+    // there.
+    UpgradeRouteNotFound,
+    NotAnUpgrade,
+};
+
+/// TLS subsystem errors. Tracks the pluggable backend contract from
+/// `core/tls.zig`. Phase W1.1 wires the trait + a no-op plain backend;
+/// the real BoringSSL backend lands in W1.2 and uses these variants for
+/// handshake / certificate / availability failures.
+pub const TlsError = error{
+    HandshakeFailed,
+    BackendUnavailable,
+    BadCert,
 };
 
 pub const RelayError = error{
