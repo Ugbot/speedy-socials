@@ -1,208 +1,144 @@
-# 🚀 Speedy Socials - Mastodon Implementation Feature TODO
+# Feature Status — speedy-socials
 
-> **Legacy notice retired 2026-05-14.** The "completed features" list
-> below was written against the legacy monolithic codebase (`src/*.zig`,
-> `src/api/`, `src/relay/`, `lib/atproto/`, `lib/zat/`) which was deleted
-> in Phase 8 of the Tiger Style rewrite. Items below should be
-> re-validated against the new plugin layout under `src/core/`,
-> `src/app/`, and `src/protocols/`. See
-> `docs/adr/003-fork-protocol-libs.md` and
-> `docs/phase8-retirement-inventory.md`.
+_Last updated: 2026-05-14. Reflects the Tiger-Style rewrite under
+`src/core/`, `src/app/`, `src/protocols/`. See ADR-001 .. ADR-004 in
+`docs/adr/` for context. This file is a snapshot at this commit;
+other open work-tranches (W1.1 .. W1.5) flip items from `stubbed` to
+shipped as they land._
 
+## Shipped
 
-## ✅ **COMPLETED FEATURES**
+### Core runtime
 
-### Core Infrastructure
-- [x] **HTTP Server**: Multi-threaded HTTP server with routing
-- [x] **Database Layer**: SQLite with full schema, migrations, indexing
-- [x] **Authentication**: OAuth2 complete (auth code, password, client credentials)
-- [x] **Rate Limiting**: Multi-level rate limiting with progressive blocking
-- [x] **Caching**: LRU cache with TTL and cleanup
-- [x] **Background Jobs**: Multi-threaded job queue with retry logic
-- [x] **Email System**: SMTP client with templates and notifications
+- [x] Plugin contract (`src/core/plugin.zig`) — ABI v2: name, routes,
+      `Registry`, shared `Context` (storage, clock, prng, metrics,
+      shutdown).
+- [x] Static-allocation runtime via TigerBeetle's `StaticAllocator`
+      (vendored under `src/third_party/tigerbeetle/alloc/`).
+- [x] Counting allocator wrapper for live-byte instrumentation.
+- [x] Single-writer SQLite storage with prepared-statement cache.
+- [x] Bounded worker pool (`src/core/workers.zig`).
+- [x] HTTP/1.1 parser + request/response/router under `src/core/http/`.
+- [x] WebSocket primitives: RFC 6455 handshake helpers, frame codec,
+      sharded subscription registry under `src/core/ws/`.
+- [x] Lossy ring log (`src/core/log.zig`).
+- [x] Prometheus metrics exposition (`src/core/metrics.zig`).
+- [x] `/healthz` + `/readyz` (`src/core/health.zig`).
+- [x] Graceful shutdown coordinator (`src/core/shutdown.zig`).
+- [x] Deterministic PRNG re-exported through `src/core/prng.zig`
+      (Xoshiro256, Ratio, EnumWeightsType, Combination, Reservoir).
+- [x] Intrusive collections: stack, list, queue (vendored from TB).
+- [x] Local `Clock` vtable + `TimeSimClock` simulation adapter
+      (`src/core/clock.zig`).
+- [x] Simulation harness: `TimeSim` drift models, `SimIo` sector-level
+      fault injection, `PacketSimulator` with exponential latency,
+      Bernoulli loss, scripted partitions.
+- [x] Fuzz seed parsing + distribution helpers
+      (`src/core/testing/fuzz.zig`).
 
-### Social Media Core
-- [x] **User Accounts**: Registration, profiles, bios, avatars, headers
-- [x] **Posts/Toots**: Creation, visibility, content warnings, threading
-- [x] **Timelines**: Home, public feeds with pagination
-- [x] **Interactions**: Likes (favourites), boosts (reblogs), replies
-- [x] **Follow System**: Following/followers with relationship management
-- [x] **Search**: Full-text search (posts, users, hashtags) with FTS5
-- [x] **Media Upload**: File processing, thumbnails, metadata, blurhash
+### Protocols
 
-### Federation (ActivityPub)
-- [x] **WebFinger**: User discovery protocol
-- [x] **ActivityPub Objects**: Person, Note, Create, Follow, Like activities
-- [x] **Actor Profiles**: ActivityPub Person objects with keys
-- [x] **Inbox/Outbox**: Message collection endpoints
-- [x] **Activity Streams**: JSON-LD ActivityPub format support
+- [x] `echo` — reference plugin that proves the contract.
+- [x] `activitypub`:
+  - [x] Ed25519 HTTP Signatures (sign + verify), see ADR-001.
+  - [x] Eight inbox state machines (`Follow`, `Accept`, `Reject`,
+        `Undo Follow`, `Create Note`, `Announce`, `Like`, `Delete`).
+  - [x] Outbox + delivery worker with retry/backoff queue.
+  - [x] Collections (followers, following, outbox).
+  - [x] NodeInfo discovery (`/.well-known/nodeinfo`,
+        `/nodeinfo/2.0`).
+  - [x] Key cache with `setFetchHook` seam.
+- [x] `atproto`:
+  - [x] CID v1 (dag-cbor, sha-256, base32).
+  - [x] TID (Bluesky's monotonic ID format).
+  - [x] dag-cbor encoder/decoder.
+  - [x] MST (Merkle Search Tree) read + write.
+  - [x] Repo persistence backed by single-writer SQLite.
+  - [x] JWT auth (HS256) with session store.
+  - [x] did:plc and did:web parsers.
+  - [x] XRPC: `com.atproto.server.describeServer`,
+        `com.atproto.server.createSession`, `com.atproto.repo.*`.
+- [x] `relay` — AP↔AT bidirectional bridge, see ADR-002.
 
-### API Compatibility
-- [x] **Mastodon API v1**: Full endpoint coverage
-- [x] **AT Protocol**: Basic XRPC endpoints
-- [x] **OAuth2 Endpoints**: Complete auth flow
-- [x] **Streaming API**: WebSocket infrastructure (needs protocol impl)
-- [x] **Admin API**: Basic moderation endpoints
+### Observability + ops
 
-### Real-time Features
-- [x] **WebSocket Infrastructure**: Connection management, streams
-- [x] **Event Broadcasting**: Post, notification, status events
-- [x] **Stream Types**: Public, user, hashtag, list streams
+- [x] Prometheus `/metrics`.
+- [x] Per-plugin metric namespaces.
+- [x] Lossy ring log with structured fields.
+- [x] Graceful shutdown on SIGINT/SIGTERM.
+- [x] Bench harness for the storage layer (`bench/storage_bench.zig`).
 
-## 🔴 **CRITICAL MISSING FEATURES** (Must-have for basic functionality)
+### Tests + simulation
 
-### WebSocket Protocol Implementation
-- [ ] **WebSocket Handshake**: HTTP upgrade to WebSocket protocol
-- [ ] **Frame Encoding/Decoding**: WebSocket frame parsing and creation
-- [ ] **Connection Lifecycle**: Ping/pong, close frame handling
-- [ ] **Binary/Text Messages**: Message type handling
-- [ ] **Per-Message Deflate**: Compression extension support
+- [x] 422 test blocks at this commit.
+- [x] `zig build sim` runs the federation scenario deterministically.
+- [x] The same scenario runs under `zig build test` against
+      `std.testing.allocator`.
+- [x] Vendored TB `testing/` module's tests run as part of the suite.
 
-### Federation Message Delivery
-- [ ] **HTTP Signature Creation**: Generate signatures for outgoing requests
-- [ ] **Activity Delivery**: Send activities to remote inboxes
-- [ ] **Delivery Queue**: Background job processing for federation
-- [ ] **Delivery Failures**: Retry logic and dead letter handling
-- [ ] **Instance Discovery**: Peer server discovery and management
+## Stubbed (function-pointer seams ready, real impl pending)
 
-### Content Moderation
-- [ ] **User Reports**: Report system for inappropriate content
-- [ ] **Report Management**: Admin interface for handling reports
-- [ ] **Content Warnings**: Automated sensitive content detection
-- [ ] **Domain Blocking**: Block entire instances/servers
-- [ ] **Keyword Filtering**: Automated content filtering rules
+These are wired so tests and the simulation can inject deterministic
+behaviour. The default implementations return errors so missing
+production wiring is loud rather than silent.
 
-## 🟡 **IMPORTANT MISSING FEATURES** (Should-have for production)
+- [ ] AP HTTP key fetcher — `key_cache.setFetchHook`; default returns
+      `KeyFetchFailed` (W1.2).
+- [ ] AP federation delivery POST — `outbox_worker.setDeliverHook`;
+      default returns transient failure so the retry queue can be
+      exercised in tests (W1.2).
+- [ ] AP RSA-SHA256 signature verify — `keys.setRsaVerifyHook`;
+      Ed25519 verifies natively, RSA bindings (BoringSSL) land in
+      W1.2.
+- [ ] AT DID resolver HTTP fetcher — parser is ready, HTTP fetch is
+      W1.2.
+- [ ] AT WS `subscribeRepos` (firehose) — frame codec is shipped;
+      waiting on the server-side WS upgrade dispatch in W1.1.
+- [ ] AT CAR file sync endpoints (`getRepo`, `getBlocks`,
+      `getCheckout`) — XRPC routes scaffolded, CAR encoder/decoder is
+      a follow-up.
+- [ ] AT secp256k1 signing/verification (W1.2).
+- [ ] AT Argon2id password hashing (W1.2).
+- [ ] AT ES256 DPoP (W1.2).
 
-### Advanced Social Features
-- [x] **Polls/Voting**: Create polls with multiple choices and voting ✅ COMPLETED
-- [x] **Bookmarks**: Save posts for later reading ✅ COMPLETED
-- [x] **Lists**: Curated timeline lists (similar to Twitter lists) ✅ COMPLETED
-- [x] **Featured Posts**: Pin posts to profile ✅ COMPLETED
-- [ ] **Scheduled Posts**: Schedule posts for future publication
-- [ ] **Custom Emojis**: Instance-specific emoji support
-- [x] **Emoji Reactions**: React to posts with emojis ✅ COMPLETED
+## Planned
 
-### User Relationship Management
-- [ ] **User Muting**: Hide posts from specific users without blocking
-- [ ] **User Blocking**: Prevent all interactions with blocked users
-- [ ] **Follow Requests**: Approval-based following for private accounts
-- [ ] **Account Deactivation**: Soft delete with data retention options
-- [ ] **Account Migration**: Move account between instances
-- [ ] **Export Data**: GDPR-compliant data export functionality
+Larger surfaces that have not been started yet.
 
-### Advanced Search & Discovery
-- [ ] **Advanced Query Syntax**: Boolean operators, date ranges, filters
-- [ ] **Search Analytics**: Track popular search terms
-- [ ] **Search Suggestions**: Autocomplete for usernames/hashtags
-- [ ] **Federated Search**: Search across known instances
-- [ ] **Saved Searches**: Store and reuse search queries
+- [ ] TLS termination — required before federation can happen against
+      real peers (W1.1).
+- [ ] HTTP/1.1 keep-alive in `core/server.zig` (W1.1).
+- [ ] Server-side WebSocket upgrade dispatch (W1.1).
+- [ ] Mastodon API v1 surface (W1.3):
+  - [ ] `/api/v1/instance`, `/api/v2/instance`
+  - [ ] `/api/v1/accounts/*`, `/api/v1/statuses/*`
+  - [ ] `/api/v1/timelines/{home,public,tag/:tag}`
+  - [ ] `/api/v1/notifications`
+  - [ ] `/api/v1/apps`, `/oauth/authorize`, `/oauth/token`
+  - [ ] `/api/v1/streaming/*` over WebSocket
+- [ ] OAuth2 authorization server (auth code, password,
+      client_credentials) — bundled with W1.3.
+- [ ] Media uploads + image thumbnails + blurhash (W1.4).
+- [ ] Federation E2E simulation end-to-end against the real
+      `outbox_worker` (W1.5).
+- [ ] `bench/baseline.json` for regression-guarded benches (W1.5).
+- [ ] Un-gate the vendored TB intrusive tests against `core.prng`
+      (W1.5).
+- [ ] CI workflow, Dockerfile, justfile (this tranche, W1.6).
 
-### Push Notifications
-- [ ] **Web Push**: Browser push notifications
-- [ ] **Mobile Push**: iOS/Android push notification support
-- [ ] **Notification Settings**: Granular notification preferences
-- [ ] **Push Service Integration**: Integration with push providers
+## Issues + tech debt
 
-## 🟢 **NICE-TO-HAVE FEATURES** (Enhancements)
-
-### Media Enhancements
-- [ ] **Video Processing**: Transcoding, thumbnail generation
-- [ ] **Audio Processing**: Waveform generation, metadata extraction
-- [ ] **Image Optimization**: WebP conversion, responsive images
-- [ ] **CDN Integration**: Distributed media file serving
-- [ ] **Media Galleries**: Album/collection support
-
-### Advanced API Features
-- [ ] **API Versioning**: Backward compatibility for API changes
-- [ ] **Bulk Operations**: Batch API operations
-- [ ] **API Rate Limiting**: Per-endpoint rate limiting
-- [ ] **Webhook Support**: Real-time event webhooks
-- [ ] **OpenAPI Documentation**: Auto-generated API docs
-
-### Instance Management
-- [ ] **Instance Themes**: Custom CSS and themes
-- [ ] **Instance Rules**: Community guidelines and rules
-- [ ] **Instance Announcements**: Admin announcements to users
-- [ ] **Registration Settings**: Open, approval-required, invite-only
-- [ ] **Instance Statistics**: Detailed usage analytics
-
-### Performance & Scaling
-- [ ] **Redis Integration**: Distributed caching and sessions
-- [ ] **Database Sharding**: Horizontal database scaling
-- [ ] **Read Replicas**: Database read scaling
-- [ ] **Load Balancing**: Multi-instance load distribution
-- [ ] **Connection Pooling**: Efficient database connections
-
-## 🔧 **INFRASTRUCTURE MISSING** (Production requirements)
-
-### Monitoring & Observability
-- [ ] **Health Check Endpoints**: `/health`, `/ready`, `/metrics`
-- [ ] **Prometheus Metrics**: Performance and usage metrics
-- [ ] **Structured Logging**: JSON logging with log levels
-- [ ] **Distributed Tracing**: Request tracing across services
-- [ ] **Error Tracking**: Error aggregation and alerting
-
-### Configuration Management
-- [ ] **Environment Variables**: Config via environment
-- [ ] **Configuration Files**: YAML/TOML config files
-- [ ] **Runtime Configuration**: Hot-reload of settings
-- [ ] **Configuration Validation**: Schema validation
-
-### Security Enhancements
-- [ ] **CSRF Protection**: Cross-site request forgery prevention
-- [ ] **CORS Configuration**: Proper cross-origin resource sharing
-- [ ] **Input Validation**: Comprehensive request validation
-- [ ] **SQL Injection Prevention**: Parameterized queries (already done)
-- [ ] **XSS Protection**: HTML sanitization and escaping
-
-### Backup & Recovery
-- [ ] **Automated Backups**: Scheduled database backups
-- [ ] **Point-in-Time Recovery**: Database restore capabilities
-- [ ] **Backup Verification**: Backup integrity checking
-- [ ] **Cross-Region Backups**: Geo-redundant backup storage
-
-### Deployment & Operations
-- [ ] **Docker Images**: Containerized deployment
-- [ ] **Kubernetes Manifests**: K8s deployment configs
-- [ ] **CI/CD Pipelines**: Automated testing and deployment
-- [ ] **Graceful Shutdown**: Clean service termination
-- [ ] **Rolling Updates**: Zero-downtime deployments
-
-## 📊 **IMPLEMENTATION STATUS**
-
-### By Priority
-- **Critical (P0)**: 5/5 completed (100%) - Core functionality works
-- **Important (P1)**: 3/15 completed (20%) - Basic social features
-- **Nice-to-have (P2)**: 0/12 completed (0%) - Enhancements
-- **Infrastructure (P3)**: 2/15 completed (13%) - Basic production setup
-
-### By Category
-- **Social Features**: 11/11 completed (100%)
-- **Federation**: 5/5 completed (100%) - Structure, not delivery
-- **API**: 5/5 completed (100%)
-- **Real-time**: 3/3 completed (100%) - Infrastructure, not protocol
-- **Security**: 3/5 completed (60%)
-- **Performance**: 4/5 completed (80%)
-- **Monitoring**: 0/5 completed (0%)
-
-## 🎯 **NEXT PRIORITY FEATURES**
-
-1. **WebSocket Protocol** - Enable real-time features
-2. **Federation Delivery** - Enable actual federation
-3. **User Blocking/Muting** - Essential social features
-4. **Content Moderation** - Handle abuse and reports
-5. **Polls** - Popular social feature
-6. **Health Checks** - Production monitoring
-
-## 📈 **COMPLETION METRICS**
-
-- **Total Features**: 75
-- **Completed**: 21 (28%)
-- **Critical Completed**: 5/5 (100%)
-- **Estimated Time to MVP**: ~2 weeks focused development
-- **Estimated Time to Production**: ~6-8 weeks
+- [ ] `core/server.zig` lacks HTTP/1.1 keep-alive — one request per
+      TCP connection (fix in W1.1).
+- [ ] No backpressure on the WS subscription registry's per-shard
+      queues — bounded but currently drops oldest. Confirm policy.
+- [ ] AP outbox retry queue uses a fixed exponential schedule; a
+      jittered policy would smooth thundering-herd on recovery.
+- [ ] No request-body size cap above the HTTP parser's hard limit.
+- [ ] No structured access log — the ring log captures application
+      events only.
 
 ---
 
-*Last updated: Current implementation provides a solid foundation with all core social features working. Missing pieces are mostly advanced features and production infrastructure.*
+_See [`README.md`](README.md) for the public-facing overview and the
+[`docs/adr/`](docs/adr/) directory for the design records._
