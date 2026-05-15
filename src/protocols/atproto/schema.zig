@@ -137,6 +137,23 @@ pub const sessions_migration: Migration = .{
     .down = "DROP TABLE atp_sessions;",
 };
 
+/// Per-DID Argon2id password hashes for the legacy `createSession`
+/// path. Migrating from the stub-accept-any policy: empty table means
+/// nobody can log in via password, which is the correct default until
+/// admins provision identities.
+pub const user_passwords_migration: Migration = .{
+    .id = 2009,
+    .name = "atproto:user_passwords",
+    .up =
+    \\CREATE TABLE IF NOT EXISTS atp_user_passwords (
+    \\    did           TEXT PRIMARY KEY,
+    \\    password_hash BLOB NOT NULL,
+    \\    created_at    INTEGER NOT NULL
+    \\) STRICT;
+    ,
+    .down = "DROP TABLE atp_user_passwords;",
+};
+
 pub const all_migrations = [_]Migration{
     repos_migration,
     commits_migration,
@@ -146,4 +163,5 @@ pub const all_migrations = [_]Migration{
     firehose_cursor_migration,
     firehose_events_migration,
     sessions_migration,
+    user_passwords_migration,
 };

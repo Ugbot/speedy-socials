@@ -10,11 +10,82 @@
 //! caller-supplied buffers. Body is a fixed-shape JSON payload.
 
 const std = @import("std");
+const c = @import("sqlite").c;
 const core = @import("core");
 const AtpError = core.errors.AtpError;
 const assertLe = core.assert.assertLe;
 
 const keypair = @import("keypair.zig");
+const argon2id = core.crypto.argon2id;
+
+// ── Password registration / verification ───────────────────────────
+//
+// Stored as Argon2id PHC strings in `atp_user_passwords` (migration
+// id 2009). The `createSession` route in `routes.zig` calls
+// `verifyPassword` instead of the prior accept-any-nonempty stub.
+
+pub const PasswordError = error{
+    PrepareFailed,
+    StepFailed,
+    HashFailed,
+    DidTooLong,
+    DuplicateDid,
+};
+
+pub const max_did_input_bytes: usize = max_did_bytes;
+
+pub fn setPassword(
+    db: *c.sqlite3,
+    rng: *core.rng.Rng,
+    clock: core.clock.Clock,
+    did: []const u8,
+    password: []const u8,
+) PasswordError!void {
+    if (did.len == 0 or did.len > max_did_input_bytes) return error.DidTooLong;
+
+    var salt: [argon2id.salt_length]u8 = undefined;
+    rng.random().bytes(&salt);
+
+    var phc_buf: [argon2id.max_phc_bytes]u8 = undefined;
+    const phc = argon2id.hashDefault(password, salt, &phc_buf) catch return error.HashFailed;
+
+    const now = clock.wallUnix();
+    const sql =
+        \\INSERT OR REPLACE INTO atp_user_passwords(did, password_hash, created_at)
+        \\VALUES (?, ?, ?)
+    ;
+    var stmt: ?*c.sqlite3_stmt = null;
+    if (c.sqlite3_prepare_v2(db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.PrepareFailed;
+    defer _ = c.sqlite3_finalize(stmt);
+    _ = c.sqlite3_bind_text(stmt, 1, did.ptr, @intCast(did.len), c.sqliteTransientAsDestructor());
+    _ = c.sqlite3_bind_blob(stmt, 2, phc.ptr, @intCast(phc.len), c.sqliteTransientAsDestructor());
+    _ = c.sqlite3_bind_int64(stmt, 3, now);
+    if (c.sqlite3_step(stmt.?) != c.SQLITE_DONE) return error.StepFailed;
+}
+
+pub fn verifyPassword(
+    db: *c.sqlite3,
+    did: []const u8,
+    password: []const u8,
+) bool {
+    if (did.len == 0 or did.len > max_did_input_bytes) return false;
+    const sql = "SELECT password_hash FROM atp_user_passwords WHERE did = ? LIMIT 1";
+    var stmt: ?*c.sqlite3_stmt = null;
+    if (c.sqlite3_prepare_v2(db, sql, -1, &stmt, null) != c.SQLITE_OK) {
+        if (stmt != null) _ = c.sqlite3_finalize(stmt);
+        return false;
+    }
+    defer _ = c.sqlite3_finalize(stmt);
+    _ = c.sqlite3_bind_text(stmt, 1, did.ptr, @intCast(did.len), c.sqliteTransientAsDestructor());
+    if (c.sqlite3_step(stmt.?) != c.SQLITE_ROW) return false;
+    const ptr = c.sqlite3_column_blob(stmt.?, 0);
+    const n: usize = @intCast(c.sqlite3_column_bytes(stmt.?, 0));
+    if (n == 0 or n > argon2id.max_phc_bytes or ptr == null) return false;
+    var hash_buf: [argon2id.max_phc_bytes]u8 = undefined;
+    const p: [*]const u8 = @ptrCast(ptr);
+    @memcpy(hash_buf[0..n], p[0..n]);
+    return argon2id.verifyDefault(password, hash_buf[0..n]) catch false;
+}
 
 pub const access_ttl_seconds: i64 = 60 * 60;
 pub const refresh_ttl_seconds: i64 = 60 * 60 * 24 * 90;
@@ -352,4 +423,55 @@ test "constantTimeEq" {
     try testing.expect(constantTimeEq("abc", "abc"));
     try testing.expect(!constantTimeEq("abc", "abd"));
     try testing.expect(!constantTimeEq("abc", "abcd"));
+}
+
+// ── Argon2id password integration tests ────────────────────────────
+
+const schema_mod = @import("schema.zig");
+
+fn pwTestDb() !*c.sqlite3 {
+    const db = try core.storage.sqlite.openWriter(":memory:");
+    for (schema_mod.all_migrations) |m| {
+        const sql_z = try testing.allocator.dupeZ(u8, m.up);
+        defer testing.allocator.free(sql_z);
+        var errmsg: [*c]u8 = null;
+        _ = c.sqlite3_exec(db, sql_z.ptr, null, null, &errmsg);
+        if (errmsg != null) c.sqlite3_free(errmsg);
+    }
+    return db;
+}
+
+fn configureArgonForTests() void {
+    argon2id.resetForTests();
+    const T = struct {
+        var threaded: ?std.Io.Threaded = null;
+    };
+    if (T.threaded == null) T.threaded = std.Io.Threaded.init(testing.allocator, .{});
+    argon2id.configure(testing.allocator, T.threaded.?.io());
+}
+
+test "atproto auth: setPassword + verifyPassword round-trip" {
+    configureArgonForTests();
+    defer argon2id.resetForTests();
+    const db = try pwTestDb();
+    defer core.storage.sqlite.closeDb(db);
+    var rng = core.rng.Rng.init(0xABCD_1234);
+    var sc = core.clock.SimClock.init(1_700_000_000);
+    try setPassword(db, &rng, sc.clock(), "did:plc:alice", "open sesame");
+    try testing.expect(verifyPassword(db, "did:plc:alice", "open sesame"));
+    try testing.expect(!verifyPassword(db, "did:plc:alice", "wrong"));
+    try testing.expect(!verifyPassword(db, "did:plc:bob", "open sesame"));
+}
+
+test "atproto auth: setPassword overwrites prior hash" {
+    configureArgonForTests();
+    defer argon2id.resetForTests();
+    const db = try pwTestDb();
+    defer core.storage.sqlite.closeDb(db);
+    var rng = core.rng.Rng.init(7);
+    var sc = core.clock.SimClock.init(1);
+    try setPassword(db, &rng, sc.clock(), "did:plc:carol", "old");
+    try setPassword(db, &rng, sc.clock(), "did:plc:carol", "new");
+    try testing.expect(!verifyPassword(db, "did:plc:carol", "old"));
+    try testing.expect(verifyPassword(db, "did:plc:carol", "new"));
 }

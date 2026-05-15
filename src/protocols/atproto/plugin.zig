@@ -97,6 +97,7 @@ test {
     _ = did_resolver;
     _ = oauth_dpop;
     _ = car;
+    _ = @import("routes.zig");
 }
 
 test "atproto plugin registers" {

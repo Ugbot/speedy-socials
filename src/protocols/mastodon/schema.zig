@@ -108,12 +108,35 @@ pub const reblogs_migration: Migration = .{
     .down = "DROP TABLE mastodon_reblogs;",
 };
 
+/// Mastodon users — local password-backed accounts.
+///
+/// We deliberately keep this table separate from the AP plugin's
+/// `ap_users` so that crossing protocol boundaries doesn't require
+/// mutating someone else's schema. The `handle` column matches the
+/// public Mastodon username; downstream `ap_users.username` is created
+/// on first login so the two stay in sync.
+pub const users_migration: Migration = .{
+    .id = 4006,
+    .name = "mastodon:users",
+    .up =
+    \\CREATE TABLE IF NOT EXISTS mastodon_users (
+    \\    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    \\    handle        TEXT NOT NULL UNIQUE,
+    \\    password_hash BLOB NOT NULL,
+    \\    created_at    INTEGER NOT NULL
+    \\) STRICT;
+    \\CREATE INDEX IF NOT EXISTS mastodon_users_handle_idx ON mastodon_users (handle);
+    ,
+    .down = "DROP TABLE mastodon_users;",
+};
+
 pub const all_migrations = [_]Migration{
     apps_migration,
     tokens_migration,
     notifications_migration,
     favourites_migration,
     reblogs_migration,
+    users_migration,
 };
 
 pub fn register(schema: *core.storage.Schema) !void {

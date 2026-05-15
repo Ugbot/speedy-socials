@@ -176,3 +176,44 @@ test "car: BufferTooSmall on short dst" {
     const roots = [_]cid_mod.Cid{cid_mod.computeDagCbor("x")};
     try testing.expectError(error.BufferTooSmall, writeHeader(&roots, &out));
 }
+
+// ── W2.3 streamer tests ────────────────────────────────────────────
+
+test "car: empty roots header round-trips" {
+    var out: [256]u8 = undefined;
+    const roots: [0]cid_mod.Cid = .{};
+    const n = try writeHeader(&roots, &out);
+    var r = Reader.init(out[0..n]);
+    try r.skipHeader();
+    try testing.expect((try r.next()) == null);
+}
+
+test "car: multi-block stream preserves order" {
+    var buf: [4096]u8 = undefined;
+    var pos: usize = 0;
+    const cids = [_]cid_mod.Cid{
+        cid_mod.computeDagCbor("block-1"),
+        cid_mod.computeDagCbor("block-2"),
+        cid_mod.computeDagCbor("block-3"),
+    };
+    const roots = [_]cid_mod.Cid{cids[0]};
+    pos += try writeHeader(&roots, buf[pos..]);
+    pos += try writeBlock(cids[0], "block-1", buf[pos..]);
+    pos += try writeBlock(cids[1], "block-2", buf[pos..]);
+    pos += try writeBlock(cids[2], "block-3", buf[pos..]);
+
+    var r = Reader.init(buf[0..pos]);
+    var i: usize = 0;
+    while (try r.next()) |b| : (i += 1) {
+        try testing.expectEqualSlices(u8, cids[i].raw(), b.cid.raw());
+    }
+    try testing.expectEqual(@as(usize, 3), i);
+}
+
+test "car: varint encodes max u64 in 10 bytes" {
+    var buf: [10]u8 = undefined;
+    const n = try writeVarint(std.math.maxInt(u64), &buf);
+    try testing.expectEqual(@as(usize, 10), n);
+    const r = try readVarint(buf[0..n]);
+    try testing.expectEqual(@as(u64, std.math.maxInt(u64)), r.value);
+}

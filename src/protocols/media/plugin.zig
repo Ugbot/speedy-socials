@@ -32,6 +32,7 @@ pub const multipart = @import("multipart.zig");
 pub const blurhash = @import("blurhash.zig");
 pub const image = @import("image.zig");
 pub const pixels = @import("pixels.zig");
+pub const api = @import("api.zig");
 
 const Plugin = core.plugin.Plugin;
 const Context = core.plugin.Context;
@@ -85,6 +86,7 @@ test {
     _ = image;
     _ = pixels;
     _ = routes;
+    _ = api;
 }
 
 test "media plugin registers" {
