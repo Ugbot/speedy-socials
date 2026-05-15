@@ -79,6 +79,10 @@ pub fn attachWsRegistry(reg: *core.ws.registry.Registry) void {
     state.attachWsRegistry(reg);
 }
 
+pub fn attachHttpClient(client: *core.http_client.Client) void {
+    state.attachHttpClient(client);
+}
+
 pub const plugin: Plugin = .{
     .name = "atproto",
     .version = 1,

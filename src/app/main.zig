@@ -37,6 +37,56 @@ fn flushApOutboxPhase(_: ?*anyopaque) anyerror!void {
     activitypub.state.get().outbox.signalStop();
 }
 
+// ── Federation hook trampolines ───────────────────────────────────────
+// The existing hook ABIs (`FetchHookFn`, `DeliverFn`, `HttpFetcher`) do
+// not carry a closure pointer. We bind module-level state via
+// `activitypub.attachHttpClient` / `atproto.attachHttpClient` at boot,
+// and these trampolines read it back.
+
+fn apKeyFetchClosure(key_id: []const u8, out_pem: []u8) core.errors.FedError!usize {
+    const client = activitypub.state.get().http_client orelse return error.KeyFetchFailed;
+    return activitypub.key_fetcher_http.httpFetch(client, key_id, out_pem);
+}
+
+fn apDeliveryClosure(
+    target_inbox: []const u8,
+    payload: []const u8,
+    key_id: []const u8,
+) activitypub.outbox_worker.DeliveryResult {
+    const st = activitypub.state.get();
+    const client = st.http_client orelse return .transient_failure;
+    const db = st.db orelse return .transient_failure;
+    return activitypub.http_delivery.deliver(
+        client,
+        db,
+        st.clock.wallUnix(),
+        target_inbox,
+        payload,
+        key_id,
+    );
+}
+
+fn atDidFetchClosure(url: []const u8, out: []u8) core.errors.AtpError!usize {
+    const client = atproto.state.get().http_client orelse return error.NotImplemented;
+    var resp_storage: core.http_client.Response = .{ .status = 0 };
+    const resp = &resp_storage;
+    const req: core.http_client.Request = .{
+        .method = .get,
+        .url = url,
+        .headers = &[_]core.http_client.Header{
+            .{ .name = "Accept", .value = "application/did+ld+json, application/json" },
+        },
+        .body = "",
+        .timeout_ms = 15_000,
+    };
+    client.sendSync(req, resp) catch return error.NotImplemented;
+    if (resp.status < 200 or resp.status >= 300) return error.NotImplemented;
+    const body = resp.body();
+    const n = @min(body.len, out.len);
+    @memcpy(out[0..n], body[0..n]);
+    return n;
+}
+
 pub fn main() !void {
     // GPA only exists during boot, for the big static pool allocation.
     // After `serve()` starts, no further allocations occur on the hot
@@ -197,6 +247,15 @@ pub fn main() !void {
     defer tls_backend_state.deinit();
     core.http_client.setTlsBackend(tls_backend_state.backend());
     log_ptr.info("boot", "tls backend wired (native outbound)");
+
+    // Bind the HTTP client to the protocol plugins so their federation
+    // hook trampolines can find it. After this, AP key fetches +
+    // outbox deliveries and AT DID resolutions hit the wire for real.
+    activitypub.attachHttpClient(&http_client);
+    atproto.attachHttpClient(&http_client);
+    activitypub.key_cache.setFetchHook(apKeyFetchClosure);
+    activitypub.outbox_worker.setDeliverHook(apDeliveryClosure);
+    atproto.did_resolver.setFetcher(atDidFetchClosure);
 
     log_ptr.info("boot", "outbound http client + worker pool ready");
 

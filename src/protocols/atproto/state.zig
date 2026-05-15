@@ -38,6 +38,10 @@ pub const State = struct {
     /// WS subscription registry, wired by the composition root after
     /// `core.ws.registry.Registry.initInPlace`. Null until attached.
     ws_registry: ?*core.ws.registry.Registry = null,
+    /// Outbound HTTP client wired by the composition root. Null until
+    /// `attachHttpClient` is called. The DID resolver fetcher closure
+    /// reads it; it fails closed (NotFound) when null.
+    http_client: ?*core.http_client.Client = null,
 };
 
 var instance: State = .{};
@@ -70,6 +74,10 @@ pub fn attachWorkers(pool: *anyopaque) void {
 
 pub fn attachWsRegistry(reg: *core.ws.registry.Registry) void {
     instance.ws_registry = reg;
+}
+
+pub fn attachHttpClient(client: *core.http_client.Client) void {
+    instance.http_client = client;
 }
 
 pub fn get() *State {

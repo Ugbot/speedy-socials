@@ -53,6 +53,12 @@ pub const State = struct {
     /// drain in `plugin.deinit`.
     outbox: outbox_worker.Worker = .{},
 
+    /// Outbound HTTP client wired by the composition root. Null until
+    /// `attachHttpClient` is called. The federation hook trampolines
+    /// dereference this; they fail closed (KeyFetchFailed /
+    /// transient_failure) when it is null.
+    http_client: ?*core.http_client.Client = null,
+
     pub fn hostname(self: *const State) []const u8 {
         if (self.hostname_len == 0) return "speedy-socials.local";
         return self.hostname_buf[0..self.hostname_len];
@@ -75,6 +81,10 @@ pub fn attachDb(db: *c.sqlite3) void {
 
 pub fn attachWorkers(pool: *PoolType) void {
     instance.workers = pool;
+}
+
+pub fn attachHttpClient(client: *core.http_client.Client) void {
+    instance.http_client = client;
 }
 
 pub fn setClockAndRng(clock: Clock, rng: *Rng) void {
