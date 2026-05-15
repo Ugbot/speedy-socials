@@ -31,7 +31,56 @@ pub const Error = error{
     BufferTooSmall,
     HashFailed,
     VerifyFailed,
+    NotConfigured,
 };
+
+// ── Module-level runtime handles ───────────────────────────────────
+//
+// Password hashing needs an allocator (~64 MiB of working blocks per
+// `params.m`) and a `std.Io` to drive argon2's blockwise compression.
+// Both must outlive any verify/hash call. The composition root wires
+// them once at boot, BEFORE the static allocator transitions to its
+// locked mode — so the GPA-backed allocator we capture here is still
+// alive and usable for password operations (which are rare, off the
+// hot per-request path).
+//
+// The `_default` wrappers below pull the handles from these slots and
+// forward to `hash` / `verify`. Tests that want to bypass the global
+// state continue to call `hash` / `verify` directly.
+
+var configured_allocator: ?std.mem.Allocator = null;
+var configured_io: ?std.Io = null;
+
+pub fn configure(allocator: std.mem.Allocator, io: std.Io) void {
+    configured_allocator = allocator;
+    configured_io = io;
+}
+
+pub fn isConfigured() bool {
+    return configured_allocator != null and configured_io != null;
+}
+
+/// Convenience wrapper: hash with the module-configured allocator + io.
+pub fn hashDefault(password: []const u8, salt: [salt_length]u8, out: []u8) Error![]const u8 {
+    const a = configured_allocator orelse return error.NotConfigured;
+    const io = configured_io orelse return error.NotConfigured;
+    return hash(a, io, password, salt, out);
+}
+
+/// Convenience wrapper: verify with the module-configured allocator + io.
+pub fn verifyDefault(password: []const u8, encoded: []const u8) Error!bool {
+    const a = configured_allocator orelse return error.NotConfigured;
+    const io = configured_io orelse return error.NotConfigured;
+    return verify(a, io, password, encoded);
+}
+
+/// Test-only: clear the configured handles. Lets unit tests guarantee
+/// they start from a clean slate when they're checking the configure
+/// path itself.
+pub fn resetForTests() void {
+    configured_allocator = null;
+    configured_io = null;
+}
 
 /// Hash `password` with `salt` and return a PHC-encoded ASCII string
 /// written into `out`. Returns the slice consumed.
@@ -227,6 +276,28 @@ test "argon2id: encoded form is reproducible for identical salt" {
     const a = try hash(testing.allocator, io, "hunter2", salt, &out_a);
     const b = try hash(testing.allocator, io, "hunter2", salt, &out_b);
     try testing.expectEqualStrings(a, b);
+}
+
+test "argon2id: hashDefault/verifyDefault require configure" {
+    resetForTests();
+    var out: [max_phc_bytes]u8 = undefined;
+    const salt: [salt_length]u8 = [_]u8{1} ** salt_length;
+    try testing.expectError(error.NotConfigured, hashDefault("x", salt, &out));
+    try testing.expectError(error.NotConfigured, verifyDefault("x", "$argon2id$"));
+}
+
+test "argon2id: configure + default helpers round-trip" {
+    resetForTests();
+    configure(testing.allocator, testIo());
+    defer resetForTests();
+    try testing.expect(isConfigured());
+    var out: [max_phc_bytes]u8 = undefined;
+    var salt: [salt_length]u8 = undefined;
+    var rng = std.Random.DefaultPrng.init(0xA5A5_5A5A_DEAD_BEEF);
+    rng.random().bytes(&salt);
+    const enc = try hashDefault("rotating cipher", salt, &out);
+    try testing.expect(try verifyDefault("rotating cipher", enc));
+    try testing.expect(!try verifyDefault("rotating cipherX", enc));
 }
 
 test "argon2id: verify rejects tampered encoded blob" {

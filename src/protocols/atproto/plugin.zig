@@ -113,6 +113,7 @@ test {
     _ = oauth_dpop;
     _ = car;
     _ = sync_firehose;
+    _ = @import("routes.zig");
 }
 
 test "atproto plugin registers" {

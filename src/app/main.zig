@@ -259,6 +259,14 @@ pub fn main() !void {
 
     log_ptr.info("boot", "outbound http client + worker pool ready");
 
+    // Argon2id needs an allocator + io for password hash/verify. We
+    // configure them here, before the static allocator transitions to
+    // its locked mode. Password operations only run on the rare login
+    // path; they intentionally borrow the GPA-backed allocator (the
+    // hot per-request path remains alloc-free).
+    core.crypto.argon2id.configure(gpa_allocator, io);
+    log_ptr.info("boot", "argon2id configured (gpa + io)");
+
     // ── Mastodon plugin wiring (W1.3) ─────────────────────────────
     mastodon.attachDb(db);
     mastodon.setHostname("speedy-socials.local");

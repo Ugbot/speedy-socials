@@ -21,6 +21,7 @@ const oauth = @import("oauth.zig");
 const jwt = @import("jwt.zig");
 const auth = @import("auth.zig");
 const http_util = @import("http_util.zig");
+const users_mod = @import("users.zig");
 const accounts_routes = @import("routes/accounts.zig");
 const statuses_routes = @import("routes/statuses.zig");
 const timelines_routes = @import("routes/timelines.zig");
@@ -39,6 +40,13 @@ const PathParams = core.http.router.PathParams;
 const HandlerContext = core.http.router.HandlerContext;
 
 const testing = std.testing;
+
+// Argon2id needs an allocator + Io; tests share one threaded backend.
+var test_io_storage: ?std.Io.Threaded = null;
+fn ensureArgonConfigured() void {
+    if (test_io_storage == null) test_io_storage = std.Io.Threaded.init(testing.allocator, .{});
+    core.crypto.argon2id.configure(testing.allocator, test_io_storage.?.io());
+}
 
 // ── Test harness ─────────────────────────────────────────────────
 
@@ -69,6 +77,7 @@ const Fixture = struct {
         state_mod.setClockAndRng(self.ctx.clock, &self.rng);
         state_mod.setHostname("speedy.test");
         state_mod.attachDb(self.db);
+        ensureArgonConfigured();
     }
 
     fn deinit(self: *Fixture) void {
@@ -224,6 +233,7 @@ test "OAuth: password grant binds a user_id" {
     var name_buf: [8]u8 = undefined;
     const username = randomUsername(&fx.rng, &name_buf);
     _ = try db_mod.insertUser(fx.db, username, username, "", fx.sim.clock().wallUnix());
+    _ = try users_mod.createUser(fx.db, &fx.rng, fx.sim.clock(), username, "hunter2");
 
     // Register app.
     var app_call = try makeCall(alloc, &fx, .post, "/api/v1/apps", &.{}, "{\"client_name\":\"app\"}");
@@ -260,6 +270,7 @@ test "OAuth: revoked token fails verify_credentials" {
     var name_buf: [8]u8 = undefined;
     const username = randomUsername(&fx.rng, &name_buf);
     _ = try db_mod.insertUser(fx.db, username, username, "", fx.sim.clock().wallUnix());
+    _ = try users_mod.createUser(fx.db, &fx.rng, fx.sim.clock(), username, "x");
 
     var app_call = try makeCall(alloc, &fx, .post, "/api/v1/apps", &.{}, "{\"client_name\":\"app\"}");
     defer alloc.destroy(app_call);
@@ -307,6 +318,7 @@ test "OAuth: revoke handles already-expired token" {
     var name_buf: [8]u8 = undefined;
     const username = randomUsername(&fx.rng, &name_buf);
     _ = try db_mod.insertUser(fx.db, username, username, "", fx.sim.clock().wallUnix());
+    _ = try users_mod.createUser(fx.db, &fx.rng, fx.sim.clock(), username, "x");
 
     var app_call = try makeCall(alloc, &fx, .post, "/api/v1/apps", &.{}, "{\"client_name\":\"app\"}");
     defer alloc.destroy(app_call);
@@ -444,6 +456,11 @@ fn mintUserAndToken(fx: *Fixture, alloc: std.mem.Allocator, scopes: []const u8, 
     const uname = randomUsername(&fx.rng, name_buf);
     out_username.* = uname;
     out_user_id.* = try db_mod.insertUser(fx.db, uname, uname, "", fx.sim.clock().wallUnix());
+    // The Mastodon-local credential row — INSERT OR IGNORE in createUser
+    // tolerates the pre-existing ap_users row that db_mod.insertUser
+    // just wrote. Password is the literal "x" used throughout these
+    // tests (the OAuth body below sends password=x).
+    _ = try users_mod.createUser(fx.db, &fx.rng, fx.sim.clock(), uname, "x");
 
     var app_call = try makeCall(alloc, fx, .post, "/api/v1/apps", &.{}, "{\"client_name\":\"app\"}");
     defer alloc.destroy(app_call);
@@ -951,7 +968,7 @@ test "instance: peers + activity return arrays" {
 
 // ── Media + streaming stubs ──────────────────────────────────────
 
-test "media: v1 returns 501" {
+test "media: v1 without multipart returns 400" {
     const alloc = testing.allocator;
     var fx = Fixture.init(0xF3);
     try fx.start();
@@ -960,10 +977,12 @@ test "media: v1 returns 501" {
     defer alloc.destroy(call);
     var hc = call.handler();
     try media_routes.handleUploadV1(&hc);
-    try testing.expect(std.mem.startsWith(u8, call.statusLine(), "HTTP/1.1 501"));
+    // W2.3: route is wired to the media plugin; with no Content-Type
+    // header we now bounce 400 instead of the prior 501 stub.
+    try testing.expect(std.mem.startsWith(u8, call.statusLine(), "HTTP/1.1 400"));
 }
 
-test "media: v2 returns 501" {
+test "media: v2 without multipart returns 400" {
     const alloc = testing.allocator;
     var fx = Fixture.init(0xF4);
     try fx.start();
@@ -972,7 +991,58 @@ test "media: v2 returns 501" {
     defer alloc.destroy(call);
     var hc = call.handler();
     try media_routes.handleUploadV2(&hc);
-    try testing.expect(std.mem.startsWith(u8, call.statusLine(), "HTTP/1.1 501"));
+    try testing.expect(std.mem.startsWith(u8, call.statusLine(), "HTTP/1.1 400"));
+}
+
+test "media: v2 multipart upload returns Mastodon attachment JSON" {
+    // The media plugin needs its own state + attached DB independently
+    // of the mastodon plugin's fixture. Mirror the prime / reset dance
+    // the media tests themselves use.
+    const alloc = testing.allocator;
+    var fx = Fixture.init(0xF6);
+    try fx.start();
+    defer fx.deinit();
+
+    // Materialise the media plugin's `media_attachments` + `atp_blobs`
+    // tables on the shared in-memory db, and attach the media state.
+    // `atp_blobs` is owned by the atproto plugin in production; for
+    // this test we run the media schema_create_sql directly so we don't
+    // collide on migration ids.
+    const media = @import("protocol_media");
+    {
+        const z = try alloc.dupeZ(u8, media.schema.media_attachments_migration.up);
+        defer alloc.free(z);
+        var errmsg: [*c]u8 = null;
+        _ = c.sqlite3_exec(fx.db, z.ptr, null, null, &errmsg);
+        if (errmsg != null) c.sqlite3_free(errmsg);
+        const z2 = try alloc.dupeZ(u8, media.schema.blobs_create_sql);
+        defer alloc.free(z2);
+        _ = c.sqlite3_exec(fx.db, z2.ptr, null, null, &errmsg);
+        if (errmsg != null) c.sqlite3_free(errmsg);
+    }
+    media.state.reset();
+    media.state.init(fx.sim.clock(), &fx.rng);
+    media.state.attachDb(fx.db);
+    defer media.state.reset();
+
+    const body =
+        "--Z\r\n" ++
+        "Content-Disposition: form-data; name=\"file\"; filename=\"a.bin\"\r\n" ++
+        "Content-Type: application/octet-stream\r\n" ++
+        "\r\n" ++
+        "hello-bytes" ++
+        "\r\n--Z--\r\n";
+    var call = try makeCall(alloc, &fx, .post, "/api/v2/media", &.{
+        .{ .name = "Content-Type", .value = "multipart/form-data; boundary=Z" },
+    }, body);
+    defer alloc.destroy(call);
+    var hc = call.handler();
+    try media_routes.handleUploadV2(&hc);
+    try testing.expect(std.mem.startsWith(u8, call.statusLine(), "HTTP/1.1 200"));
+    const out = call.responseBodyBytes();
+    try testing.expect(std.mem.indexOf(u8, out, "\"id\":") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "\"url\":") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "\"blurhash\":") != null);
 }
 
 test "streaming: HTTP fallback returns 400 telling client to upgrade" {

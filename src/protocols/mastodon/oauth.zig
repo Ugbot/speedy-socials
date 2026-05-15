@@ -32,6 +32,7 @@ const state_mod = @import("state.zig");
 const jwt = @import("jwt.zig");
 const http_util = @import("http_util.zig");
 const db_mod = @import("db.zig");
+const users_mod = @import("users.zig");
 const serialize = @import("serialize.zig");
 
 const default_scopes = "read write follow push";
@@ -181,10 +182,11 @@ pub fn handleToken(hc: *HandlerContext) anyerror!void {
         if (password.len == 0) {
             return http_util.writeError(hc, .unauthorized, "password required");
         }
-        // No real password store yet (Argon2id lands in W1.2). Accept
-        // any non-empty password for an existing user. This matches the
-        // AT Protocol legacy createSession behavior — both will switch
-        // to real verification when crypto-net lands.
+        // Real Argon2id verify (W2.3). The Mastodon-local user table
+        // owns the password hash; ap_users still owns the public actor.
+        if (!users_mod.verifyPassword(db, username, password)) {
+            return http_util.writeError(hc, .unauthorized, "bad credentials");
+        }
         const u = db_mod.findUserByUsername(db, username) orelse {
             return http_util.writeError(hc, .unauthorized, "unknown user");
         };

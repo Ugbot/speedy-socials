@@ -32,6 +32,7 @@ pub const routes = @import("routes.zig");
 pub const http_util = @import("http_util.zig");
 pub const serialize = @import("serialize.zig");
 pub const db = @import("db.zig");
+pub const users = @import("users.zig");
 pub const keypair_ed25519 = @import("keypair_ed25519.zig");
 pub const streaming_ws = @import("routes/streaming_ws.zig");
 
@@ -93,6 +94,7 @@ test {
     _ = http_util;
     _ = serialize;
     _ = db;
+    _ = users;
     _ = keypair_ed25519;
     _ = @import("tests.zig");
     _ = @import("routes/accounts.zig");

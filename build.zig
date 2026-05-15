@@ -96,15 +96,6 @@ pub fn build(b: *std.Build) void {
             .{ .name = "sqlite", .module = sqlite_mod },
         },
     });
-    const mastodon_mod = b.addModule("protocol_mastodon", .{
-        .root_source_file = b.path("src/protocols/mastodon/plugin.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{
-            .{ .name = "core", .module = core_mod },
-            .{ .name = "sqlite", .module = sqlite_mod },
-        },
-    });
     const echo_mod = b.addModule("protocol_echo", .{
         .root_source_file = b.path("src/protocols/echo/plugin.zig"),
         .target = target,
@@ -118,6 +109,20 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "core", .module = core_mod },
             .{ .name = "sqlite", .module = sqlite_mod },
+        },
+    });
+    // The Mastodon plugin delegates uploads to the media plugin's
+    // public `api`, so it must see the media module at build time. The
+    // dependency is strictly one-way (mastodon → media); media never
+    // reaches back, mirroring the relay's sibling-lookup carve-out.
+    const mastodon_mod = b.addModule("protocol_mastodon", .{
+        .root_source_file = b.path("src/protocols/mastodon/plugin.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "core", .module = core_mod },
+            .{ .name = "sqlite", .module = sqlite_mod },
+            .{ .name = "protocol_media", .module = media_mod },
         },
     });
     const relay_mod = b.addModule("protocol_relay", .{
@@ -212,6 +217,15 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "sqlite", .module = sqlite_mod },
                 .{ .name = "protocol_atproto", .module = atproto_mod },
                 .{ .name = "protocol_activitypub", .module = ap_mod },
+            },
+        }) else if (is_mastodon) b.createModule(.{
+            .root_source_file = b.path(pm.path),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "core", .module = core_mod },
+                .{ .name = "sqlite", .module = sqlite_mod },
+                .{ .name = "protocol_media", .module = media_mod },
             },
         }) else if (needs_sqlite) b.createModule(.{
             .root_source_file = b.path(pm.path),
