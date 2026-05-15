@@ -33,6 +33,9 @@ pub const http_util = @import("http_util.zig");
 pub const serialize = @import("serialize.zig");
 pub const db = @import("db.zig");
 pub const keypair_ed25519 = @import("keypair_ed25519.zig");
+pub const streaming_ws = @import("routes/streaming_ws.zig");
+
+const WsUpgradeRouter = core.ws.upgrade_router.WsUpgradeRouter;
 
 // Public composition-root API.
 
@@ -42,6 +45,10 @@ pub fn attachDb(database: *c.sqlite3) void {
 
 pub fn setHostname(name: []const u8) void {
     state.setHostname(name);
+}
+
+pub fn attachWsRegistry(reg: *core.ws.registry.Registry) void {
+    state.attachWsRegistry(reg);
 }
 
 // Plugin contract hooks.
@@ -62,6 +69,10 @@ fn registerRoutes(_: ?*anyopaque, _: *Context, router: *Router, plugin_index: u1
     try routes.register(router, plugin_index);
 }
 
+fn registerWs(_: ?*anyopaque, _: *Context, router: *WsUpgradeRouter, plugin_index: u16) anyerror!void {
+    try streaming_ws.registerRoutes(router, plugin_index);
+}
+
 pub const plugin: Plugin = .{
     .name = "mastodon",
     .version = 1,
@@ -69,6 +80,7 @@ pub const plugin: Plugin = .{
     .deinit = deinit,
     .register_schema = registerSchema,
     .register_routes = registerRoutes,
+    .register_ws_upgrade = registerWs,
 };
 
 test {
@@ -91,6 +103,7 @@ test {
     _ = @import("routes/apps.zig");
     _ = @import("routes/media.zig");
     _ = @import("routes/streaming.zig");
+    _ = streaming_ws;
 }
 
 test "mastodon plugin registers" {

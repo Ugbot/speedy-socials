@@ -9,6 +9,27 @@ const auth = @import("../auth.zig");
 const http_util = @import("../http_util.zig");
 const db_mod = @import("../db.zig");
 const serialize = @import("../serialize.zig");
+const streaming_ws = @import("streaming_ws.zig"); // W2.1
+
+/// W2.1: publish a notification onto the recipient's WS user stream.
+/// Call after the DB row is inserted. Best-effort — additive; does
+/// not alter HTTP semantics. `recipient_user_id` is the owner of the
+/// notification row (the `user_id` foreign key on `mastodon_notifications`).
+pub fn publishLiveNotification(st: *state_mod.State, recipient_user_id: i64, row: db_mod.NotificationRow) void {
+    const reg = st.ws_registry orelse return;
+    var json_buf: [4096]u8 = undefined;
+    var iso_buf: [32]u8 = undefined;
+    const iso = serialize.formatIsoTimestamp(row.created_at, &iso_buf) catch "1970-01-01T00:00:00Z";
+    const json = serialize.writeNotification(.{
+        .id = row.id,
+        .type = row.typeStr(),
+        .created_at_iso = iso,
+        .account_acct = row.fromAccount(),
+        .hostname = st.hostname(),
+        .status_id = row.status_id,
+    }, &json_buf) catch return;
+    streaming_ws.publishNotification(reg, recipient_user_id, json);
+}
 
 pub fn handleList(hc: *HandlerContext) anyerror!void {
     const st = state_mod.get();

@@ -292,6 +292,19 @@ fn notImplemented(hc: *HandlerContext) anyerror!void {
     try xrpc.writeError(hc, .not_implemented, "NotImplemented", "endpoint not yet wired");
 }
 
+// W2.1: HTTP fallback for `subscribeRepos`. Real clients send an
+// Upgrade: websocket request which the server's upgrade router catches
+// before this handler ever runs. A plain GET ends up here and gets a
+// 400 with a hint to upgrade.
+fn subscribeReposHttp(hc: *HandlerContext) anyerror!void {
+    try xrpc.writeError(
+        hc,
+        .bad_request,
+        "InvalidRequest",
+        "subscribeRepos requires a WebSocket upgrade (RFC 6455)",
+    );
+}
+
 // ── register ──────────────────────────────────────────────────────
 
 pub fn register(router: *Router, plugin_index: u16) !void {
@@ -311,7 +324,11 @@ pub fn register(router: *Router, plugin_index: u16) !void {
     try router.register(.get, "/xrpc/com.atproto.sync.getRecord", notImplemented, plugin_index);
     try router.register(.get, "/xrpc/com.atproto.sync.getBlocks", notImplemented, plugin_index);
     try router.register(.get, "/xrpc/com.atproto.sync.listRepos", notImplemented, plugin_index);
-    try router.register(.get, "/xrpc/com.atproto.sync.subscribeRepos", notImplemented, plugin_index);
+    // W2.1: subscribeRepos is owned by the WS upgrade router (see
+    // sync_firehose.zig). The HTTP route returns 426 Upgrade Required
+    // for plain-GET probes; the upgrade router catches real WS
+    // upgrade requests before this HTTP handler is invoked.
+    try router.register(.get, "/xrpc/com.atproto.sync.subscribeRepos", subscribeReposHttp, plugin_index);
 
     try router.register(.get, "/xrpc/com.atproto.identity.resolveHandle", notImplemented, plugin_index);
 

@@ -35,6 +35,9 @@ pub const State = struct {
     jwt_key: keypair.Ed25519KeyPair = undefined,
     /// Monotonic TID generator (one per process).
     tid_state: tid.State = undefined,
+    /// WS subscription registry, wired by the composition root after
+    /// `core.ws.registry.Registry.initInPlace`. Null until attached.
+    ws_registry: ?*core.ws.registry.Registry = null,
 };
 
 var instance: State = .{};
@@ -63,6 +66,10 @@ pub fn attachDb(db: *c.sqlite3) void {
 
 pub fn attachWorkers(pool: *anyopaque) void {
     instance.workers = pool;
+}
+
+pub fn attachWsRegistry(reg: *core.ws.registry.Registry) void {
+    instance.ws_registry = reg;
 }
 
 pub fn get() *State {

@@ -39,11 +39,13 @@ pub const xrpc = @import("xrpc.zig");
 pub const did_resolver = @import("did_resolver.zig");
 pub const oauth_dpop = @import("oauth_dpop.zig");
 pub const car = @import("car.zig");
+pub const sync_firehose = @import("sync_firehose.zig");
 
 const Plugin = core.plugin.Plugin;
 const Context = core.plugin.Context;
 const Router = core.http.router.Router;
 const Schema = core.storage.Schema;
+const WsUpgradeRouter = core.ws.upgrade_router.WsUpgradeRouter;
 
 fn init(_: ?*anyopaque, ctx: *Context) anyerror!void {
     state.init(ctx.clock, ctx.rng, "localhost:8080");
@@ -61,12 +63,20 @@ fn registerRoutes(_: ?*anyopaque, _: *Context, router: *Router, plugin_index: u1
     try routes.register(router, plugin_index);
 }
 
+fn registerWs(_: ?*anyopaque, _: *Context, router: *WsUpgradeRouter, plugin_index: u16) anyerror!void {
+    try sync_firehose.registerRoutes(router, plugin_index);
+}
+
 pub fn attachDb(db: *c.sqlite3) void {
     state.attachDb(db);
 }
 
 pub fn attachWorkers(pool: *anyopaque) void {
     state.attachWorkers(pool);
+}
+
+pub fn attachWsRegistry(reg: *core.ws.registry.Registry) void {
+    state.attachWsRegistry(reg);
 }
 
 pub const plugin: Plugin = .{
@@ -76,6 +86,7 @@ pub const plugin: Plugin = .{
     .deinit = deinit,
     .register_schema = registerSchema,
     .register_routes = registerRoutes,
+    .register_ws_upgrade = registerWs,
 };
 
 // ── tests ──────────────────────────────────────────────────────────
@@ -97,6 +108,7 @@ test {
     _ = did_resolver;
     _ = oauth_dpop;
     _ = car;
+    _ = sync_firehose;
 }
 
 test "atproto plugin registers" {
