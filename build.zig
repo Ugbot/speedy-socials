@@ -321,6 +321,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "core", .module = core_mod },
         .{ .name = "protocol_activitypub", .module = ap_mod },
         .{ .name = "protocol_atproto", .module = atproto_mod },
+        .{ .name = "protocol_relay", .module = relay_mod },
         .{ .name = "sqlite", .module = sqlite_mod },
     };
 
@@ -346,9 +347,21 @@ pub fn build(b: *std.Build) void {
     });
     const run_sim_fh = b.addRunArtifact(sim_fh_exe);
 
+    const sim_relay_exe = b.addExecutable(.{
+        .name = "sim-relay-bridge",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/sim/relay_bridge_scenario.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &sim_imports,
+        }),
+    });
+    const run_sim_relay = b.addRunArtifact(sim_relay_exe);
+
     const sim_step = b.step("sim", "Run simulation tests");
     sim_step.dependOn(&run_sim_fed.step);
     sim_step.dependOn(&run_sim_fh.step);
+    sim_step.dependOn(&run_sim_relay.step);
 
     // The simulation scenarios also run as regular `zig build test` tests.
     const sim_fed_tests = b.addTest(.{
@@ -369,6 +382,16 @@ pub fn build(b: *std.Build) void {
     });
     test_step.dependOn(&b.addRunArtifact(sim_fed_tests).step);
     test_step.dependOn(&b.addRunArtifact(sim_fh_tests).step);
+
+    const sim_relay_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/sim/relay_bridge_scenario.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &sim_imports,
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(sim_relay_tests).step);
 
     // ── benchmarks (continued) ─────────────────────────────────────
     const echo_bench = b.addExecutable(.{
