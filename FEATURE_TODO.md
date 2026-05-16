@@ -1,6 +1,6 @@
 # Feature Status — speedy-socials
 
-_Last updated: 2026-05-14. Reflects the Tiger-Style rewrite under
+_Last updated: 2026-05-16. Reflects the Tiger-Style rewrite under
 `src/core/`, `src/app/`, `src/protocols/`. See ADR-001 .. ADR-004 in
 `docs/adr/` for context. This file is a snapshot at this commit;
 other open work-tranches (W1.1 .. W1.5) flip items from `stubbed` to
@@ -87,9 +87,10 @@ production wiring is loud rather than silent.
 - [ ] AP federation delivery POST — `outbox_worker.setDeliverHook`;
       default returns transient failure so the retry queue can be
       exercised in tests (W1.2).
-- [ ] AP RSA-SHA256 signature verify — `keys.setRsaVerifyHook`;
-      Ed25519 verifies natively, RSA bindings (BoringSSL) land in
-      W1.2.
+- [ ] AP RSA-SHA256 signature *verify* hook — `keys.setRsaVerifyHook`
+      default still stubbed. RSA-SHA256 *signing* shipped in W3.1 via
+      OpenSSL link (used by federation delivery for Mastodon-default
+      rsa-sha256 actors).
 - [ ] AT DID resolver HTTP fetcher — parser is ready, HTTP fetch is
       W1.2.
 - [ ] AT WS `subscribeRepos` (firehose) — frame codec is shipped;
@@ -105,8 +106,12 @@ production wiring is loud rather than silent.
 
 Larger surfaces that have not been started yet.
 
-- [ ] TLS termination — required before federation can happen against
-      real peers (W1.1).
+- [x] TLS termination — outbound TLS shipped via `std.crypto.tls`
+      (W2.4); inbound TLS shipped via OpenSSL `BoringInboundBackend`
+      (W3.1). Boot loads `TLS_CERT_PATH` + `TLS_KEY_PATH` and installs
+      the backend when both are set, otherwise plain HTTP behind an
+      LB. Multi-SNI is a follow-up; HTTPS-fronted WebSocket data-plane
+      wiring is also a follow-up.
 - [ ] HTTP/1.1 keep-alive in `core/server.zig` (W1.1).
 - [ ] Server-side WebSocket upgrade dispatch (W1.1).
 - [ ] Mastodon API v1 surface (W1.3):

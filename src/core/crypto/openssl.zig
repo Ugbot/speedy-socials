@@ -226,6 +226,16 @@ pub const SslCtx = struct {
             return error.KeyLoadFailed;
         };
         defer c.EVP_PKEY_free(pkey);
+        // Check the key against the cert *before* installing it. Openssl's
+        // `SSL_CTX_use_PrivateKey` performs the same check internally and
+        // collapses a mismatch into the generic load failure, which makes
+        // it impossible for callers to distinguish a malformed key from a
+        // mismatched key. Doing the comparison up front keeps the error
+        // signalling crisp.
+        if (c.X509_check_private_key(x509, pkey) != 1) {
+            clearError();
+            return error.KeyMismatch;
+        }
         if (c.SSL_CTX_use_PrivateKey(ctx, pkey) != 1) {
             clearError();
             return error.KeyLoadFailed;
