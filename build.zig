@@ -60,6 +60,14 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    // ── system OpenSSL link (W3.1) ─────────────────────────────────
+    // Wired via Homebrew on macOS aarch64, system pkg-config on Linux.
+    // Used by `core.crypto.openssl` for RSA-PKCS1v15-SHA256 sign and by
+    // `core.tls.boring_inbound.BoringInboundBackend` for server TLS.
+    // See `third_party/boringssl/README.md` for the rationale on system
+    // linking vs source vendor.
+    linkSystemOpenSsl(b, core_mod, target);
+
     // ── plugin modules ─────────────────────────────────────────────
     const plugin_modules = [_]struct { name: []const u8, path: []const u8 }{
         .{ .name = "protocol_echo", .path = "src/protocols/echo/plugin.zig" },
@@ -360,4 +368,33 @@ pub fn build(b: *std.Build) void {
 
     const all_bench_step = b.step("bench", "Run all benchmarks and write bench/results.json");
     all_bench_step.dependOn(&run_bench_runner.step);
+}
+
+/// Link the system OpenSSL (`libssl` + `libcrypto`) into the given
+/// module. Used by `core` so that `core.crypto.openssl` (RSA sign +
+/// inbound TLS) can `@cImport` the headers and resolve at link time.
+///
+/// macOS aarch64/x86_64: prefer Homebrew OpenSSL 3 because Apple's
+/// system libssl is a wrapped LibreSSL that third-party code is not
+/// supposed to link.
+/// Linux: rely on pkg-config-discoverable system headers + libraries.
+fn linkSystemOpenSsl(b: *std.Build, mod: *std.Build.Module, target: std.Build.ResolvedTarget) void {
+    _ = b;
+    const os_tag = target.result.os.tag;
+    const arch = target.result.cpu.arch;
+    if (os_tag == .macos) {
+        // Homebrew install paths differ by arch.
+        const inc_path: []const u8 = if (arch == .aarch64)
+            "/opt/homebrew/opt/openssl@3/include"
+        else
+            "/usr/local/opt/openssl@3/include";
+        const lib_path: []const u8 = if (arch == .aarch64)
+            "/opt/homebrew/opt/openssl@3/lib"
+        else
+            "/usr/local/opt/openssl@3/lib";
+        mod.addIncludePath(.{ .cwd_relative = inc_path });
+        mod.addLibraryPath(.{ .cwd_relative = lib_path });
+    }
+    mod.linkSystemLibrary("ssl", .{});
+    mod.linkSystemLibrary("crypto", .{});
 }

@@ -31,7 +31,18 @@ pub const crypto = struct {
     pub const rsa = @import("crypto/rsa.zig");
     pub const secp256k1 = @import("crypto/secp256k1.zig");
     pub const argon2id = @import("crypto/argon2id.zig");
+    /// OpenSSL / BoringSSL / LibreSSL C-ABI wrapper. Single place in
+    /// the tree that names the `c.EVP_*` / `c.SSL_*` symbols. See
+    /// `third_party/boringssl/README.md`.
+    pub const openssl = @import("crypto/openssl.zig");
 };
+
+/// Inbound TLS backend backed by the system OpenSSL link. See
+/// `src/core/tls/boring_inbound.zig`. Exposed at the same level as the
+/// `core.tls` namespace via re-export rather than nesting under
+/// `core.crypto` so callers reach for it from the TLS-server side of
+/// the tree, not the crypto primitives.
+pub const tls_boring = @import("tls/boring_inbound.zig");
 
 pub const testing = struct {
     pub const fuzz = @import("testing/fuzz.zig");
@@ -83,6 +94,8 @@ test {
     _ = crypto.rsa;
     _ = crypto.secp256k1;
     _ = crypto.argon2id;
+    _ = crypto.openssl;
+    _ = tls_boring;
     _ = testing.fuzz;
     _ = http.parser;
     _ = http.request;

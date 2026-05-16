@@ -46,6 +46,10 @@ pub const max_path_bytes: usize = 2048;
 pub const DeliveryError = error{
     UnknownKey,
     SignFailed,
+    /// Retained in the error set for ABI stability; W3.1 wired RSA
+    /// signing through the system OpenSSL link, so this variant is no
+    /// longer produced by `deliverInner`. Surface kept so existing
+    /// dispatch tables continue to compile.
     RsaSignNotImplemented,
     BuildFailed,
     HttpFailed,
@@ -306,13 +310,19 @@ fn deliverInner(
             const sig_b64 = sig.signEd25519(&template, &req_view, kp.secret_key, &sig_b64_buf) catch return error.SignFailed;
             break :blk sig_b64;
         },
-        .rsa_sha256 => {
-            // The stdlib RSA does not yet expose a sign primitive; the
-            // host-injected verifier in `core.crypto.rsa` covers verify
-            // only. Until that ships, dead-letter outbound RSA flows so
-            // operators see them and can rotate to Ed25519. Inbound RSA
-            // verification continues to work.
-            return error.RsaSignNotImplemented;
+        .rsa_sha256 => blk: {
+            // W3.1: RSA sign via the system OpenSSL link. Builds the
+            // signing string from the same `sig.buildSigningString` the
+            // receiver reconstructs, then signs with PKCS1v15-SHA256.
+            var signing_string_buf: [4096]u8 = undefined;
+            const signing_string = sig.buildSigningString(&template, &req_view, &signing_string_buf) catch return error.SignFailed;
+            var raw_sig: [512]u8 = undefined; // RSA-4096 ceiling
+            const sig_len = core.crypto.rsa.signPkcs1v15Sha256(priv.bytes[0..priv.len], signing_string, &raw_sig) catch return error.SignFailed;
+            // Base64-encode the raw signature into sig_b64_buf.
+            const enc_len = base64.Encoder.calcSize(sig_len);
+            if (enc_len > sig_b64_buf.len) return error.SignFailed;
+            const encoded = base64.Encoder.encode(sig_b64_buf[0..enc_len], raw_sig[0..sig_len]);
+            break :blk encoded;
         },
     };
 
