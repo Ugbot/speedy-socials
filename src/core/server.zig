@@ -124,6 +124,9 @@ pub const Server = struct {
             else
                 raw_stream;
             self.handleConnection(stream) catch {};
+            // Tear down the TLS session (if any) before the raw socket
+            // closes — the backend needs to free its per-fd slot.
+            if (self.cfg.tls) |be| be.closeConn(stream.socket.handle);
             stream.close(self.io);
         }
     }
@@ -131,7 +134,7 @@ pub const Server = struct {
     fn handleConnection(self: *Server, stream: net.Stream) !void {
         const acquired = self.pool.acquire() catch |err| switch (err) {
             error.Exhausted => {
-                try writeRaw(stream, self.io, "HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 19\r\n\r\nServer Unavailable\n");
+                try writeRawTls(self.cfg.tls, stream, self.io, "HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 19\r\n\r\nServer Unavailable\n");
                 return;
             },
         };
@@ -166,7 +169,7 @@ pub const Server = struct {
                 // Client closed the connection cleanly between requests.
                 error.UnexpectedEof => return,
                 error.HeaderTooLarge => {
-                    try writeStatusResponse(stream, self.io, conn, .payload_too_large);
+                    try writeStatusResponseTls(self.cfg.tls, stream, self.io, conn, .payload_too_large);
                     return;
                 },
                 else => return,
@@ -178,7 +181,7 @@ pub const Server = struct {
             var hdrs_scratch: parser.HeaderArray = undefined;
             const parsed = parser.parse(conn.read_buf[0..conn.read_len], &hdrs_scratch) catch {
                 // Malformed request: respond with a 400 and bail.
-                try writeStatusResponse(stream, self.io, conn, .bad_request);
+                try writeStatusResponseTls(self.cfg.tls, stream, self.io, conn, .bad_request);
                 return;
             };
 
@@ -227,8 +230,19 @@ pub const Server = struct {
             const try_parse = parser.parse(conn.read_buf[0..conn.read_len], &hdrs_scratch);
             if (try_parse) |_| return else |_| {}
         }
+
+        // TLS data-plane fast path. When the backend intercepts reads /
+        // writes (e.g. `BoringInboundBackend`), route through its
+        // `read_some` hook instead of `net.Stream.Reader`. The bare fd
+        // bytes are encrypted post-handshake; only the backend can
+        // decrypt them.
+        const tls_dp = if (self.cfg.tls) |be| (if (be.interceptsDataPlane()) be else null) else null;
+
         var read_scratch: [read_chunk_bytes]u8 = undefined;
-        var reader = net.Stream.Reader.init(stream, self.io, &read_scratch);
+        var reader_storage: net.Stream.Reader = if (tls_dp == null)
+            net.Stream.Reader.init(stream, self.io, &read_scratch)
+        else
+            undefined;
 
         // Bounded outer loop: at most one read per `read_chunk_bytes`
         // until the request buffer is full. Anything beyond is
@@ -239,10 +253,18 @@ pub const Server = struct {
             if (conn.read_len >= conn.read_buf.len) return error.HeaderTooLarge;
             const remain = conn.read_buf.len - conn.read_len;
             const this_chunk = @min(remain, read_chunk_bytes);
-            var dest_arr: [1][]u8 = .{conn.read_buf[conn.read_len..][0..this_chunk]};
-            const n = reader.interface.readVec(&dest_arr) catch |err| switch (err) {
-                error.EndOfStream => return error.UnexpectedEof,
-                error.ReadFailed => return error.UnexpectedEof,
+            const dst = conn.read_buf[conn.read_len..][0..this_chunk];
+            const n: usize = if (tls_dp) |be| blk: {
+                const got = be.readSome(stream.socket.handle, dst) catch return error.UnexpectedEof;
+                if (got == 0) return error.UnexpectedEof;
+                break :blk got;
+            } else blk: {
+                var dest_arr: [1][]u8 = .{dst};
+                const got = reader_storage.interface.readVec(&dest_arr) catch |err| switch (err) {
+                    error.EndOfStream => return error.UnexpectedEof,
+                    error.ReadFailed => return error.UnexpectedEof,
+                };
+                break :blk got;
             };
             if (n == 0) continue;
             conn.read_len += n;
@@ -265,22 +287,22 @@ pub const Server = struct {
         var params: router_mod.PathParams = .{};
         const handler_opt = self.ws_upgrade_router.match(path_query.path, &params);
         const handler = handler_opt orelse {
-            try writeStatusResponse(stream, self.io, conn, .bad_request);
+            try writeStatusResponseTls(self.cfg.tls, stream, self.io, conn, .bad_request);
             return error.UpgradeRouteNotFound;
         };
 
         // Validate the handshake and write 101. Validation failures map
         // to 400; the connection is then closed by the outer loop.
         const accepted = ws_handshake.validate(request, &.{}) catch {
-            try writeStatusResponse(stream, self.io, conn, .bad_request);
+            try writeStatusResponseTls(self.cfg.tls, stream, self.io, conn, .bad_request);
             return;
         };
         var rb = response.Builder.init(&conn.write_buf);
         ws_handshake.writeResponse(&rb, accepted) catch {
-            try writeStatusResponse(stream, self.io, conn, .internal);
+            try writeStatusResponseTls(self.cfg.tls, stream, self.io, conn, .internal);
             return;
         };
-        try writeRaw(stream, self.io, rb.bytes());
+        try writeRawTls(self.cfg.tls, stream, self.io, rb.bytes());
 
         // Hand the stream off to the plugin handler. It owns I/O from
         // here. Any error it returns is logged and the socket is
@@ -339,7 +361,7 @@ pub const Server = struct {
         // this write; we do not rewrite the headers (the client only
         // needs to honor the actual Connection header it sees).
         _ = force_close;
-        try writeRaw(stream, self.io, rb.bytes());
+        try writeRawTls(self.cfg.tls, stream, self.io, rb.bytes());
     }
 };
 
@@ -387,6 +409,27 @@ fn writeRaw(stream: net.Stream, io: Io, payload: []const u8) !void {
     var writer = net.Stream.Writer.init(stream, io, &write_scratch);
     writer.interface.writeAll(payload) catch return error.WriteFailed;
     writer.interface.flush() catch return error.WriteFailed;
+}
+
+/// TLS-aware write helpers (W3.1). When the server has a TLS backend
+/// that intercepts the data plane, every write must go through it;
+/// the bare fd carries encrypted bytes only. These helpers fall back
+/// to the plain-fd writers when `tls` is null or the backend does not
+/// intercept the data plane.
+fn writeRawTls(tls: ?TlsBackend, stream: net.Stream, io: Io, payload: []const u8) !void {
+    if (tls) |be| {
+        if (be.interceptsDataPlane()) {
+            be.writeAll(stream.socket.handle, payload) catch return error.WriteFailed;
+            return;
+        }
+    }
+    return writeRaw(stream, io, payload);
+}
+
+fn writeStatusResponseTls(tls: ?TlsBackend, stream: net.Stream, io: Io, conn: *Connection, status: response.Status) !void {
+    var rb = response.Builder.init(&conn.write_buf);
+    rb.simple(status, "text/plain", status.reason()) catch return;
+    try writeRawTls(tls, stream, io, rb.bytes());
 }
 
 // ──────────────────────────────────────────────────────────────────────

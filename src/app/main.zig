@@ -24,6 +24,68 @@ fn alwaysReadyHook(_: ?*anyopaque) core.health.Status {
     return .ready;
 }
 
+// ── Inbound TLS (W3.1) wiring helpers ────────────────────────────────
+//
+// `InboundTlsHolder` owns the heap-allocated `BoringInboundBackend` for
+// the lifetime of `main`. We allocate via the GPA (boot-only) and never
+// reallocate. The SSL_CTX inside the backend lives in OpenSSL's own
+// allocator, outside our static-allocator boundary by design.
+
+const InboundTlsHolder = struct {
+    backend: ?*core.tls.boring_inbound.BoringInboundBackend = null,
+    allocator: ?std.mem.Allocator = null,
+
+    fn deinit(self: *InboundTlsHolder) void {
+        if (self.backend) |b| {
+            b.deinit();
+            if (self.allocator) |a| a.destroy(b);
+        }
+        self.* = .{};
+    }
+};
+
+/// If `TLS_CERT_PATH` and `TLS_KEY_PATH` are both set in the
+/// environment, load the PEMs, build the inbound TLS backend, and
+/// return a `core.tls.TlsBackend` pointing at it. Otherwise return
+/// null (plain-HTTP fall-through).
+fn loadInboundTlsIfConfigured(
+    holder: *InboundTlsHolder,
+    allocator: std.mem.Allocator,
+    log_ptr: *core.log.Log,
+) !?core.tls.TlsBackend {
+    // Zig 0.16's `std.process` no longer exposes the global-env helpers
+    // (`getEnvVarOwned`); the replacement is `Environ` which carries
+    // through `init.environ_map`. For boot config we just consult the
+    // POSIX `environ` directly — bounded, no alloc, portable to macOS +
+    // Linux. Windows is not a target here.
+    const cert_path_c = std.c.getenv("TLS_CERT_PATH") orelse return null;
+    const key_path_c = std.c.getenv("TLS_KEY_PATH") orelse {
+        log_ptr.warn("boot", "TLS_CERT_PATH set without TLS_KEY_PATH — refusing to start inbound TLS");
+        return null;
+    };
+    const cert_path = std.mem.sliceTo(cert_path_c, 0);
+    const key_path = std.mem.sliceTo(key_path_c, 0);
+
+    // Read both PEMs synchronously via a freshly-spun Threaded Io. The
+    // boot path can afford the temporary; we don't keep it past this
+    // function.
+    var boot_threaded = std.Io.Threaded.init(allocator, .{});
+    defer boot_threaded.deinit();
+    const boot_io = boot_threaded.io();
+    const cert_pem = try std.Io.Dir.cwd().readFileAlloc(boot_io, cert_path, allocator, .limited(256 * 1024));
+    defer allocator.free(cert_pem);
+    const key_pem = try std.Io.Dir.cwd().readFileAlloc(boot_io, key_path, allocator, .limited(256 * 1024));
+    defer allocator.free(key_pem);
+
+    const ptr = try allocator.create(core.tls.boring_inbound.BoringInboundBackend);
+    errdefer allocator.destroy(ptr);
+    ptr.* = try core.tls.boring_inbound.BoringInboundBackend.init(cert_pem, key_pem);
+    holder.backend = ptr;
+    holder.allocator = allocator;
+    log_ptr.info("boot", "inbound TLS backend initialised (BoringInboundBackend, system OpenSSL)");
+    return ptr.backend();
+}
+
 /// Shutdown phase: drain the log ring before we close storage. Wired
 /// here so the phase order is owned by the composition root.
 fn flushLogsPhase(ud: ?*anyopaque) anyerror!void {
@@ -333,8 +395,22 @@ pub fn main() !void {
     // runs FIRST on the way out.
     defer static_alloc.transition_from_static_to_deinit();
 
+    // ── Inbound TLS (W3.1) ─────────────────────────────────────────
+    // Env-var driven: TLS_CERT_PATH + TLS_KEY_PATH must both be set to
+    // turn on inbound TLS. When set, build a `BoringInboundBackend` and
+    // install it on the server. When unset, fall through to plain HTTP
+    // (the existing behaviour and the production-safe default for
+    // deployments behind a terminating LB / sidecar).
+    var inbound_tls_holder = InboundTlsHolder{};
+    defer inbound_tls_holder.deinit();
+    const inbound_tls_backend = try loadInboundTlsIfConfigured(&inbound_tls_holder, gpa_allocator, log_ptr);
+
     var server = try core.server.Server.init(
-        .{ .bind_addr = "127.0.0.1", .port = 8080 },
+        .{
+            .bind_addr = "127.0.0.1",
+            .port = 8080,
+            .tls = inbound_tls_backend,
+        },
         io,
         &ctx,
         &router,
@@ -343,7 +419,11 @@ pub fn main() !void {
     );
     defer server.deinit();
 
-    log_ptr.info("boot", "listening on 127.0.0.1:8080");
+    if (inbound_tls_backend == null) {
+        log_ptr.info("boot", "listening on 127.0.0.1:8080 (plain HTTP — set TLS_CERT_PATH+TLS_KEY_PATH for HTTPS)");
+    } else {
+        log_ptr.info("boot", "listening on 127.0.0.1:8080 (HTTPS via system OpenSSL)");
+    }
 
     // Run the server; on signal, the handler flips shutdown.requested
     // which Server.run() polls and drops out of accept loop.

@@ -22,6 +22,7 @@ handed a raw accepted stream and only wraps it.
 | `core.tls.StubTlsBackend`          | inbound   | shipped  | Pass-through with a noisy warning, for ops scripts wiring the TLS flag      |
 | `core.tls.native_outbound`         | outbound  | **shipped** | Real TLS 1.2/1.3 client via `std.crypto.tls.Client` + OS CA bundle      |
 | `core.tls.native_inbound`          | inbound   | **stub** | Always errors `TlsServerNotImplementedInThisZig`; 0.16 stdlib has no server |
+| `core.tls.boring_inbound`          | inbound   | **shipped (W3.1)** | Real TLS 1.2/1.3 server via system OpenSSL link; cert+key from in-memory PEM, fd-keyed slot pool |
 
 The default boot wiring (`src/app/main.zig`) installs
 `NativeOutboundBackend` on `http_client` so federation requests reach
@@ -52,11 +53,40 @@ real Mastodon and Bluesky peers. Inbound listeners run with
   the OS trust store wholesale. Pinning slots into the same vtable when
   needed.
 
-## BoringSSL backend (deferred)
+## BoringSSL backend (W3.1 — shipped via system OpenSSL link)
 
-The follow-up replaces `native_inbound` (and optionally `native_outbound`
-in FIPS-sensitive deployments) with a vendored BoringSSL build. The shape
-is identical to the native backends:
+W3.1 wired in `core.tls.boring_inbound.BoringInboundBackend`, which
+plugs into the existing `core.tls.TlsBackend` vtable. We did **not**
+vendor the BoringSSL source tree — the build links the system / Homebrew
+`libssl` + `libcrypto` instead. The C-ABI surface (`SSL_*`, `EVP_*`,
+`RSA_*`, `PEM_*`) is stable across OpenSSL 3, BoringSSL, and LibreSSL,
+so the same Zig wrapper (`src/core/crypto/openssl.zig`) works across
+all three. See `third_party/boringssl/README.md` for the rationale +
+re-vendor procedure if we ever decide to absorb the source.
+
+The vtable picked up three new **optional** fields (additions only —
+existing backends untouched): `read_some`, `write_all`, `close_conn`.
+When a backend sets them, the server (`src/core/server.zig`) routes its
+data plane through them instead of `net.Stream.Reader/Writer`.
+`PlainBackend` / `StubTlsBackend` leave them null and keep the fast
+path.
+
+Boot wiring lives in `src/app/main.zig` (see `loadInboundTlsIfConfigured`).
+Set `TLS_CERT_PATH` and `TLS_KEY_PATH` to enable inbound HTTPS:
+
+```
+TLS_CERT_PATH=./tests/fixtures/test.crt \
+TLS_KEY_PATH=./tests/fixtures/test.key \
+./zig-out/bin/speedy-socials
+```
+
+Multi-SNI dispatch is intentionally deferred — single-cert support
+matches Mastodon defaults and covers v1 deployments.
+
+## BoringSSL backend shape (reference)
+
+The shape of any future BoringSSL / LibreSSL / Rustls inbound backend
+remains identical to the existing native backends:
 
 ```zig
 pub const BoringInboundBackend = struct {

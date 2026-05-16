@@ -37,6 +37,11 @@ pub const native_outbound = @import("tls/native_outbound.zig");
 /// see `src/core/tls/native_inbound.zig` and `tls/README.md`.
 pub const native_inbound = @import("tls/native_inbound.zig");
 
+/// Inbound TLS backend backed by the system OpenSSL link (W3.1).
+/// Replaces the `native_inbound` stub. See
+/// `src/core/tls/boring_inbound.zig`.
+pub const boring_inbound = @import("tls/boring_inbound.zig");
+
 pub const TlsBackend = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
@@ -46,10 +51,54 @@ pub const TlsBackend = struct {
         /// stream. Plain backends return the raw stream unchanged.
         /// Real backends perform (or schedule) the TLS handshake here.
         wrap_stream: *const fn (ptr: *anyopaque, io: Io, raw: net.Stream) anyerror!net.Stream,
+
+        // ── Optional data-plane hooks (W3.1) ──────────────────────────
+        // When a backend performs a real handshake (e.g. OpenSSL via
+        // `BoringInboundBackend`), the post-handshake bytes can no
+        // longer be read / written through the bare fd. These three
+        // hooks let `core.server` route I/O through the TLS session.
+        // They are *optional* — backends that genuinely pass through
+        // (PlainBackend, StubTlsBackend) leave them null and the server
+        // takes its existing `net.Stream.Reader/Writer` fast path.
+
+        /// Read up to `buf.len` bytes from the TLS session for `fd`.
+        /// Returns 0 on clean EOF / close-notify. Non-null only on
+        /// backends that intercept the data plane.
+        read_some: ?*const fn (ptr: *anyopaque, fd: std.posix.fd_t, buf: []u8) anyerror!usize = null,
+
+        /// Write the entire `buf` to the TLS session for `fd`, looping
+        /// on short writes. Non-null only on backends that intercept
+        /// the data plane.
+        write_all: ?*const fn (ptr: *anyopaque, fd: std.posix.fd_t, buf: []const u8) anyerror!void = null,
+
+        /// Tear down the TLS session for `fd`. Called by the server
+        /// just before closing the underlying socket. Non-null only on
+        /// backends that intercept the data plane.
+        close_conn: ?*const fn (ptr: *anyopaque, fd: std.posix.fd_t) void = null,
     };
 
     pub fn wrapStream(self: TlsBackend, io: Io, raw: net.Stream) anyerror!net.Stream {
         return self.vtable.wrap_stream(self.ptr, io, raw);
+    }
+
+    /// True iff this backend intercepts the data plane (i.e. the server
+    /// must route reads / writes through `readSome` / `writeAll`).
+    pub fn interceptsDataPlane(self: TlsBackend) bool {
+        return self.vtable.read_some != null and self.vtable.write_all != null;
+    }
+
+    pub fn readSome(self: TlsBackend, fd: std.posix.fd_t, buf: []u8) anyerror!usize {
+        const f = self.vtable.read_some orelse return error.TlsBackendHasNoDataPlane;
+        return f(self.ptr, fd, buf);
+    }
+
+    pub fn writeAll(self: TlsBackend, fd: std.posix.fd_t, buf: []const u8) anyerror!void {
+        const f = self.vtable.write_all orelse return error.TlsBackendHasNoDataPlane;
+        return f(self.ptr, fd, buf);
+    }
+
+    pub fn closeConn(self: TlsBackend, fd: std.posix.fd_t) void {
+        if (self.vtable.close_conn) |f| f(self.ptr, fd);
     }
 };
 
@@ -101,6 +150,7 @@ test {
     // Pull submodule tests into this module's test binary.
     _ = native_outbound;
     _ = native_inbound;
+    _ = boring_inbound;
 }
 
 test "PlainBackend.wrap_stream is the identity function" {

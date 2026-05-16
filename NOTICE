@@ -118,3 +118,55 @@ Upstream-tracking policy: re-vendor reviewed quarterly or when
 TigerBeetle ships a known fix to a file we vendor. The re-vendor
 procedure is documented in
 `src/third_party/tigerbeetle/README.md`.
+
+OpenSSL / BoringSSL / LibreSSL (system link, W3.1)
+--------------------------------------------------
+Origin:    https://www.openssl.org/  (build-time link target;
+           BoringSSL https://boringssl.googlesource.com/boringssl is
+           ABI-compatible at the C surface we use)
+Author:    The OpenSSL Project and contributors
+License:   Apache License, Version 2.0 (OpenSSL 3+)
+           plus historical OpenSSL/SSLeay dual-license for older forks
+Imported:  Not vendored at source level — speedy-socials links the
+           system / Homebrew-provided `libssl` + `libcrypto` via
+           `linkSystemLibrary` from `build.zig` (see the
+           `linkSystemOpenSsl` helper).
+
+Why no source vendor:
+
+  * The minimum BoringSSL slice needed for `RSA_sign`,
+    `EVP_DigestSign`, and the server-TLS path (`SSL_CTX_*`, `SSL_*`,
+    `PEM_*`) drags in roughly 200 `.c` files across `bn/`, `asn1/`,
+    `evp/`, `x509/`, `ec/`, `pem/`, `rand/`, plus the entire `ssl/`
+    directory and its perlasm fan-out per arch. Bring-up under
+    `build.zig` is well over a working day — outside the W3.1 budget.
+  * The C-ABI surface we depend on (`EVP_*`, `RSA_*`, `SSL_*`,
+    `PEM_*`) is stable across OpenSSL 3.x, BoringSSL, and LibreSSL.
+    Linking the system / Homebrew copy gives us the same surface for
+    a tiny build-time cost.
+
+Audit trail: `third_party/boringssl/README.md` records the rationale
+and the re-vendor procedure for when we eventually do absorb the
+source. The Zig-side C wrapper lives in `src/core/crypto/openssl.zig`
+— the only file in the tree that names the `c.EVP_*` / `c.SSL_*` /
+`c.RSA_*` / `c.PEM_*` symbols.
+
+Where it's wired:
+
+  * RSA-PKCS1v15-SHA256 sign: `src/core/crypto/rsa.zig#signPkcs1v15Sha256`
+    delegates to the OpenSSL wrapper; used by
+    `src/protocols/activitypub/http_delivery.zig` on the outbound
+    federation path for Mastodon-default `algorithm=rsa-sha256` keys.
+  * Inbound TLS: `src/core/tls/boring_inbound.zig#BoringInboundBackend`
+    plugs into the existing `core.tls.TlsBackend` vtable (additions
+    only — `read_some` / `write_all` / `close_conn` are optional hooks
+    on top of the original `wrap_stream`).
+
+Platform notes:
+
+  * macOS aarch64 + x86_64: Homebrew OpenSSL 3 is required for
+    development and CI. Apple's own `libssl` in `/usr/lib/` is a
+    wrapped LibreSSL that third-party software is not supposed to
+    link.
+  * Linux x86_64 + aarch64: any system OpenSSL 3 or compatible
+    BoringSSL / LibreSSL works.

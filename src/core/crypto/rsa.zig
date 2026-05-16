@@ -22,6 +22,7 @@
 const std = @import("std");
 const cert = std.crypto.Certificate;
 const Sha256 = std.crypto.hash.sha2.Sha256;
+const openssl = @import("openssl.zig");
 
 pub const Error = error{
     /// SPKI DER did not parse as an RSA public key.
@@ -118,6 +119,17 @@ fn derSkipLen(der: []const u8, start: usize) error{Malformed}!usize {
 pub fn verifyPkcs1v15Sha256(spki_der: []const u8, message: []const u8, signature: []const u8) bool {
     const pk = parseSpkiDer(spki_der) catch return false;
     return verifyParsed(pk, message, signature);
+}
+
+/// PKCS1-v1.5 / SHA-256 sign. Wraps `core.crypto.openssl.rsaSignPkcs1v15Sha256`
+/// — the stdlib's RSA primitives expose verify only, so signing requires
+/// the OpenSSL link. Returns the number of signature bytes written
+/// (256 for RSA-2048, 384 for RSA-3072, 512 for RSA-4096).
+///
+/// Wired into `src/protocols/activitypub/http_delivery.zig` as the RSA
+/// outbound signer.
+pub fn signPkcs1v15Sha256(priv_pem: []const u8, message: []const u8, sig_out: []u8) anyerror!usize {
+    return openssl.rsaSignPkcs1v15Sha256(priv_pem, message, sig_out);
 }
 
 pub fn verifyParsed(pk: PublicKey, message: []const u8, signature: []const u8) bool {
@@ -227,4 +239,100 @@ test "rsa: parseSpkiDer rejects garbage" {
     var garbage: [64]u8 = undefined;
     @memset(&garbage, 0xFF);
     try testing.expectError(error.BadSpki, parseSpkiDer(&garbage));
+}
+
+// ── W3.1 sign + cross-verify tests ────────────────────────────────────
+//
+// These tests use the test fixture key at `tests/fixtures/test.key`
+// (the same key whose self-signed cert is at `tests/fixtures/test.crt`).
+// They prove that:
+//   * Our OpenSSL-backed sign function produces signatures that our own
+//     pure-Zig verifier accepts (round-trip parity).
+//   * OpenSSL-produced signatures verify under our pure-Zig verifier,
+//     and pure-Zig-produced signatures verify under OpenSSL.
+//
+// The fixture must exist for these tests to run; the file is checked
+// in alongside the test binary and is referenced by `zig build test`
+// from the repo root.
+
+const fixture_key_path = "tests/fixtures/test.key";
+
+fn readFixturePem(alloc: std.mem.Allocator, path: []const u8) ![]u8 {
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    return std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(16 * 1024));
+}
+
+test "rsa: signPkcs1v15Sha256 round-trips via verifyPkcs1v15Sha256" {
+    const key_pem = readFixturePem(testing.allocator, fixture_key_path) catch |e| switch (e) {
+        error.FileNotFound => return error.SkipZigTest,
+        else => return e,
+    };
+    defer testing.allocator.free(key_pem);
+
+    const msg = "speedy-socials W3.1 round-trip sign+verify";
+    var sig: [256]u8 = undefined;
+    const n = try signPkcs1v15Sha256(key_pem, msg, &sig);
+    try testing.expectEqual(@as(usize, 256), n);
+
+    // Extract the matching SPKI DER via the openssl helper and verify
+    // with our pure-Zig verifier.
+    var spki_buf: [512]u8 = undefined;
+    const spki = try openssl.extractSpkiDerFromPrivatePem(key_pem, &spki_buf);
+    try testing.expect(verifyPkcs1v15Sha256(spki, msg, sig[0..n]));
+}
+
+test "rsa: signPkcs1v15Sha256 produces a signature that OpenSSL itself accepts" {
+    const key_pem = readFixturePem(testing.allocator, fixture_key_path) catch |e| switch (e) {
+        error.FileNotFound => return error.SkipZigTest,
+        else => return e,
+    };
+    defer testing.allocator.free(key_pem);
+
+    const msg = "cross-verify @ W3.1";
+    var sig: [256]u8 = undefined;
+    const n = try signPkcs1v15Sha256(key_pem, msg, &sig);
+
+    // Build the public PEM via openssl and verify there.
+    const bio_in = openssl.c.BIO_new_mem_buf(key_pem.ptr, @intCast(key_pem.len)) orelse return error.TestUnexpectedResult;
+    defer _ = openssl.c.BIO_free(bio_in);
+    const pkey = openssl.c.PEM_read_bio_PrivateKey(bio_in, null, null, null) orelse return error.TestUnexpectedResult;
+    defer openssl.c.EVP_PKEY_free(pkey);
+    const bio_out = openssl.c.BIO_new(openssl.c.BIO_s_mem()) orelse return error.TestUnexpectedResult;
+    defer _ = openssl.c.BIO_free(bio_out);
+    try testing.expect(openssl.c.PEM_write_bio_PUBKEY(bio_out, pkey) == 1);
+    var pub_ptr: ?[*]u8 = null;
+    const pub_len = openssl.c.BIO_get_mem_data(bio_out, &pub_ptr);
+    try testing.expect(pub_len > 0);
+    const pub_pem = pub_ptr.?[0..@intCast(pub_len)];
+
+    try testing.expect(openssl.rsaVerifyPkcs1v15Sha256Pem(pub_pem, msg, sig[0..n]));
+}
+
+test "rsa: tampered signature fails verifyPkcs1v15Sha256 after round-trip sign" {
+    const key_pem = readFixturePem(testing.allocator, fixture_key_path) catch |e| switch (e) {
+        error.FileNotFound => return error.SkipZigTest,
+        else => return e,
+    };
+    defer testing.allocator.free(key_pem);
+
+    const msg = "tamper test";
+    var sig: [256]u8 = undefined;
+    const n = try signPkcs1v15Sha256(key_pem, msg, &sig);
+    sig[0] ^= 0xff;
+
+    var spki_buf: [512]u8 = undefined;
+    const spki = try openssl.extractSpkiDerFromPrivatePem(key_pem, &spki_buf);
+    try testing.expect(!verifyPkcs1v15Sha256(spki, msg, sig[0..n]));
+}
+
+test "rsa: signPkcs1v15Sha256 rejects an undersized output buffer" {
+    const key_pem = readFixturePem(testing.allocator, fixture_key_path) catch |e| switch (e) {
+        error.FileNotFound => return error.SkipZigTest,
+        else => return e,
+    };
+    defer testing.allocator.free(key_pem);
+    var tiny: [16]u8 = undefined;
+    try testing.expectError(error.BufferTooSmall, signPkcs1v15Sha256(key_pem, "x", &tiny));
 }
