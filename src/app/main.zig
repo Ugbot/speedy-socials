@@ -376,10 +376,19 @@ pub fn main() !void {
     atproto.attachDb(db);
     atproto.attachWorkers(&atp_workers);
 
-    // ── Media plugin wiring (W1.4) ─────────────────────────────────
+    // ── Media plugin wiring (W1.4 + W5.5 filesystem spillover) ────
     media.attachDb(db);
     media.setBaseUrl("http://127.0.0.1:8080");
     media.setMediaRoot("./media");
+    // Best-effort mkdir so the spillover path has somewhere to land.
+    // EEXIST is fine; any other error is logged but non-fatal — the
+    // inline path still works.
+    {
+        const rc = std.c.mkdir("./media", @as(std.c.mode_t, 0o755));
+        if (rc != 0 and std.c._errno().* != 17) { // 17 = EEXIST on macOS+Linux
+            log_ptr.warn("boot", "media root mkdir failed (filesystem spillover disabled)");
+        }
+    }
 
     // ── HTTP server ────────────────────────────────────────────────
     var router = core.http.router.Router.init();

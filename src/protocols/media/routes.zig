@@ -346,13 +346,31 @@ fn getBlob(hc: *HandlerContext) anyerror!void {
     };
     if (!found) return writeError(hc, .not_found, "RecordNotFound", "no such blob");
 
-    // If we got a filesystem pointer, fail loudly: spillover writes
-    // are gated behind the not-yet-wired Io handle (see storeBlob).
+    const mime = if (mime_len > 0) mime_buf[0..mime_len] else "application/octet-stream";
+
     if (fs_path_len > 0) {
-        return writeError(hc, .not_implemented, "NotImplemented", "filesystem spillover read not wired yet");
+        // Filesystem spillover (W5.5). The `fs:<cid>` marker in the
+        // db row points at `<media_root>/<cid>` on disk. Read the
+        // file into a bounded stack buffer and emit as a single
+        // response body. Cap at 4 MiB — anything larger should use
+        // a separate streamed-response path (TODO: chunked transfer
+        // encoding on the response builder).
+        const fs_blob_max_bytes: usize = 4 * 1024 * 1024;
+        var blob_buf: [fs_blob_max_bytes]u8 = undefined;
+        const path = fs_path_buf[0..fs_path_len];
+        const n = readBlobFileInto(st.media_root, path, &blob_buf) catch {
+            return writeError(hc, .internal, "InternalError", "blob fs read failed");
+        };
+        try hc.response.startStatus(.ok);
+        try hc.response.header("Content-Type", mime);
+        try hc.response.headerFmt("Content-Length", "{d}", .{n});
+        try hc.response.header("Cache-Control", "public, max-age=31536000, immutable");
+        try hc.response.header("Connection", "close");
+        try hc.response.finishHeaders();
+        try hc.response.body(blob_buf[0..n]);
+        return;
     }
 
-    const mime = if (mime_len > 0) mime_buf[0..mime_len] else "application/octet-stream";
     try hc.response.startStatus(.ok);
     try hc.response.header("Content-Type", mime);
     try hc.response.headerFmt("Content-Length", "{d}", .{data_len});
@@ -360,6 +378,36 @@ fn getBlob(hc: *HandlerContext) anyerror!void {
     try hc.response.header("Connection", "close");
     try hc.response.finishHeaders();
     try hc.response.body(data_buf[0..data_len]);
+}
+
+/// Read `<media_root>/<cid>` into `out`. Returns the number of bytes
+/// read. Errors if the file is larger than `out.len`.
+fn readBlobFileInto(media_root: []const u8, cid: []const u8, out: []u8) !usize {
+    var path_buf: [512]u8 = undefined;
+    if (media_root.len + 1 + cid.len + 1 > path_buf.len) return error.PayloadTooLarge;
+    var n: usize = 0;
+    @memcpy(path_buf[n..][0..media_root.len], media_root);
+    n += media_root.len;
+    path_buf[n] = '/';
+    n += 1;
+    @memcpy(path_buf[n..][0..cid.len], cid);
+    n += cid.len;
+    path_buf[n] = 0;
+    const path_z: [*:0]const u8 = @ptrCast(&path_buf);
+
+    const fd = std.c.open(path_z, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    if (fd < 0) return error.StepFailed;
+    defer _ = std.c.close(fd);
+
+    var total: usize = 0;
+    while (total < out.len) {
+        const want = out.len - total;
+        const got = std.c.read(fd, out.ptr + total, want);
+        if (got < 0) return error.StepFailed;
+        if (got == 0) break;
+        total += @intCast(got);
+    }
+    return total;
 }
 
 // ── data shapes ────────────────────────────────────────────────────
@@ -429,16 +477,21 @@ fn storeBlobAt(db: *c.sqlite3, cid: []const u8, mime: []const u8, data: []const 
 
     // New blob. Pick inline-vs-filesystem based on size.
     //
-    // NOTE: filesystem spillover requires the `std.Io.Dir` handle which
-    // the plugin Context does not carry today. Until that wiring lands
-    // (W1.1 server upgrades will plumb Io through), large blobs are
-    // simply rejected; the per-request 413 path catches them earlier
-    // so this branch is defence-in-depth.
-    _ = media_root;
+    // W5.5: large blobs spill to disk under `media_root/<cid>`. The
+    // db row stores `data = "fs:<cid>"` — the same prefix convention
+    // `loadBlob` already understands. When no media_root is wired,
+    // oversize uploads still fail loud with PayloadTooLarge (the
+    // request path normally catches them earlier on body-size).
+    var fs_marker_buf: [3 + 256]u8 = undefined;
+    var stored_slice: []const u8 = data;
     if (data.len > limits.media_inline_threshold_bytes) {
-        return error.PayloadTooLarge;
+        if (media_root.len == 0) return error.PayloadTooLarge;
+        if (cid.len > 256) return error.PayloadTooLarge;
+        try writeBlobFile(media_root, cid, data);
+        @memcpy(fs_marker_buf[0..3], "fs:");
+        @memcpy(fs_marker_buf[3..][0..cid.len], cid);
+        stored_slice = fs_marker_buf[0 .. 3 + cid.len];
     }
-    const data_to_store: []const u8 = data;
 
     var ins: ?*c.sqlite3_stmt = null;
     const ins_sql = "INSERT INTO atp_blobs(cid, did, mime, size, ref_count, data, created_at) VALUES (?, ?, ?, ?, 1, ?, ?)";
@@ -449,10 +502,43 @@ fn storeBlobAt(db: *c.sqlite3, cid: []const u8, mime: []const u8, data: []const 
     _ = c.sqlite3_bind_text(ins, 2, did_placeholder.ptr, @intCast(did_placeholder.len), c.sqliteTransientAsDestructor());
     _ = c.sqlite3_bind_text(ins, 3, mime.ptr, @intCast(mime.len), c.sqliteTransientAsDestructor());
     _ = c.sqlite3_bind_int64(ins, 4, @intCast(data.len));
-    _ = c.sqlite3_bind_blob(ins, 5, data_to_store.ptr, @intCast(data_to_store.len), c.sqliteTransientAsDestructor());
+    _ = c.sqlite3_bind_blob(ins, 5, stored_slice.ptr, @intCast(stored_slice.len), c.sqliteTransientAsDestructor());
     _ = c.sqlite3_bind_int64(ins, 6, created_at);
     if (c.sqlite3_step(ins.?) != c.SQLITE_DONE) return error.StepFailed;
 }
+
+/// Write `data` to `<media_root>/<cid>` using POSIX `open`/`write`/`close`
+/// directly. Zig 0.16's `std.Io.Dir` needs an `Io` handle threaded
+/// from the composition root; the plugin Context does not carry one
+/// today. The `media_root` directory is created at boot by
+/// `app/main.zig` (via `mkdir` of the env-supplied path); we assume
+/// it exists.
+fn writeBlobFile(media_root: []const u8, cid: []const u8, data: []const u8) !void {
+    var path_buf: [512]u8 = undefined;
+    if (media_root.len + 1 + cid.len + 1 > path_buf.len) return error.PayloadTooLarge;
+    var n: usize = 0;
+    @memcpy(path_buf[n..][0..media_root.len], media_root);
+    n += media_root.len;
+    path_buf[n] = '/';
+    n += 1;
+    @memcpy(path_buf[n..][0..cid.len], cid);
+    n += cid.len;
+    path_buf[n] = 0;
+    const path_z: [*:0]const u8 = @ptrCast(&path_buf);
+
+    const fd = std.c.open(path_z, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+    if (fd < 0) return error.StepFailed;
+    defer _ = std.c.close(fd);
+    var written: usize = 0;
+    while (written < data.len) {
+        const want = data.len - written;
+        const w = std.c.write(fd, data.ptr + written, want);
+        if (w < 0) return error.StepFailed;
+        written += @intCast(w);
+        if (w == 0) return error.StepFailed;
+    }
+}
+
 
 fn insertAttachment(db: *c.sqlite3, p: InsertParams) !i64 {
     const sql =
@@ -713,6 +799,64 @@ fn setupDb() !*c.sqlite3 {
         return error.StepFailed;
     }
     return db;
+}
+
+test "storeBlobAt: oversize payload spills to media_root and reads back" {
+    const db = try setupDb();
+    defer core.storage.sqlite.closeDb(db);
+
+    // Create a unique scratch dir for this test run.
+    const dir_path = "./_test_media_spillover";
+    _ = std.c.mkdir(dir_path, @as(std.c.mode_t, 0o755));
+
+    // Payload deliberately bigger than the inline cap.
+    const big_len = limits.media_inline_threshold_bytes + 12_345;
+    const big = try std.testing.allocator.alloc(u8, big_len);
+    defer std.testing.allocator.free(big);
+    for (big, 0..) |*b, i| b.* = @intCast(i & 0xff);
+
+    var cid_buf: [64]u8 = undefined;
+    const cid = blobCid(big, &cid_buf);
+    try storeBlobAt(db, cid, "application/octet-stream", big, dir_path, 12345);
+
+    // Verify the db row carries the `fs:<cid>` marker.
+    var mime_buf: [128]u8 = undefined;
+    var mime_len: usize = 0;
+    var data_out: [16]u8 = undefined; // intentionally tiny — we expect zero inline bytes
+    var data_out_len: usize = 0;
+    var fs_buf: [256]u8 = undefined;
+    var fs_len: usize = 0;
+    const ok = try loadBlob(db, cid, &mime_buf, &mime_len, &data_out, &data_out_len, &fs_buf, &fs_len);
+    try std.testing.expect(ok);
+    try std.testing.expectEqualStrings("application/octet-stream", mime_buf[0..mime_len]);
+    try std.testing.expectEqual(@as(usize, 0), data_out_len);
+    try std.testing.expectEqualStrings(cid, fs_buf[0..fs_len]);
+
+    // Read the file back through the same helper the GET handler uses
+    // and check byte-for-byte equality.
+    const echo = try std.testing.allocator.alloc(u8, big_len + 8);
+    defer std.testing.allocator.free(echo);
+    const got = try readBlobFileInto(dir_path, fs_buf[0..fs_len], echo);
+    try std.testing.expectEqual(big_len, got);
+    try std.testing.expectEqualSlices(u8, big, echo[0..got]);
+
+    // Cleanup: unlink the blob + rmdir.
+    var path_buf: [512]u8 = undefined;
+    const path_n = std.fmt.bufPrintZ(&path_buf, "{s}/{s}", .{ dir_path, cid }) catch unreachable;
+    _ = std.c.unlink(path_n.ptr);
+    _ = std.c.rmdir(dir_path);
+}
+
+test "storeBlobAt: oversize without media_root still rejects with PayloadTooLarge" {
+    const db = try setupDb();
+    defer core.storage.sqlite.closeDb(db);
+    const big_len = limits.media_inline_threshold_bytes + 1;
+    const big = try std.testing.allocator.alloc(u8, big_len);
+    defer std.testing.allocator.free(big);
+    @memset(big, 'x');
+    var cid_buf: [64]u8 = undefined;
+    const cid = blobCid(big, &cid_buf);
+    try std.testing.expectError(error.PayloadTooLarge, storeBlobAt(db, cid, "x/y", big, "", 0));
 }
 
 test "storeBlob: inline path round-trips through atp_blobs" {
