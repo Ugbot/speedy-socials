@@ -47,6 +47,7 @@ pub const identity_map = @import("identity_map.zig");
 pub const subscription = @import("subscription.zig");
 pub const routes = @import("routes.zig");
 pub const state = @import("state.zig");
+pub const firehose_consumer = @import("firehose_consumer.zig");
 
 /// The relay holds a pointer to the registry between `attachRegistry`
 /// and `init`. `initAll` does not pass the registry through, so we
@@ -230,6 +231,7 @@ test {
     _ = subscription;
     _ = routes;
     _ = state;
+    _ = firehose_consumer;
 }
 
 test "Relay plugin registers via Registry" {

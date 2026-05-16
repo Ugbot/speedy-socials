@@ -274,6 +274,20 @@ pub fn main() !void {
     // rare, admin-bound, and synchronous (good enough for Phase 5).
     relay.state.attachDb(db);
 
+    // W5.1: spin the AT→AP firehose consumer. Registers an in-process
+    // sink against `atproto.firehose.append` and drains a bounded
+    // ring on a dedicated thread, calling `relay.handleFirehoseEvent`
+    // on each record and appending to `relay_translation_log`. The
+    // sink is unregistered + the worker joined on the `defer` below.
+    _ = relay.firehose_consumer.start(gpa_allocator, db, real_clock.clock(), "speedy-socials.local") catch |err| blk: {
+        log_ptr.record(.warn, "boot", "relay firehose consumer failed to start", &.{
+            .{ .k = "err", .v = @errorName(err) },
+        });
+        break :blk null;
+    };
+    defer relay.firehose_consumer.stop(gpa_allocator);
+    log_ptr.info("boot", "relay firehose consumer started");
+
     // ── ActivityPub worker pool + state wiring (Phase 3b) ──────────
     const ap_workers = try allocator.create(activitypub.state.PoolType);
     defer allocator.destroy(ap_workers);

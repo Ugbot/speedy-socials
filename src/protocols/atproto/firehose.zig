@@ -18,6 +18,27 @@ const c = @import("sqlite").c;
 const core = @import("core");
 const StorageError = core.errors.StorageError;
 
+/// W5.1: an in-process notification fired synchronously from
+/// `append()` after a row has been committed. The relay's firehose
+/// consumer registers here at boot to pick up AT→AP translation work
+/// without re-using the existing WebSocket subscriber path (which is
+/// for external clients).
+///
+/// At most one sink may be installed at a time. The caller must keep
+/// the sink alive for the duration of the process; we hold a raw
+/// function pointer.
+pub const LocalSink = *const fn (seq: i64, did: []const u8, commit_cid: []const u8, body: []const u8, ts: i64) void;
+
+var local_sink: ?LocalSink = null;
+
+pub fn registerLocalSink(sink: ?LocalSink) void {
+    local_sink = sink;
+}
+
+pub fn currentLocalSink() ?LocalSink {
+    return local_sink;
+}
+
 /// Append a firehose event row. Returns the assigned sequence number.
 pub fn append(
     db: *c.sqlite3,
@@ -49,6 +70,13 @@ pub fn append(
         _ = c.sqlite3_bind_int64(ustmt, 1, seq);
         _ = c.sqlite3_step(ustmt.?);
     }
+
+    // W5.1: notify the in-process local sink (the relay's consumer).
+    // Synchronous on the caller's thread — the sink must enqueue + return
+    // quickly. A panicking sink takes down the whole append path; this
+    // is by design (Tiger Style: loud failures over hidden retries).
+    if (local_sink) |sink| sink(seq, did, commit_cid, body, ts);
+
     return seq;
 }
 
