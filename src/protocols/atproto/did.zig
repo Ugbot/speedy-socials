@@ -1,9 +1,9 @@
 //! DID — Decentralized Identifier parsing and validation.
 //!
 //! Tiger Style: pure, allocator-free. The `Did` struct is a borrowed
-//! view over the input string. Resolution (over the network) is *not*
-//! done here — it lands in a later phase via the worker pool. The
-//! `resolve*` helpers are explicit stubs returning `error.NotImplemented`.
+//! view over the input string. Network resolution lives in
+//! `did_resolver.zig` (HTTP-backed with an LRU cache), wired into the
+//! boot path via `did_resolver.setFetcher`.
 //!
 //! Spec: https://atproto.com/specs/did
 
@@ -83,17 +83,6 @@ pub fn parse(s: []const u8) AtpError!Did {
     return .{ .raw = s, .method_start = 4, .id_start = id_offset };
 }
 
-/// Network resolution stub. Will be implemented in a later phase using
-/// the worker pool. Calling this today is a programmer error.
-pub fn resolvePlcDocument(_: Did, _: []u8) AtpError!usize {
-    return error.NotImplemented;
-}
-
-/// Network resolution stub for did:web.
-pub fn resolveWebDocument(_: Did, _: []u8) AtpError!usize {
-    return error.NotImplemented;
-}
-
 // ── Tests ──────────────────────────────────────────────────────────
 
 test "did:plc valid" {
@@ -120,9 +109,3 @@ test "did: rejects missing prefix / uppercase method / empty parts / forbidden c
     try std.testing.expectError(error.BadDid, parse("did:plc:abc%"));
 }
 
-test "did: resolve stubs return NotImplemented" {
-    const d = try parse("did:web:example.com");
-    var buf: [16]u8 = undefined;
-    try std.testing.expectError(error.NotImplemented, resolveWebDocument(d, &buf));
-    try std.testing.expectError(error.NotImplemented, resolvePlcDocument(d, &buf));
-}

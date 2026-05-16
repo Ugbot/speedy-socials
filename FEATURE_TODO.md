@@ -1,10 +1,10 @@
 # Feature Status — speedy-socials
 
-_Last updated: 2026-05-16. Reflects the Tiger-Style rewrite under
-`src/core/`, `src/app/`, `src/protocols/`. See ADR-001 .. ADR-004 in
-`docs/adr/` for context. This file is a snapshot at this commit;
-other open work-tranches (W1.1 .. W1.5) flip items from `stubbed` to
-shipped as they land._
+_Last updated: 2026-05-16 (post-W3.2 audit). Reflects the Tiger-Style
+rewrite under `src/core/`, `src/app/`, `src/protocols/`. See ADR-001 ..
+ADR-004 in `docs/adr/` for context. Each line below was checked
+against the actual source tree at this commit — if you spot drift,
+fix it._
 
 ## Shipped
 
@@ -76,72 +76,84 @@ shipped as they land._
       `std.testing.allocator`.
 - [x] Vendored TB `testing/` module's tests run as part of the suite.
 
-## Stubbed (function-pointer seams ready, real impl pending)
+## Recently shipped (W2.x / W3.x)
 
-These are wired so tests and the simulation can inject deterministic
-behaviour. The default implementations return errors so missing
-production wiring is loud rather than silent.
+These were listed as stubs in earlier snapshots; they have all been
+wired through to real implementations. Listed here to clear the
+backlog of stale "stubbed" claims.
 
-- [ ] AP HTTP key fetcher — `key_cache.setFetchHook`; default returns
-      `KeyFetchFailed` (W1.2).
-- [ ] AP federation delivery POST — `outbox_worker.setDeliverHook`;
-      default returns transient failure so the retry queue can be
-      exercised in tests (W1.2).
-- [ ] AP RSA-SHA256 signature *verify* hook — `keys.setRsaVerifyHook`
-      default still stubbed. RSA-SHA256 *signing* shipped in W3.1 via
-      OpenSSL link (used by federation delivery for Mastodon-default
-      rsa-sha256 actors).
-- [ ] AT DID resolver HTTP fetcher — parser is ready, HTTP fetch is
-      W1.2.
-- [ ] AT WS `subscribeRepos` (firehose) — frame codec is shipped;
-      waiting on the server-side WS upgrade dispatch in W1.1.
-- [ ] AT CAR file sync endpoints (`getRepo`, `getBlocks`,
-      `getCheckout`) — XRPC routes scaffolded, CAR encoder/decoder is
-      a follow-up.
-- [ ] AT secp256k1 signing/verification (W1.2).
-- [ ] AT Argon2id password hashing (W1.2).
-- [ ] AT ES256 DPoP (W1.2).
+- [x] AP HTTP key fetcher (`key_cache.setFetchHook` → `apKeyFetchClosure`
+      in `src/app/main.zig`).
+- [x] AP federation delivery POST (`outbox_worker.setDeliverHook` →
+      `apDeliveryClosure` → `activitypub.http_delivery.deliver`).
+- [x] AP RSA-SHA256 *signature verify* (`keys.setRsaVerifyHook` →
+      `core.crypto.rsa.verifyPkcs1v15Sha256`, pure-Zig via `std.crypto.Certificate.rsa`).
+- [x] AP RSA-SHA256 *signing* via OpenSSL link
+      (`core.crypto.rsa.signPkcs1v15Sha256` → outbound delivery).
+- [x] AT DID resolver HTTP fetcher (`did_resolver.setFetcher` →
+      `atDidFetchClosure`).
+- [x] AT WS `subscribeRepos` firehose — handler in
+      `src/protocols/atproto/sync_firehose.zig`, dispatched via
+      `core.ws.upgrade_router`.
+- [x] AT CAR file sync endpoints (`getRepo`, `getBlocks`,
+      `getCheckout`) — CAR encoder/decoder in `src/protocols/atproto/car.zig`.
+- [x] AT secp256k1 signing/verification (`core.crypto.secp256k1`).
+- [x] AT Argon2id password hashing (`core.crypto.argon2id`, configured
+      at boot with the GPA + Io).
+- [x] AT ES256 DPoP (handled in `src/protocols/atproto/oauth_dpop.zig`;
+      the only remaining `NotImplemented` is the optional alg path).
+- [x] AT `com.atproto.identity.resolveHandle` (W3.2 follow-up: wired
+      through the module-level DID resolver).
+- [x] HTTP/1.1 keep-alive in `core/server.zig`.
+- [x] Server-side WebSocket upgrade dispatch
+      (`core.ws.upgrade_router` + `core/server.zig` integration).
+- [x] Mastodon API v1 surface — instance, accounts, statuses,
+      timelines, notifications, apps, OAuth2, streaming WS.
+- [x] OAuth2 authorization server (auth code, password,
+      client_credentials).
+- [x] Media uploads + image thumbnails + blurhash; large-blob
+      filesystem spillover is the only remaining gap (see below).
+- [x] Federation E2E simulation against the real `outbox_worker`
+      (`zig build sim`).
+- [x] `bench/baseline.json` regression-guarded benches.
+- [x] Un-gated TigerBeetle intrusive tests.
+- [x] CI workflow template, Dockerfile, justfile (see `docs/ci/`).
+- [x] TLS termination: outbound (`std.crypto.tls`, W2.4) +
+      inbound (`ianic_inbound`, pure-Zig TLS 1.3, W3.2 — replaces the
+      W3.1 OpenSSL-backed default; OpenSSL link retained narrowly for
+      RSA signing).
 
-## Planned
+## Open work
 
-Larger surfaces that have not been started yet.
+Real remaining gaps, ordered by impact.
 
-- [x] TLS termination — outbound TLS shipped via `std.crypto.tls`
-      (W2.4); inbound TLS shipped via OpenSSL `BoringInboundBackend`
-      (W3.1). Boot loads `TLS_CERT_PATH` + `TLS_KEY_PATH` and installs
-      the backend when both are set, otherwise plain HTTP behind an
-      LB. Multi-SNI is a follow-up; HTTPS-fronted WebSocket data-plane
-      wiring is also a follow-up.
-- [ ] HTTP/1.1 keep-alive in `core/server.zig` (W1.1).
-- [ ] Server-side WebSocket upgrade dispatch (W1.1).
-- [ ] Mastodon API v1 surface (W1.3):
-  - [ ] `/api/v1/instance`, `/api/v2/instance`
-  - [ ] `/api/v1/accounts/*`, `/api/v1/statuses/*`
-  - [ ] `/api/v1/timelines/{home,public,tag/:tag}`
-  - [ ] `/api/v1/notifications`
-  - [ ] `/api/v1/apps`, `/oauth/authorize`, `/oauth/token`
-  - [ ] `/api/v1/streaming/*` over WebSocket
-- [ ] OAuth2 authorization server (auth code, password,
-      client_credentials) — bundled with W1.3.
-- [ ] Media uploads + image thumbnails + blurhash (W1.4).
-- [ ] Federation E2E simulation end-to-end against the real
-      `outbox_worker` (W1.5).
-- [ ] `bench/baseline.json` for regression-guarded benches (W1.5).
-- [ ] Un-gate the vendored TB intrusive tests against `core.prng`
-      (W1.5).
-- [ ] CI workflow, Dockerfile, justfile (this tranche, W1.6).
-
-## Issues + tech debt
-
-- [ ] `core/server.zig` lacks HTTP/1.1 keep-alive — one request per
-      TCP connection (fix in W1.1).
-- [ ] No backpressure on the WS subscription registry's per-shard
-      queues — bounded but currently drops oldest. Confirm policy.
-- [ ] AP outbox retry queue uses a fixed exponential schedule; a
-      jittered policy would smooth thundering-herd on recovery.
-- [ ] No request-body size cap above the HTTP parser's hard limit.
-- [ ] No structured access log — the ring log captures application
-      events only.
+- [ ] **HTTPS-fronted WebSocket data plane.** The WS *handshake* is
+      routed through the TLS backend, but each handler's frame loop
+      (`writeAll` / `pumpInbound` in `sync_firehose.zig` +
+      `streaming_ws.zig`) reads + writes via the bare socket. Under
+      HTTPS this means WSS connections work for the upgrade but
+      garbage on app data. Mitigation today: terminate TLS at an LB
+      and run WS over plain HTTP behind it. Production fix: add a
+      `read_nonblock` hook to the TLS vtable + route the WS handlers
+      through it.
+- [ ] **Media filesystem spillover.** `src/protocols/media/routes.zig`
+      rejects large blobs (>16 KiB inline cap) with 413 because the
+      plugin `Context` doesn't carry an `std.Io.Dir` handle yet.
+      Plumb Io through, then wire `storeBlobAt` to fall through to
+      `media_root` for oversize uploads.
+- [ ] **Multi-SNI cert dispatch** on the inbound TLS backends.
+      Single-cert deployments unaffected; needed before serving more
+      than one hostname from one process.
+- [ ] **Per-socket connect/read timeouts** for the outbound HTTP
+      client. `timeout_ms` is plumbed but `std.Io.net` doesn't expose
+      the underlying setsockopt portably yet. Track upstream Zig.
+- [ ] **WS subscription registry backpressure policy** — currently
+      drops oldest when a shard queue is full. Confirm with prod
+      load shape before promising at-least-once semantics.
+- [ ] **Request-body size cap** above the HTTP parser's hard limit
+      (current cap is per-buffer, not per-endpoint).
+- [ ] **Structured access log** — the ring log captures application
+      events but not HTTP access lines.
 
 ---
 

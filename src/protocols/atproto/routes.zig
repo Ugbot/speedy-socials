@@ -32,6 +32,7 @@ const dag = @import("dag_cbor.zig");
 const mst = @import("mst.zig");
 const cid_mod = @import("cid.zig");
 const car = @import("car.zig");
+const did_resolver = @import("did_resolver.zig");
 
 // W2.3: caps for the sync endpoints. listRecords pagination follows
 // the AT spec defaults (50/100). CAR responses are bounded by the
@@ -305,6 +306,32 @@ fn wellKnownAtprotoDid(hc: *HandlerContext) anyerror!void {
     try hc.response.header("Connection", "close");
     try hc.response.finishHeaders();
     try hc.response.body(body);
+}
+
+// ── identity.resolveHandle ────────────────────────────────────────
+// Resolves a Bluesky handle (e.g. `alice.example.com`) to a DID by
+// fetching `https://<handle>/.well-known/atproto-did` through the
+// module-level HTTP fetcher wired at boot (`did_resolver.setFetcher`).
+// Returns `{ "did": "did:..." }` on success.
+fn identityResolveHandle(hc: *HandlerContext) anyerror!void {
+    const q = hc.request.pathAndQuery().query;
+    const handle = xrpc.queryParam(q, "handle") orelse {
+        return xrpc.writeError(hc, .bad_request, "InvalidRequest", "missing handle");
+    };
+    const fetcher = did_resolver.getFetcher() orelse {
+        return xrpc.writeError(hc, .service_unavailable, "ServiceUnavailable", "did resolver not configured");
+    };
+    var resolver = did_resolver.Resolver.init(fetcher);
+    var did_buf: [did_resolver.max_did_bytes]u8 = undefined;
+    const did_slice = resolver.resolveHandle(handle, &did_buf) catch |err| switch (err) {
+        error.NotFound => return xrpc.writeError(hc, .not_found, "ResolutionFailed", "handle not found"),
+        else => return xrpc.writeError(hc, .internal, "InternalError", "resolution failed"),
+    };
+    var body_buf: [did_resolver.max_did_bytes + 32]u8 = undefined;
+    const body = std.fmt.bufPrint(&body_buf, "{{\"did\":\"{s}\"}}", .{did_slice}) catch {
+        return xrpc.writeError(hc, .internal, "InternalError", "encode");
+    };
+    try xrpc.writeJsonBody(hc, .ok, body);
 }
 
 // ── stubs returning 501 for endpoints whose plumbing lands later ──
@@ -876,7 +903,7 @@ pub fn register(router: *Router, plugin_index: u16) !void {
     // upgrade router before this handler runs.
     try router.register(.get, "/xrpc/com.atproto.sync.subscribeRepos", subscribeReposHttp, plugin_index);
 
-    try router.register(.get, "/xrpc/com.atproto.identity.resolveHandle", notImplemented, plugin_index);
+    try router.register(.get, "/xrpc/com.atproto.identity.resolveHandle", identityResolveHandle, plugin_index);
 
     try router.register(.get, "/.well-known/atproto-did", wellKnownAtprotoDid, plugin_index);
 }

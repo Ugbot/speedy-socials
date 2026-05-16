@@ -45,6 +45,18 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // ── third-party: ianic/tls.zig (vendored submodule) ───────────
+    // Pure-Zig TLS 1.2/1.3 client + TLS 1.3 server. Replaces the
+    // system OpenSSL link for *server-side* TLS (`core.tls.ianic_inbound`).
+    // The OpenSSL link is retained narrowly for RSA-PKCS1v15-SHA256
+    // signing (used by AP federation outbound delivery for Mastodon's
+    // default rsa-sha256 actors). See `third_party/ianic-tls/`.
+    const ianic_tls_mod = b.addModule("tls", .{
+        .root_source_file = b.path("third_party/ianic-tls/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     // ── core module ────────────────────────────────────────────────
     const core_mod = b.addModule("core", .{
         .root_source_file = b.path("src/core/root.zig"),
@@ -57,6 +69,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "tb_prng", .module = tb_prng_mod },
             .{ .name = "tb_intrusive", .module = tb_intrusive_mod },
             .{ .name = "tb_testing", .module = tb_testing_mod },
+            .{ .name = "tls", .module = ianic_tls_mod },
         },
     });
 

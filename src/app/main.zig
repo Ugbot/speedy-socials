@@ -24,15 +24,21 @@ fn alwaysReadyHook(_: ?*anyopaque) core.health.Status {
     return .ready;
 }
 
-// ── Inbound TLS (W3.1) wiring helpers ────────────────────────────────
+// ── Inbound TLS (W3.2) wiring helpers ────────────────────────────────
 //
-// `InboundTlsHolder` owns the heap-allocated `BoringInboundBackend` for
-// the lifetime of `main`. We allocate via the GPA (boot-only) and never
-// reallocate. The SSL_CTX inside the backend lives in OpenSSL's own
-// allocator, outside our static-allocator boundary by design.
+// `InboundTlsHolder` owns the heap-allocated inbound TLS backend for
+// the lifetime of `main`. We allocate via the GPA (boot-only) and
+// never reallocate. The backend itself uses no allocator on the hot
+// path; its slot pool is heap-allocated once at `init`.
+//
+// Default backend: `core.tls.ianic_inbound.IanicInboundBackend` — pure
+// Zig, no system OpenSSL link required for server TLS. The OpenSSL
+// link stays in the build narrowly for RSA-PKCS1v15-SHA256 signing
+// (used by ActivityPub federation outbound delivery for Mastodon's
+// rsa-sha256 actors); see `src/core/crypto/openssl.zig`.
 
 const InboundTlsHolder = struct {
-    backend: ?*core.tls.boring_inbound.BoringInboundBackend = null,
+    backend: ?*core.tls.ianic_inbound.IanicInboundBackend = null,
     allocator: ?std.mem.Allocator = null,
 
     fn deinit(self: *InboundTlsHolder) void {
@@ -51,6 +57,7 @@ const InboundTlsHolder = struct {
 fn loadInboundTlsIfConfigured(
     holder: *InboundTlsHolder,
     allocator: std.mem.Allocator,
+    io: std.Io,
     log_ptr: *core.log.Log,
 ) !?core.tls.TlsBackend {
     // Zig 0.16's `std.process` no longer exposes the global-env helpers
@@ -66,23 +73,17 @@ fn loadInboundTlsIfConfigured(
     const cert_path = std.mem.sliceTo(cert_path_c, 0);
     const key_path = std.mem.sliceTo(key_path_c, 0);
 
-    // Read both PEMs synchronously via a freshly-spun Threaded Io. The
-    // boot path can afford the temporary; we don't keep it past this
-    // function.
-    var boot_threaded = std.Io.Threaded.init(allocator, .{});
-    defer boot_threaded.deinit();
-    const boot_io = boot_threaded.io();
-    const cert_pem = try std.Io.Dir.cwd().readFileAlloc(boot_io, cert_path, allocator, .limited(256 * 1024));
+    const cert_pem = try std.Io.Dir.cwd().readFileAlloc(io, cert_path, allocator, .limited(256 * 1024));
     defer allocator.free(cert_pem);
-    const key_pem = try std.Io.Dir.cwd().readFileAlloc(boot_io, key_path, allocator, .limited(256 * 1024));
+    const key_pem = try std.Io.Dir.cwd().readFileAlloc(io, key_path, allocator, .limited(256 * 1024));
     defer allocator.free(key_pem);
 
-    const ptr = try allocator.create(core.tls.boring_inbound.BoringInboundBackend);
+    const ptr = try allocator.create(core.tls.ianic_inbound.IanicInboundBackend);
     errdefer allocator.destroy(ptr);
-    ptr.* = try core.tls.boring_inbound.BoringInboundBackend.init(cert_pem, key_pem);
+    ptr.* = try core.tls.ianic_inbound.IanicInboundBackend.init(allocator, io, cert_pem, key_pem);
     holder.backend = ptr;
     holder.allocator = allocator;
-    log_ptr.info("boot", "inbound TLS backend initialised (BoringInboundBackend, system OpenSSL)");
+    log_ptr.info("boot", "inbound TLS backend initialised (IanicInboundBackend, pure-Zig TLS 1.3)");
     return ptr.backend();
 }
 
@@ -403,7 +404,7 @@ pub fn main() !void {
     // deployments behind a terminating LB / sidecar).
     var inbound_tls_holder = InboundTlsHolder{};
     defer inbound_tls_holder.deinit();
-    const inbound_tls_backend = try loadInboundTlsIfConfigured(&inbound_tls_holder, gpa_allocator, log_ptr);
+    const inbound_tls_backend = try loadInboundTlsIfConfigured(&inbound_tls_holder, gpa_allocator, io, log_ptr);
 
     var server = try core.server.Server.init(
         .{

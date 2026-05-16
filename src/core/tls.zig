@@ -38,9 +38,15 @@ pub const native_outbound = @import("tls/native_outbound.zig");
 pub const native_inbound = @import("tls/native_inbound.zig");
 
 /// Inbound TLS backend backed by the system OpenSSL link (W3.1).
-/// Replaces the `native_inbound` stub. See
-/// `src/core/tls/boring_inbound.zig`.
+/// Kept available as a fallback / for FIPS-sensitive deployments. The
+/// default boot wiring uses `ianic_inbound` instead.
+/// See `src/core/tls/boring_inbound.zig`.
 pub const boring_inbound = @import("tls/boring_inbound.zig");
+
+/// Inbound TLS backend backed by the pure-Zig `ianic/tls.zig` library
+/// (W3.2). Default inbound backend — no system OpenSSL link required.
+/// See `src/core/tls/ianic_inbound.zig`.
+pub const ianic_inbound = @import("tls/ianic_inbound.zig");
 
 pub const TlsBackend = struct {
     ptr: *anyopaque,
@@ -151,6 +157,7 @@ test {
     _ = native_outbound;
     _ = native_inbound;
     _ = boring_inbound;
+    _ = ianic_inbound;
 }
 
 test "PlainBackend.wrap_stream is the identity function" {

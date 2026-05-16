@@ -1,0 +1,3 @@
+[submodule "third_party/ianic-tls"]
+	path = third_party/ianic-tls
+	url = https://github.com/ianic/tls.zig.git

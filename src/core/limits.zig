@@ -42,6 +42,14 @@
 /// in the Connection pool (request arena + fixed read/write buffers).
 pub const max_connections: u32 = 4096;
 
+/// Maximum simultaneous inbound TLS sessions. Each slot carries a full
+/// TLS input + output record buffer (~33 KiB) plus the per-connection
+/// `tls.Connection` state. Operators who exceed this cap should
+/// terminate TLS at an LB / sidecar and run speedy-socials on plain
+/// HTTP. Deliberately smaller than `max_connections` so the BSS cost
+/// of TLS buffers isn't paid for non-TLS deployments.
+pub const tls_inbound_max_connections: u32 = 1024;
+
 /// Per-connection request arena size. One full HTTP request lives here
 /// from parse through response serialization. ActivityPub Notes + Mastodon
 /// API payloads should comfortably fit in 64 KiB.

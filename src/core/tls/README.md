@@ -22,7 +22,8 @@ handed a raw accepted stream and only wraps it.
 | `core.tls.StubTlsBackend`          | inbound   | shipped  | Pass-through with a noisy warning, for ops scripts wiring the TLS flag      |
 | `core.tls.native_outbound`         | outbound  | **shipped** | Real TLS 1.2/1.3 client via `std.crypto.tls.Client` + OS CA bundle      |
 | `core.tls.native_inbound`          | inbound   | **stub** | Always errors `TlsServerNotImplementedInThisZig`; 0.16 stdlib has no server |
-| `core.tls.boring_inbound`          | inbound   | **shipped (W3.1)** | Real TLS 1.2/1.3 server via system OpenSSL link; cert+key from in-memory PEM, fd-keyed slot pool |
+| `core.tls.ianic_inbound`           | inbound   | **shipped (W3.2, default)** | Pure-Zig TLS 1.3 server via vendored `ianic/tls.zig`; cert+key from in-memory PEM; fd-keyed slot pool sized at `limits.tls_inbound_max_connections` |
+| `core.tls.boring_inbound`          | inbound   | shipped (W3.1, alternative) | Same shape, backed by system OpenSSL. Retained for FIPS-sensitive deployments and TLS 1.2 server support. Not the default. |
 
 The default boot wiring (`src/app/main.zig`) installs
 `NativeOutboundBackend` on `http_client` so federation requests reach
@@ -41,10 +42,14 @@ real Mastodon and Bluesky peers. Inbound listeners run with
 
 ## Known gaps
 
-- **Inbound TLS** — needs an external library (BoringSSL is the planned
-  replacement). Today the recommended deployment shape is to terminate
-  TLS in a sidecar (Caddy, nginx, a load balancer) and run speedy-socials
-  on plain HTTP behind it.
+- **Server-side TLS 1.2** — the default `ianic_inbound` backend is
+  TLS 1.3 only. Mastodon and Bluesky negotiate TLS 1.3 by default, so
+  this is fine for federation. Deployments that need TLS 1.2 inbound
+  can opt into the OpenSSL-backed `boring_inbound` at boot.
+- **HTTPS-fronted WebSocket data plane** — the WS handshake fires
+  through the TLS backend, but the per-handler frame loop reads /
+  writes via the bare socket. Run WS over plain HTTP behind a
+  terminating LB for now.
 - **Socket-level timeouts on outbound connect** — `std.Io.net` does not
   yet expose per-socket connect / read timeouts in a portable way. The
   `timeout_ms` parameter on `http_client.TlsBackend.connect` is recorded
@@ -52,17 +57,30 @@ real Mastodon and Bluesky peers. Inbound listeners run with
 - **Cert pinning** — not implemented. The native outbound backend uses
   the OS trust store wholesale. Pinning slots into the same vtable when
   needed.
+- **Multi-SNI fan-out** — both inbound backends serve a single
+  cert/key pair. SNI dispatch lands when a multi-domain deployment
+  actually appears.
 
-## BoringSSL backend (W3.1 — shipped via system OpenSSL link)
+## `ianic_inbound` (W3.2 — default, pure Zig)
 
-W3.1 wired in `core.tls.boring_inbound.BoringInboundBackend`, which
-plugs into the existing `core.tls.TlsBackend` vtable. We did **not**
-vendor the BoringSSL source tree — the build links the system / Homebrew
-`libssl` + `libcrypto` instead. The C-ABI surface (`SSL_*`, `EVP_*`,
-`RSA_*`, `PEM_*`) is stable across OpenSSL 3, BoringSSL, and LibreSSL,
-so the same Zig wrapper (`src/core/crypto/openssl.zig`) works across
-all three. See `third_party/boringssl/README.md` for the rationale +
-re-vendor procedure if we ever decide to absorb the source.
+Backed by [`ianic/tls.zig`](https://github.com/ianic/tls.zig), vendored
+as a git submodule under `third_party/ianic-tls/`. TLS 1.3 only on the
+server side; no system OpenSSL link needed for inbound. The slot pool
+is heap-allocated at boot (size: `limits.tls_inbound_max_connections`,
+default 1024). Each slot carries ~33 KiB of TLS record buffers plus
+the per-connection `tls.Connection` value; sized smaller than
+`max_connections` so plain-HTTP deployments don't pay the BSS cost.
+
+## `boring_inbound` (W3.1 — alternative via system OpenSSL link)
+
+`core.tls.boring_inbound.BoringInboundBackend` plugs into the same
+`core.tls.TlsBackend` vtable. The build links system / Homebrew
+`libssl` + `libcrypto`; the C-ABI surface (`SSL_*`, `EVP_*`, `RSA_*`,
+`PEM_*`) is stable across OpenSSL 3, BoringSSL, and LibreSSL, so the
+same Zig wrapper (`src/core/crypto/openssl.zig`) covers all three. The
+OpenSSL link also provides the RSA-PKCS1v15-SHA256 *signing* primitive
+used by ActivityPub federation outbound delivery — that path stays
+linked even when the inbound backend is the pure-Zig `ianic_inbound`.
 
 The vtable picked up three new **optional** fields (additions only —
 existing backends untouched): `read_some`, `write_all`, `close_conn`.
@@ -83,22 +101,7 @@ TLS_KEY_PATH=./tests/fixtures/test.key \
 Multi-SNI dispatch is intentionally deferred — single-cert support
 matches Mastodon defaults and covers v1 deployments.
 
-## BoringSSL backend shape (reference)
-
-The shape of any future BoringSSL / LibreSSL / Rustls inbound backend
-remains identical to the existing native backends:
-
-```zig
-pub const BoringInboundBackend = struct {
-    // ... cert chain, private key, SNI table ...
-
-    pub fn backend(self: *@This()) core.tls.TlsBackend {
-        return .{ .ptr = self, .vtable = &vtable };
-    }
-
-    pub const vtable: core.tls.TlsBackend.VTable = .{ .wrap_stream = wrap };
-};
-```
-
-Because callers in `core.server` and `core.http_client` only see the
-vtable, no other code changes when the BoringSSL backend lands.
+To force the OpenSSL-backed `boring_inbound` (e.g. for TLS 1.2 server
+support), edit the `InboundTlsHolder` wiring in `src/app/main.zig` to
+construct `core.tls.boring_inbound.BoringInboundBackend.init(...)`
+instead of the ianic variant.
