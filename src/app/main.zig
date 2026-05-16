@@ -288,6 +288,13 @@ pub fn main() !void {
     defer relay.firehose_consumer.stop(gpa_allocator);
     log_ptr.info("boot", "relay firehose consumer started");
 
+    // W5.2: install the relay's AP-inbox hook. Fires after every
+    // accepted AP activity; the relay translates it into an AT-side
+    // log entry (and, when key infra lands, an AT repo commit).
+    relay.ap_to_at.setRelayHost("speedy-socials.local");
+    activitypub.inbox.setRelayInboxHook(relay.ap_to_at.onActivityReceived);
+    log_ptr.info("boot", "relay ap-to-at hook wired");
+
     // ── ActivityPub worker pool + state wiring (Phase 3b) ──────────
     const ap_workers = try allocator.create(activitypub.state.PoolType);
     defer allocator.destroy(ap_workers);

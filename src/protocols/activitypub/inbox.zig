@@ -32,6 +32,42 @@ const ActivityType = activity.ActivityType;
 
 pub const max_side_effects: u8 = 16;
 
+// ──────────────────────────────────────────────────────────────────────
+// Relay hook (W5.2)
+//
+// The protocol-relay plugin needs to observe every successfully
+// processed inbound activity so it can mirror the activity into the
+// AT side of the bridge. Following the established `setRsaVerifyHook`
+// pattern (in `keys.zig`), the AP module exposes a single optional
+// callback; the relay registers it at boot. Hard imports between AP
+// and relay are intentionally avoided — the relay depends on AP, not
+// the other way round.
+//
+// The hook fires *after* `dispatch()` succeeds and the inbox route
+// has finished draining side effects. It receives the parsed
+// activity and a db handle so the relay can do its own writes. The
+// hook MUST NOT throw — relay translation failures are logged at
+// the relay; they do not fail the AP inbox response.
+// ──────────────────────────────────────────────────────────────────────
+
+const sqlite_c = @import("sqlite").c;
+
+pub const RelayInboxHook = *const fn (
+    act: *const Activity,
+    db: *sqlite_c.sqlite3,
+    clock: Clock,
+) void;
+
+var relay_inbox_hook: ?RelayInboxHook = null;
+
+pub fn setRelayInboxHook(hook: ?RelayInboxHook) void {
+    relay_inbox_hook = hook;
+}
+
+pub fn currentRelayInboxHook() ?RelayInboxHook {
+    return relay_inbox_hook;
+}
+
 /// Side-effect descriptors emitted by transitions. The caller (the inbox
 /// HTTP handler) drains these into the storage + delivery + metrics
 /// subsystems.

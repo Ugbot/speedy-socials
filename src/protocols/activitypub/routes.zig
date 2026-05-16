@@ -423,6 +423,13 @@ fn dispatchInbox(hc: *HandlerContext, st: *state_mod.State, db: *c.sqlite3, _: [
 
     drainSideEffects(db, st, body, eff.slice()) catch {};
 
+    // W5.2: notify the protocol-relay hook (if registered) so the
+    // activity is mirrored into the AT side of the bridge. The hook
+    // is a no-op when no relay is running; failures inside are
+    // swallowed at the relay — they do not affect the inbox
+    // response.
+    if (inbox.currentRelayInboxHook()) |hook| hook(&act, db, st.clock);
+
     const status: Status = if (verified) .ok else .ok;
     try writeJson(hc, status, "{\"status\":\"accepted\"}");
 }
