@@ -44,6 +44,18 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    // W4: TigerBeetle stdx — BoundedArrayType, RingBufferType, IOPSType,
+    // BitSetType. The shim re-exports them plus the local `copy_*`
+    // helpers and our existing `tb_prng` so the borrow is one import.
+    // See `src/third_party/tigerbeetle/stdx/stdx.zig`.
+    const tb_stdx_mod = b.addModule("tb_stdx", .{
+        .root_source_file = b.path("src/third_party/tigerbeetle/stdx/stdx.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "tb_prng", .module = tb_prng_mod },
+        },
+    });
 
     // ── third-party: ianic/tls.zig (vendored submodule) ───────────
     // Pure-Zig TLS 1.2/1.3 client + TLS 1.3 server. Replaces the
@@ -69,6 +81,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "tb_prng", .module = tb_prng_mod },
             .{ .name = "tb_intrusive", .module = tb_intrusive_mod },
             .{ .name = "tb_testing", .module = tb_testing_mod },
+            .{ .name = "tb_stdx", .module = tb_stdx_mod },
             .{ .name = "tls", .module = ianic_tls_mod },
         },
     });
@@ -212,11 +225,19 @@ pub fn build(b: *std.Build) void {
     const tb_intrusive_tests = b.addTest(.{ .root_module = tb_intrusive_mod });
     const run_tb_intrusive_tests = b.addRunArtifact(tb_intrusive_tests);
 
+    // W4: the vendored stdx module has its own test blocks plus the
+    // upstream-TB `test` blocks inside bounded_array / ring_buffer /
+    // iops / bit_set that we pull in via the shim's `test {}`. Running
+    // the module directly executes all of them.
+    const tb_stdx_tests = b.addTest(.{ .root_module = tb_stdx_mod });
+    const run_tb_stdx_tests = b.addRunArtifact(tb_stdx_tests);
+
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_core_tests.step);
     test_step.dependOn(&run_app_tests.step);
     test_step.dependOn(&run_tb_testing_tests.step);
     test_step.dependOn(&run_tb_intrusive_tests.step);
+    test_step.dependOn(&run_tb_stdx_tests.step);
 
     // Per-plugin test step. Each plugin module's tests run independently
     // so that referenced symbols (cid, mst, dag_cbor, …) get pulled in

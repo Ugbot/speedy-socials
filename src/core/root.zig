@@ -24,6 +24,12 @@ pub const intrusive = @import("intrusive.zig");
 pub const sim = @import("sim.zig");
 pub const http_client = @import("http_client.zig");
 
+/// W4: vendored TigerBeetle stdx primitives — `BoundedArrayType`,
+/// `RingBufferType`, `IOPSType`, `BitSetType`, plus the local
+/// `copy_disjoint`/`copy_left`/`copy_right` helpers and a re-export
+/// of `tb_prng` as `PRNG`. See `src/third_party/tigerbeetle/stdx/`.
+pub const stdx = @import("tb_stdx");
+
 pub const crypto = struct {
     pub const ed25519 = @import("crypto/ed25519.zig");
     pub const multibase = @import("crypto/multibase.zig");
@@ -88,6 +94,7 @@ test {
     _ = intrusive;
     _ = sim;
     _ = http_client;
+    _ = stdx;
     _ = crypto.ed25519;
     _ = crypto.multibase;
     _ = crypto.multicodec;

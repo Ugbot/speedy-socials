@@ -39,6 +39,11 @@ primitives need light decoupling from VSR.
 | `testing/fuzz.zig` | `src/testing/fuzz.zig` | ~150 | `random_int_exponential`, `range_inclusive_ms`, `parse_seed` (base-10 or 40-char git SHA). | Retargeted at `std.Random.Xoshiro256` — TB's `stdx.PRNG` is available via `prng/`, but the testing helpers themselves are kept minimal. |
 | `testing/packet_simulator.zig` | `src/testing/packet_simulator.zig` | ~200 (new) | Network fault injection: exponential latency, Bernoulli loss, scripted symmetric + asymmetric partitions. Same contract as TB's. | **Rewritten from scratch** to avoid TB's dependencies on `vsr.Command`, `stdx.PRNG.Ratio`, the `Duration`/`Instant` types, `QueueType`, and `constants.tick_ms`. The public API is `PacketSimulator(comptime Packet: type)` where `Packet` must expose `from`, `to`, `payload`, and `copy` accessor functions — see the file header for the full contract. |
 | `testing/root.zig` | (new) | tiny | Module root re-exporting `time`, `io`, `fuzz`, `packet_simulator`. | Local. |
+| `stdx/bounded_array.zig` | `src/stdx/bounded_array.zig` | 292 | `BoundedArrayType(T, capacity)` — fixed-capacity array with `push`/`from_slice`/`insert_at`. W4. | None. |
+| `stdx/ring_buffer.zig` | `src/stdx/ring_buffer.zig` | 511 | `RingBufferType(T, .{ .array = N \| .slice })` — circular queue. W4. | None. |
+| `stdx/iops.zig` | `src/stdx/iops.zig` | 134 | `IOPSType(slot_count)` — bitmap-tracked in-flight-IO slots, used by the request-latency histogram. W4. | None. |
+| `stdx/bit_set.zig` | `src/stdx/bit_set.zig` | 157 | `BitSetType(N)` — fixed-size bit set; dependency of `iops`. W4. | None. |
+| `stdx/stdx.zig` | (new shim) | ~120 | Local shim exposing `copy_disjoint`/`copy_left`/`copy_right`/`SizePrecision`/`disjoint_slices` verbatim from TB, plus re-exports of the sibling types and `PRNG = @import("tb_prng")`. Plugins access everything via `core.stdx`. W4. | Local. |
 
 ## How the rest of the tree imports this
 
