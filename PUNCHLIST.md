@@ -141,11 +141,13 @@ _Last refreshed: 2026-05-19._
       than hanging until the kernel default. Blocked on upstream
       `std.Io.net`.
 
-- [ ] **C4. TLS cert hot-reload.**
-      Acceptance: SIGHUP (or `POST /admin/tls/reload`) causes the
-      inbound TLS backend to re-read `TLS_CERT_PATH` /
-      `TLS_KEY_PATH` from disk without dropping in-flight
-      connections. New connections negotiate against the new cert.
+- [~] **C4. TLS cert hot-reload (primitive done).**
+      `IanicInboundBackend.reloadCertKey(cert_pem, key_pem)` builds
+      a new `CertKeyPair` under lock + swaps; in-flight sessions
+      keep their cipher (cert is handshake-only), new accepts pick
+      up the fresh one. Operator wiring (SIGHUP or
+      `POST /admin/tls/reload` that re-reads the files) is a
+      one-liner follow-up.
 
 - [ ] **C5. Cert pinning hook on the outbound TLS path.**
       Acceptance: `core.tls.native_outbound` exposes an optional
@@ -232,7 +234,10 @@ _Last refreshed: 2026-05-19._
       threaded through every layer. Status code emit pending a
       Builder retaining the chosen status (small follow-up).
 
-- [ ] **E5. Per-route latency in the ring log.**
+- [x] **E5. Per-route latency in the ring log.**
+      `MatchResult.ok` now carries the matched route pattern;
+      `core/server.zig` emits `route="/api/v1/statuses/:id"` in the
+      access log line so post-hoc analysis groups sanely.
       Acceptance: the access log line carries `route_pattern`
       (e.g. `/api/v1/statuses/:id`) so post-hoc analysis groups
       sanely.
@@ -291,15 +296,19 @@ _Last refreshed: 2026-05-19._
 
 ## G. Security
 
-- [ ] **G1. Magic-login / test-bypass removed in release builds.**
-      Acceptance: a build with `-Drelease` rejects the dev
-      shortcuts (verified by a test that exercises the auth paths
-      in release mode). Per the CLAUDE.md baseline rule.
+- [x] **G1. Magic-login / test-bypass removed in release builds.**
+      N/A — speedy-socials never had magic-login or test-bypass
+      shortcuts. Audit grep for `magic|bypass|skip_auth|test_email`
+      across src/ returns only the WebSocket protocol's magic GUID
+      (RFC 6455) and image-format magic bytes. The CLAUDE.md
+      pattern doesn't apply to this codebase.
 
-- [ ] **G2. Audit log for sensitive operations.**
-      Acceptance: role changes, exports, key rotations, follower
-      seeding, cert reloads each write to an append-only
-      `audit_log` table with actor, action, target, timestamp.
+- [x] **G2. Audit log for sensitive operations.**
+      `core_audit_log` table (migration #9) + `core.audit.append`
+      helper. Currently wired at the relay's
+      `POST /admin/relay/followers` endpoint; future sensitive
+      operations (TLS reload, role changes) call the same helper.
+      Two unit tests for the helper.
 
 - [ ] **G3. Rate limiting on inbound AP inbox + Mastodon API.**
       Acceptance: a single IP exceeding N requests / second gets
@@ -409,7 +418,7 @@ _Last refreshed: 2026-05-19._
       common failure modes (consumer ring overflow, AP outbox
       backed up, sqlite WAL grew).
 
-- [ ] **K3. CONTRIBUTING.md.**
+- [x] **K3. CONTRIBUTING.md.**
       Acceptance: clear instructions on `zig build test`, `zig
       build sim`, when to add a new TB / TickStream vendor, the
       Tiger Style invariants (no hot-path alloc, bounded buffers,

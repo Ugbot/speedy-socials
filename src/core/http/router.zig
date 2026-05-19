@@ -117,7 +117,10 @@ pub const Router = struct {
     }
 
     pub const MatchResult = union(enum) {
-        ok: Handler,
+        /// E5: the matched route's pattern is exposed for access-log
+        /// aggregation (post-hoc analyses group sanely by route, not
+        /// by literal path).
+        ok: struct { handler: Handler, pattern: []const u8 },
         not_found,
         method_not_allowed,
     };
@@ -132,7 +135,7 @@ pub const Router = struct {
             if (matchPattern(r.pattern, path, &tmp)) {
                 if (r.method == method) {
                     params.* = tmp;
-                    return .{ .ok = r.handler };
+                    return .{ .ok = .{ .handler = r.handler, .pattern = r.pattern } };
                 }
                 any_path_match = true;
             }
@@ -190,13 +193,13 @@ test "Router static + param + method routing" {
 
     var params: PathParams = .{};
     switch (r.matchOrCode(.get, "/healthz", &params)) {
-        .ok => |h| try std.testing.expectEqual(@intFromPtr(&TestH.root), @intFromPtr(h)),
+        .ok => |h| try std.testing.expectEqual(@intFromPtr(&TestH.root), @intFromPtr(h.handler)),
         else => return error.TestExpectedOk,
     }
 
     switch (r.matchOrCode(.get, "/users/alice", &params)) {
         .ok => |h| {
-            try std.testing.expectEqual(@intFromPtr(&TestH.user), @intFromPtr(h));
+            try std.testing.expectEqual(@intFromPtr(&TestH.user), @intFromPtr(h.handler));
             try std.testing.expectEqualStrings("alice", params.get("u").?);
         },
         else => return error.TestExpectedOk,

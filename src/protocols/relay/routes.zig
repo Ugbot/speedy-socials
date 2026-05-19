@@ -382,6 +382,10 @@ fn handleAddFollower(hc: *HandlerContext) anyerror!void {
     followers_mod.add(db, state.clock, actor_url, inbox, shared, final_iri) catch {
         return writeJson(hc, .internal, "{\"error\":\"add failed\"}");
     };
+    // G2: audit-log the follower seed.
+    var detail_buf: [256]u8 = undefined;
+    const detail = std.fmt.bufPrint(&detail_buf, "{{\"inbox\":\"{s}\",\"follow_iri\":\"{s}\"}}", .{ inbox, final_iri }) catch "";
+    core.audit.append(db, state.clock, "admin", "follower.seed", actor_url, detail, true) catch {};
     try writeJson(hc, .ok, "{\"status\":\"ok\"}");
 }
 

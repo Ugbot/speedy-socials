@@ -344,7 +344,7 @@ pub const Server = struct {
         var rb = response.Builder.init(&conn.write_buf);
 
         switch (match) {
-            .ok => |handler| {
+            .ok => |hit| {
                 var hc = router_mod.HandlerContext{
                     .plugin_ctx = self.ctx,
                     .request = request,
@@ -355,7 +355,7 @@ pub const Server = struct {
                 // request-latency histogram via posix CLOCK_MONOTONIC
                 // (std.time lost nanoTimestamp in Zig 0.16).
                 const t0_ns = monotonicNow();
-                handler(&hc) catch |err| {
+                hit.handler(&hc) catch |err| {
                     // G6: opaque body to the client; the real error name
                     // goes to the ring log so operators can investigate.
                     std.log.warn("handler returned error: {s}", .{@errorName(err)});
@@ -378,6 +378,10 @@ pub const Server = struct {
                     lg.record(.info, "access", "request", &.{
                         .{ .k = "method", .v = request.method_raw },
                         .{ .k = "path", .v = path_query.path },
+                        // E5: route pattern for post-hoc aggregation
+                        // ("GET /api/v1/statuses/:id" rather than
+                        // every literal id).
+                        .{ .k = "route", .v = hit.pattern },
                         .{ .k = "dur_ms", .v = dur_ms },
                     });
                 }

@@ -291,6 +291,7 @@ pub fn main() !void {
     // ── schema migrations ──────────────────────────────────────────
     var schema = core.storage.Schema.init();
     try schema.register(core.storage.bootstrap_migration);
+    try schema.register(core.audit.audit_migration);
     try registry.registerAllSchemas(&ctx, &schema);
     try schema.applyAll(db);
 

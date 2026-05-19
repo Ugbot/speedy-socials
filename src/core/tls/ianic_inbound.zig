@@ -125,6 +125,27 @@ pub const IanicInboundBackend = struct {
         };
     }
 
+    /// C4: hot-reload the cert + key without disrupting in-flight
+    /// connections. We build a NEW `CertKeyPair`, then swap it onto
+    /// the backend under the lock. In-flight TLS sessions keep using
+    /// the previous cipher (the cert is only used at handshake time);
+    /// new accepts pick up the fresh one.
+    pub fn reloadCertKey(
+        self: *IanicInboundBackend,
+        cert_pem: []const u8,
+        key_pem: []const u8,
+    ) !void {
+        const new_auth = tls.config.CertKeyPair.fromSlice(self.auth_allocator, self.io, cert_pem, key_pem) catch |err| switch (err) {
+            error.OutOfMemory => return error.InitFailed,
+            else => return error.CertLoadFailed,
+        };
+        self.lockAcquire();
+        defer self.lockRelease();
+        var old = self.auth;
+        self.auth = new_auth;
+        old.deinit(self.auth_allocator);
+    }
+
     pub fn deinit(self: *IanicInboundBackend) void {
         // Tear down any in-flight TLS sessions. In a clean shutdown
         // this should be a no-op — the server stops accepting before
