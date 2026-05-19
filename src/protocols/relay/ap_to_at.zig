@@ -118,6 +118,25 @@ fn onActivityReceivedImpl(act: *const Activity, raw_body: []const u8, db: *c.sql
         return;
     }
 
+    // A5: known-but-not-bridged types. Log explicitly so audit shows
+    // we saw them; tracking these helps decide whether to add real
+    // bridge semantics later.
+    switch (act.activity_type) {
+        .move => {
+            _ = subscription.appendLog(db, clock, .ap_to_at, act.id, "", true, "dropped: Move not bridged (identity migration logic pending)") catch {};
+            return;
+        },
+        .block => {
+            _ = subscription.appendLog(db, clock, .ap_to_at, act.id, "", true, "dropped: Block has no AT primitive") catch {};
+            return;
+        },
+        .flag => {
+            _ = subscription.appendLog(db, clock, .ap_to_at, act.id, "", true, "dropped: Flag has no AT primitive") catch {};
+            return;
+        },
+        else => {},
+    }
+
     const collection = collectionFor(act) orelse return;
 
     // A7: dedup on (direction, source_id). source_id we'll use is

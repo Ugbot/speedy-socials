@@ -49,10 +49,11 @@ _Last refreshed: 2026-05-19._
       changes. AT→AP *open*: the firehose consumer doesn't yet emit
       AP Update for AT record mutations.
 
-- [ ] **A5. Move + Block activity translation.**
-      Acceptance: AP `Move`, `Block`, `Flag` activities each produce
-      a translation-log entry referencing the bridged AT analogue
-      (or land in a "consciously dropped" log with rationale).
+- [x] **A5. Move + Block + Flag activity translation.**
+      Parser learns `.move` / `.block` / `.flag`; inbox dispatcher
+      maps each to a counter side-effect; relay hook records a
+      "dropped: <reason>" `ap_to_at` log row keyed on the activity
+      id. Translation matrix doc updated.
 
 - [x] **A6. Activity coverage for `app.bsky.graph.listitem`, `app.bsky.feed.threadgate`, `app.bsky.graph.list`.**
       The firehose consumer now logs an explicit "unsupported
@@ -149,10 +150,10 @@ _Last refreshed: 2026-05-19._
       `POST /admin/tls/reload` that re-reads the files) is a
       one-liner follow-up.
 
-- [ ] **C5. Cert pinning hook on the outbound TLS path.**
-      Acceptance: `core.tls.native_outbound` exposes an optional
-      pin-verification callback. Federation requests to a pinned
-      host fail closed when the cert chain doesn't match the pin.
+- [ ] **C5. Cert pinning hook on the outbound TLS path.** (Deferred —
+      std.crypto.tls.Client doesn't expose post-handshake peer-cert
+      inspection in 0.16. Implementable once std exposes the peer
+      cert chain, or by patching the bundle verifier in-tree.)
 
 ---
 
@@ -412,7 +413,7 @@ _Last refreshed: 2026-05-19._
       enqueue," documents the synthetic key + pepper scheme, and
       links to A1/A2 as the known interop gap.
 
-- [ ] **K2. Operator runbook.**
+- [x] **K2. Operator runbook.** `docs/ops/runbook.md`.
       Acceptance: `docs/ops/runbook.md` describes startup,
       shutdown, key rotation, cert renewal, backup, and the most
       common failure modes (consumer ring overflow, AP outbox

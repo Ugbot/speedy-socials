@@ -149,6 +149,11 @@ pub fn dispatch(env: *const Envelope, effects: *SideEffectBuffer) ApError!void {
         // generic counter; the relay's inbox hook handles the
         // bridge-specific cleanup (follower-table delete).
         .undo => try effects.push(.{ .increment_counter = .{ .name = "ap.inbox.undo" } }),
+        // A5: explicitly-not-bridged. The relay hook records a
+        // "dropped" translation-log row; here we just count.
+        .move => try effects.push(.{ .increment_counter = .{ .name = "ap.inbox.move" } }),
+        .block => try effects.push(.{ .increment_counter = .{ .name = "ap.inbox.block" } }),
+        .flag => try effects.push(.{ .increment_counter = .{ .name = "ap.inbox.flag" } }),
     }
 }
 

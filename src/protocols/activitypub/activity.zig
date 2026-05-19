@@ -36,6 +36,12 @@ pub const ActivityType = enum {
     announce,
     like,
     undo,
+    /// A5: known but explicitly-not-bridged types. We accept them so
+    /// the inbox can audit-log + count them; the relay hook records a
+    /// "dropped: no AT analogue" translation-log row.
+    move,
+    block,
+    flag,
 
     pub fn parse(s: []const u8) ?ActivityType {
         // Type strings are typically PascalCase, but some servers send
@@ -49,6 +55,9 @@ pub const ActivityType = enum {
         if (std.ascii.eqlIgnoreCase(s, "Announce")) return .announce;
         if (std.ascii.eqlIgnoreCase(s, "Like")) return .like;
         if (std.ascii.eqlIgnoreCase(s, "Undo")) return .undo;
+        if (std.ascii.eqlIgnoreCase(s, "Move")) return .move;
+        if (std.ascii.eqlIgnoreCase(s, "Block")) return .block;
+        if (std.ascii.eqlIgnoreCase(s, "Flag")) return .flag;
         return null;
     }
 };
