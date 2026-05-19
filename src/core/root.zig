@@ -24,6 +24,7 @@ pub const intrusive = @import("intrusive.zig");
 pub const sim = @import("sim.zig");
 pub const http_client = @import("http_client.zig");
 pub const audit = @import("audit.zig");
+pub const rate_limit = @import("rate_limit.zig");
 
 /// W4: vendored TigerBeetle stdx primitives — `BoundedArrayType`,
 /// `RingBufferType`, `IOPSType`, `BitSetType`, plus the local
@@ -97,6 +98,7 @@ test {
     _ = http_client;
     _ = stdx;
     _ = audit;
+    _ = rate_limit;
     _ = crypto.ed25519;
     _ = crypto.multibase;
     _ = crypto.multicodec;

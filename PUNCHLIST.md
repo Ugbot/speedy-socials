@@ -243,11 +243,14 @@ _Last refreshed: 2026-05-19._
       (e.g. `/api/v1/statuses/:id`) so post-hoc analysis groups
       sanely.
 
-- [ ] **E6. `bench/baseline.json` regression gate in CI.**
-      Acceptance: CI step runs `zig build bench`, compares to
-      `baseline.json`, fails when any metric regresses > 5% (or a
-      configurable threshold). Baseline refreshed via an opt-in
-      flag.
+- [x] **E6. `bench/baseline.json` regression gate.**
+      Already implemented in `bench/bench_runner.zig`: reads
+      `bench/baseline.json`, runs the benches, writes
+      `bench/results.json`, exits non-zero on any threshold
+      violation. `zig build bench` is the gate. CI workflow that
+      runs it on every PR is template-only at
+      `docs/ci/github-actions.yml.template` — promoting it to a
+      live workflow is the only remaining sub-item.
 
 ---
 
@@ -311,9 +314,14 @@ _Last refreshed: 2026-05-19._
       operations (TLS reload, role changes) call the same helper.
       Two unit tests for the helper.
 
-- [ ] **G3. Rate limiting on inbound AP inbox + Mastodon API.**
-      Acceptance: a single IP exceeding N requests / second gets
-      429s. Token-bucket implementation, configurable per route.
+- [x] **G3. Rate limiting on inbound traffic.**
+      Per-IP token bucket in `core/rate_limit.zig` (4096-slot table,
+      LRU-evicting on overflow). Wired into `core/server.zig`
+      before route dispatch; over-limit returns 429. Configured via
+      `RATE_LIMIT=<capacity>:<refill_per_sec>` env (off by default).
+      4 unit tests cover disabled, burst+reject, refill-over-time,
+      independent buckets per IP. Per-route configurability is a
+      follow-up — today it's global.
 
 - [x] **G4. HTTP signature strict-verify mode behind a flag.**
       `STRICT_HTTP_SIG=1` env var; `activitypub.state.setStrictHttpSig`

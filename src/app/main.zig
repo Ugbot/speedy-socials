@@ -527,6 +527,21 @@ pub fn main() !void {
     core.metrics.initGlobal();
     try core.metrics.registerMetricsRoute(&router, std.math.maxInt(u16));
     log_ptr.info("boot", "metrics registry initialised; /metrics serving");
+
+    // G3: rate-limiting. Off by default; configured via env. Format:
+    // RATE_LIMIT=<capacity>:<refill_per_sec>  (e.g. "60:30").
+    if (std.c.getenv("RATE_LIMIT")) |env_c| {
+        const spec = std.mem.sliceTo(env_c, 0);
+        const colon = std.mem.indexOfScalar(u8, spec, ':') orelse 0;
+        if (colon > 0 and colon < spec.len - 1) {
+            const cap = std.fmt.parseInt(u32, spec[0..colon], 10) catch 0;
+            const refill = std.fmt.parseInt(u32, spec[colon + 1 ..], 10) catch 0;
+            if (cap > 0 and refill > 0) {
+                core.rate_limit.configureGlobal(.{ .capacity = cap, .refill_per_sec = refill });
+                log_ptr.info("boot", "rate limiter configured (per-IP token bucket)");
+            }
+        }
+    }
     try registry.registerAllRoutes(&ctx, &router);
 
     // ── WebSocket subscription registry (W2.1) ─────────────────────

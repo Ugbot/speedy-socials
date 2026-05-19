@@ -40,6 +40,7 @@ const response = @import("http/response.zig");
 const router_mod = @import("http/router.zig");
 const metrics_mod = @import("metrics.zig");
 const log_mod = @import("log.zig");
+const rate_limit_mod = @import("rate_limit.zig");
 
 /// Monotonic nanosecond timestamp. Std's `nanoTimestamp` was removed
 /// in Zig 0.16; use clock_gettime(CLOCK_MONOTONIC) directly. Returns
@@ -343,6 +344,19 @@ pub const Server = struct {
 
         var rb = response.Builder.init(&conn.write_buf);
 
+        // G3: per-IP rate limit. Inert when not configured.
+        const limiter = rate_limit_mod.global();
+        if (limiter.enabled) {
+            const rl_key: u128 = switch (stream.socket.address) {
+                .ip4 => |a| rate_limit_mod.keyForIpv4(std.mem.readInt(u32, &a.bytes, .big)),
+                .ip6 => |a| rate_limit_mod.keyForIpv6(a.bytes),
+            };
+            const now_ns = monotonicNow();
+            if (!limiter.allow(rl_key, now_ns)) {
+                try writeStatusResponseTls(self.cfg.tls, stream, self.io, conn, .too_many_requests);
+                return;
+            }
+        }
         switch (match) {
             .ok => |hit| {
                 var hc = router_mod.HandlerContext{
