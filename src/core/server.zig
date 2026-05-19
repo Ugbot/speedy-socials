@@ -340,8 +340,15 @@ pub const Server = struct {
                     .params = params,
                 };
                 handler(&hc) catch |err| {
+                    // G6: opaque body to the client; the real error name
+                    // goes to the ring log so operators can investigate.
+                    // Surfacing the Zig error name would leak internal
+                    // taxonomy (BadDid, KeyMismatch, OpenFailed, etc.) to
+                    // every caller — including hostile ones probing for
+                    // implementation details.
+                    std.log.warn("handler returned error: {s}", .{@errorName(err)});
                     rb = response.Builder.init(&conn.write_buf);
-                    try rb.simple(.internal, "text/plain", @errorName(err));
+                    try rb.simple(.internal, "text/plain", "internal error");
                 };
             },
             .not_found => try rb.simple(.not_found, "text/plain", "not found"),

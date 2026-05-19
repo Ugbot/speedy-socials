@@ -405,16 +405,41 @@ pub fn main() !void {
     // ── Media plugin wiring (W1.4 + W5.5 filesystem spillover) ────
     media.attachDb(db);
     media.setBaseUrl("http://127.0.0.1:8080");
-    media.setMediaRoot("./media");
+    // L1/F6: MEDIA_ROOT env (default `./media`). Container deployments
+    // mount a volume here so blobs survive restarts.
+    const media_root_buf_static = struct {
+        var buf: [512]u8 = undefined;
+        var len: usize = 0;
+    };
+    const media_root: []const u8 = blk: {
+        if (std.c.getenv("MEDIA_ROOT")) |envp| {
+            const s = std.mem.sliceTo(envp, 0);
+            if (s.len > 0 and s.len < media_root_buf_static.buf.len) {
+                @memcpy(media_root_buf_static.buf[0..s.len], s);
+                media_root_buf_static.len = s.len;
+                break :blk media_root_buf_static.buf[0..s.len];
+            }
+        }
+        const default_path = "./media";
+        @memcpy(media_root_buf_static.buf[0..default_path.len], default_path);
+        media_root_buf_static.len = default_path.len;
+        break :blk media_root_buf_static.buf[0..default_path.len];
+    };
+    media.setMediaRoot(media_root);
     // Best-effort mkdir so the spillover path has somewhere to land.
-    // EEXIST is fine; any other error is logged but non-fatal — the
-    // inline path still works.
+    // EEXIST is fine; other errors log a warning + leave the inline
+    // path working.
     {
-        const rc = std.c.mkdir("./media", @as(std.c.mode_t, 0o755));
+        var path_z_buf: [513]u8 = undefined;
+        @memcpy(path_z_buf[0..media_root.len], media_root);
+        path_z_buf[media_root.len] = 0;
+        const path_z: [*:0]const u8 = @ptrCast(&path_z_buf);
+        const rc = std.c.mkdir(path_z, @as(std.c.mode_t, 0o755));
         if (rc != 0 and std.c._errno().* != 17) { // 17 = EEXIST on macOS+Linux
             log_ptr.warn("boot", "media root mkdir failed (filesystem spillover disabled)");
         }
     }
+    log_ptr.info("boot", "media root configured");
 
     // ── HTTP server ────────────────────────────────────────────────
     var router = core.http.router.Router.init();

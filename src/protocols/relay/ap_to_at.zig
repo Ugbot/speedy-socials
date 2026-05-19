@@ -62,11 +62,15 @@ pub fn relayHostPublic() []const u8 {
 /// Maps an AP `ActivityType` (plus, for Create, an inline object
 /// type) to its AT collection name. Returns null for activities the
 /// bridge does not translate today.
+///
+/// For Delete: returns the *most likely* target collection — the
+/// bridge tries deleting from `app.bsky.feed.post` first; if no row
+/// matches it falls through to like / repost / follow in order. The
+/// AP Delete activity rarely carries enough information to know
+/// which collection the object lived in.
 pub fn collectionFor(act: *const Activity) ?[]const u8 {
     return switch (act.activity_type) {
         .create => blk: {
-            // Only translate Create{Note}; other inline objects (Article,
-            // Image, Video, …) need their own targeted mapping.
             if (std.ascii.eqlIgnoreCase(act.object_type, "Note")) {
                 break :blk "app.bsky.feed.post";
             }
@@ -75,8 +79,16 @@ pub fn collectionFor(act: *const Activity) ?[]const u8 {
         .like => "app.bsky.feed.like",
         .announce => "app.bsky.feed.repost",
         .follow => "app.bsky.graph.follow",
+        .delete => "app.bsky.feed.post", // probe order: post → like → repost → follow
         else => null,
     };
+}
+
+/// Bridge-translatable activities other than Delete go through the
+/// "commit a record" path; Delete goes through the "remove a record"
+/// path.
+fn isDelete(act: *const Activity) bool {
+    return act.activity_type == .delete;
 }
 
 /// Hook entrypoint — installed by `relay.init` via
@@ -107,6 +119,14 @@ fn onActivityReceivedImpl(act: *const Activity, db: *c.sqlite3, clock: core.cloc
     }
     const did = maybe_did.?;
 
+    // A3: Delete activities go through the remove-record path, which
+    // probes each collection in order. We attempt to delete from the
+    // most likely (post) first, then like/repost/follow.
+    if (isDelete(act)) {
+        try processDelete(act, db, clock, did, &arena);
+        return;
+    }
+
     // Mint the synthetic Ed25519 signing key for this DID (deterministic
     // from the AP actor URL via the relay pepper) + ensure the AT repo
     // row exists. We pass the AP actor URL as the "signing_key" hint
@@ -122,10 +142,12 @@ fn onActivityReceivedImpl(act: *const Activity, db: *c.sqlite3, clock: core.cloc
     var record_buf: [4096]u8 = undefined;
     const record_cbor = try buildBridgeRecord(act, collection, &record_buf);
 
-    // Generate a stable rkey from the AP activity id so re-deliveries
-    // of the same activity dedupe at the AT repo level (commit uses
-    // INSERT OR REPLACE on the at-uri primary key).
-    const rkey_seed = if (act.id.len > 0) act.id else act.object_id;
+    // Generate a stable rkey from the AP *object id* (NOT the activity
+    // id). A future Delete activity references the object id alone —
+    // keying on the same field on both sides means Delete can target
+    // the row by deriving the same rkey. Re-deliveries of Create with
+    // the same object_id INSERT-OR-REPLACE in atp_records.
+    const rkey_seed = if (act.object_id.len > 0) act.object_id else act.id;
     const rkey = try translatedRkey(rkey_seed, &arena);
 
     // Load the current MST for this synthetic repo and commit one op.
@@ -180,6 +202,47 @@ fn onActivityReceivedImpl(act: *const Activity, db: *c.sqlite3, clock: core.cloc
     );
     const source_id = if (act.id.len > 0) act.id else act.object_id;
     _ = subscription.appendLog(db, clock, .ap_to_at, source_id, translated, true, "") catch {};
+}
+
+/// A3: AP Delete → remove the bridged AT record(s).
+///
+/// AP Delete carries `object` (the URL of the thing being deleted)
+/// but not the collection it belongs to. Probe each bridged
+/// collection in turn; the first hit terminates the search.
+fn processDelete(act: *const Activity, db: *c.sqlite3, clock: core.clock.Clock, did: []const u8, arena: *Arena) !void {
+    if (act.object_id.len == 0) return;
+    const rkey = try translatedRkey(act.object_id, arena);
+
+    const probe_order = [_][]const u8{
+        "app.bsky.feed.post",
+        "app.bsky.feed.like",
+        "app.bsky.feed.repost",
+        "app.bsky.graph.follow",
+    };
+    var hit_collection: []const u8 = "";
+    for (probe_order) |col| {
+        const deleted = atproto.repo.deleteRecord(db, did, col, rkey) catch false;
+        if (deleted) {
+            hit_collection = col;
+            break;
+        }
+    }
+
+    if (hit_collection.len == 0) {
+        // No bridged record matched this object_id. Common case: the
+        // peer is deleting something we never bridged (e.g. a video).
+        // Not an error — log as a no-op so audit shows we saw it.
+        _ = subscription.appendLog(db, clock, .ap_to_at, act.object_id, "", true, "delete: no match") catch {};
+        return;
+    }
+
+    var translated_buf: [256]u8 = undefined;
+    const translated = try std.fmt.bufPrint(
+        &translated_buf,
+        "at://{s}/{s}/{s} [deleted]",
+        .{ did, hit_collection, rkey },
+    );
+    _ = subscription.appendLog(db, clock, .ap_to_at, act.object_id, translated, true, "") catch {};
 }
 
 /// Build the minimum-viable AT record body. We emit:
@@ -399,6 +462,87 @@ test "onActivityReceived: Like translates to app.bsky.feed.like" {
     const n = try subscription.listLog(db, 0, &rows);
     try testing.expectEqual(@as(u32, 1), n);
     try testing.expect(std.mem.indexOf(u8, rows[0].translatedId(), "app.bsky.feed.like") != null);
+}
+
+test "A3: Create then Delete removes the bridged atp_records row" {
+    const db = try setupDb();
+    defer core.storage.sqlite.closeDb(db);
+    var sc = core.clock.SimClock.init(1_715_000_000);
+    setRelayHost("relay.test");
+    defer setRelayHost("");
+
+    const create_act: Activity = .{
+        .activity_type = .create,
+        .id = "https://mastodon.example/users/carol/activities/77",
+        .actor = "https://mastodon.example/users/carol",
+        .object_id = "https://mastodon.example/users/carol/notes/77",
+        .object_type = "Note",
+        .target = "",
+        .published = "2026-05-19T00:00:00Z",
+        .to_first = "https://www.w3.org/ns/activitystreams#Public",
+    };
+    onActivityReceived(&create_act, db, sc.clock());
+
+    // Verify the bridged row exists.
+    var arena_buf: [1024]u8 = undefined;
+    var arena = Arena.init(&arena_buf);
+    const did = (try identity_map.didForActor(db, create_act.actor, &arena)).?;
+    var pre_count: i64 = -1;
+    var s1: ?*c.sqlite3_stmt = null;
+    if (c.sqlite3_prepare_v2(db, "SELECT count(*) FROM atp_records WHERE did = ?", -1, &s1, null) == c.SQLITE_OK) {
+        defer _ = c.sqlite3_finalize(s1);
+        _ = c.sqlite3_bind_text(s1, 1, did.ptr, @intCast(did.len), c.sqliteTransientAsDestructor());
+        if (c.sqlite3_step(s1.?) == c.SQLITE_ROW) pre_count = c.sqlite3_column_int64(s1, 0);
+    }
+    try testing.expectEqual(@as(i64, 1), pre_count);
+
+    // Send Delete referencing the same object id.
+    const delete_act: Activity = .{
+        .activity_type = .delete,
+        .id = "https://mastodon.example/users/carol/activities/88",
+        .actor = "https://mastodon.example/users/carol",
+        .object_id = "https://mastodon.example/users/carol/notes/77",
+        .object_type = "Tombstone",
+        .target = "",
+        .published = "2026-05-19T00:01:00Z",
+        .to_first = "",
+    };
+    onActivityReceived(&delete_act, db, sc.clock());
+
+    // Row should be gone.
+    var post_count: i64 = -1;
+    var s2: ?*c.sqlite3_stmt = null;
+    if (c.sqlite3_prepare_v2(db, "SELECT count(*) FROM atp_records WHERE did = ?", -1, &s2, null) == c.SQLITE_OK) {
+        defer _ = c.sqlite3_finalize(s2);
+        _ = c.sqlite3_bind_text(s2, 1, did.ptr, @intCast(did.len), c.sqliteTransientAsDestructor());
+        if (c.sqlite3_step(s2.?) == c.SQLITE_ROW) post_count = c.sqlite3_column_int64(s2, 0);
+    }
+    try testing.expectEqual(@as(i64, 0), post_count);
+}
+
+test "A3: Delete for an unknown object id is a logged no-op" {
+    const db = try setupDb();
+    defer core.storage.sqlite.closeDb(db);
+    var sc = core.clock.SimClock.init(1);
+    setRelayHost("relay.test");
+    defer setRelayHost("");
+
+    const delete_act: Activity = .{
+        .activity_type = .delete,
+        .id = "https://m.example/a/1",
+        .actor = "https://m.example/users/dave",
+        .object_id = "https://m.example/users/dave/notes/never-bridged",
+        .object_type = "Tombstone",
+        .target = "",
+        .published = "",
+        .to_first = "",
+    };
+    onActivityReceived(&delete_act, db, sc.clock());
+
+    // No atp_records changes, but a log entry exists.
+    var rows: [4]subscription.LogEntry = undefined;
+    const n = try subscription.listLog(db, 0, &rows);
+    try testing.expect(n >= 1);
 }
 
 test "onActivityReceived: unsupported activity type is silently dropped" {

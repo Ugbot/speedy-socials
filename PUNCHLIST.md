@@ -31,13 +31,15 @@ _Last refreshed: 2026-05-19._
       Bluesky-style relay client validates the commit signature
       against the published key.
 
-- [ ] **A3. Delete / Undo translation, both directions.**
-      Acceptance: posting an AP `Delete` activity referencing a
-      bridged object causes the corresponding `atp_records` row to
-      be removed (or tombstoned per atproto convention) and a
-      firehose tombstone event emitted. Symmetrically, deleting an
-      AT record causes a `Delete` AP activity to land in
-      `ap_federation_outbox`.
+- [~] **A3. Delete / Undo translation, both directions.**
+      AP→AT *done* (commit b488d4d follow-up): Delete activities
+      probe each bridged collection and remove the matching
+      `atp_records` row; unknown object_ids become a logged no-op.
+      AT→AP *still open*: the firehose consumer doesn't yet fire on
+      record deletions (no firehose-deletion event today). Split
+      into A3a (done) + A3b (open).
+      Acceptance for A3b: deleting an AT record emits an AP Delete
+      activity into `ap_federation_outbox`.
 
 - [ ] **A4. Update translation, both directions.**
       Acceptance: AP `Update{Note}` mutates the bridged
@@ -243,7 +245,7 @@ _Last refreshed: 2026-05-19._
       SQLite WAL + media root and restore on a fresh host. A CI
       step exercises the round trip.
 
-- [ ] **F6. `MEDIA_ROOT` configurable + survives container restart.**
+- [x] **F6. `MEDIA_ROOT` configurable + survives container restart.**
       Acceptance: `MEDIA_ROOT=/var/lib/speedy-socials/media` is
       respected; existing oversize blobs are still readable after a
       restart. (W5.5 hardcoded `./media` — make it env-driven.)
@@ -277,7 +279,7 @@ _Last refreshed: 2026-05-19._
       streaming endpoints accept 0 (upgrade-only). Anything larger
       returns 413 before the body finishes streaming.
 
-- [ ] **G6. Sanitize errors before they leave the process.**
+- [x] **G6. Sanitize errors before they leave the process.**
       Acceptance: no stack traces, file paths, or sqlite error
       strings appear in HTTP responses. Errors map to opaque codes
       + the underlying detail goes to the ring log.
@@ -382,7 +384,7 @@ _Last refreshed: 2026-05-19._
 
 ## L. Cleanups noticed during W4–W6
 
-- [ ] **L1. Remove the `MEDIA_ROOT` hardcode (`./media`) — use env.**
+- [x] **L1. Remove the `MEDIA_ROOT` hardcode (`./media`) — use env.**
       Acceptance: `src/app/main.zig` reads the env value once at
       boot; no path string lives in source. Pairs with F6.
 
