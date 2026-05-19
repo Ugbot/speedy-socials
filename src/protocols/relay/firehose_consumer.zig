@@ -34,12 +34,35 @@ const std = @import("std");
 const core = @import("core");
 const c = @import("sqlite").c;
 const atproto = @import("protocol_atproto");
+const activitypub = @import("protocol_activitypub");
 const firehose = atproto.firehose;
 const Arena = core.arena.Arena;
 
 const plugin = @import("plugin.zig");
 const state = @import("state.zig");
 const subscription = @import("subscription.zig");
+
+/// W6: optional AP inbox URL to deliver translated AT events to. When
+/// set (typically via `RELAY_BRIDGE_AP_TARGET` env at boot), every
+/// successful AT→AP translation enqueues a row in `ap_federation_outbox`
+/// addressed at this inbox. When unset, the consumer still translates
+/// + logs but does not deliver. Bounded to 512 bytes; longer URLs are
+/// rejected at setBridgeTargetInbox.
+var bridge_target_inbox_buf: [512]u8 = undefined;
+var bridge_target_inbox_len: u16 = 0;
+
+pub fn setBridgeTargetInbox(url: []const u8) void {
+    if (url.len > bridge_target_inbox_buf.len) {
+        bridge_target_inbox_len = 0;
+        return;
+    }
+    @memcpy(bridge_target_inbox_buf[0..url.len], url);
+    bridge_target_inbox_len = @intCast(url.len);
+}
+
+fn bridgeTargetInbox() []const u8 {
+    return bridge_target_inbox_buf[0..bridge_target_inbox_len];
+}
 
 /// Sized for a comfortable burst headroom. Tuning: a firehose append
 /// rate of ~1k/s and a consumer thread that processes ~10k/s leaves
@@ -273,7 +296,7 @@ fn processItem(self: *Consumer, item: *const QueueItem) !void {
             .record_json = row.value(),
             .fallback_created_at = "",
         };
-        _ = plugin.handleFirehoseEvent(
+        const out = plugin.handleFirehoseEvent(
             self.db,
             self.clock,
             self.relayHost(),
@@ -287,7 +310,78 @@ fn processItem(self: *Consumer, item: *const QueueItem) !void {
             else => return err,
         };
         _ = self.stats.translated_ok.fetchAdd(1, .monotonic);
+
+        // W6: deliver the translated activity to the configured AP
+        // bridge target inbox (if set). Failure to enqueue is logged
+        // but not fatal — the translation itself is recorded in
+        // `relay_translation_log` either way.
+        const target = bridgeTargetInbox();
+        if (target.len > 0) {
+            enqueueApDelivery(self.db, self.clock, &arena, out, target) catch |err| {
+                std.log.warn("relay consumer: enqueueApDelivery failed: {s}", .{@errorName(err)});
+            };
+        }
     }
+}
+
+/// Build the AP activity JSON from `out` and enqueue one row in
+/// `ap_federation_outbox` addressed at `target_inbox`. The key_id we
+/// stamp on the outbox row is `<actor>#main-key`, the standard
+/// convention; the AP outbox worker will use it when fetching the
+/// signing key (or, today, when the synthetic AP actor's key infra
+/// lands, will sign with it directly).
+fn enqueueApDelivery(
+    db: *c.sqlite3,
+    clock: core.clock.Clock,
+    arena: *Arena,
+    out: anytype,
+    target_inbox: []const u8,
+) !void {
+    const alloc = arena.allocator();
+    var key_id_buf: [256 + 9]u8 = undefined; // actor + "#main-key"
+    if (out.actor.len + 9 > key_id_buf.len) return error.OutOfMemory;
+    @memcpy(key_id_buf[0..out.actor.len], out.actor);
+    @memcpy(key_id_buf[out.actor.len..][0..9], "#main-key");
+    const key_id = key_id_buf[0 .. out.actor.len + 9];
+
+    // Minimal Create{Note} JSON envelope. Other activity types (Like,
+    // Announce, Follow) get type-specific shapes. The outbox worker
+    // delivers the bytes verbatim; we don't need to be lexicon-perfect
+    // for the at-least-one-recipient bridge case.
+    const payload = try buildApActivityJson(arena, out);
+
+    const recipients = [_]activitypub.delivery.Recipient{.{ .inbox = target_inbox }};
+    _ = try activitypub.delivery.enqueueDeliveries(db, clock, &recipients, payload, key_id);
+    _ = alloc; // silence unused when we don't take more arena allocations
+}
+
+fn buildApActivityJson(arena: *Arena, out: anytype) ![]const u8 {
+    const alloc = arena.allocator();
+    // Generous upper bound. Real activities are well under 4 KiB; if
+    // we ever cross 16 KiB the bridge needs a richer shape anyway.
+    const buf = try alloc.alloc(u8, 16 * 1024);
+    const type_str: []const u8 = switch (out.activity_type) {
+        .create => "Create",
+        .like => "Like",
+        .announce => "Announce",
+        .follow => "Follow",
+        else => "Note",
+    };
+    const written = switch (out.activity_type) {
+        .create => try std.fmt.bufPrint(buf,
+            \\{{"@context":"https://www.w3.org/ns/activitystreams","id":"{s}","type":"{s}","actor":"{s}","published":"{s}","to":["{s}"],"object":{{"id":"{s}","type":"Note","content":"{s}","attributedTo":"{s}","published":"{s}"}}}}
+        , .{ out.id, type_str, out.actor, out.published, out.to, out.object_id, out.content_html, out.actor, out.published }),
+        .like, .announce => try std.fmt.bufPrint(buf,
+            \\{{"@context":"https://www.w3.org/ns/activitystreams","id":"{s}","type":"{s}","actor":"{s}","object":"{s}","published":"{s}","to":["{s}"]}}
+        , .{ out.id, type_str, out.actor, out.object_id, out.published, out.to }),
+        .follow => try std.fmt.bufPrint(buf,
+            \\{{"@context":"https://www.w3.org/ns/activitystreams","id":"{s}","type":"Follow","actor":"{s}","object":"{s}","to":["{s}"]}}
+        , .{ out.id, out.actor, out.object_id, out.to }),
+        else => try std.fmt.bufPrint(buf,
+            \\{{"@context":"https://www.w3.org/ns/activitystreams","id":"{s}","type":"{s}","actor":"{s}"}}
+        , .{ out.id, type_str, out.actor }),
+    };
+    return written;
 }
 
 fn loadRecordsForCommit(db: *c.sqlite3, did: []const u8, ts: i64, out: []RecordRow) !u32 {
@@ -344,6 +438,15 @@ fn setupDb() !*c.sqlite3 {
     const db = try sqlite_mod.openWriter(":memory:");
     // Apply AT schema (we need atp_repos, atp_records, atp_firehose_*).
     for (at_schema.all_migrations) |m| {
+        const sql_z = try testing.allocator.dupeZ(u8, m.up);
+        defer testing.allocator.free(sql_z);
+        var errmsg: [*c]u8 = null;
+        _ = c.sqlite3_exec(db, sql_z.ptr, null, null, &errmsg);
+        if (errmsg != null) c.sqlite3_free(errmsg);
+    }
+    // Apply AP schema so ap_federation_outbox exists when the bridge
+    // target enqueue test runs.
+    for (activitypub.schema.all_migrations) |m| {
         const sql_z = try testing.allocator.dupeZ(u8, m.up);
         defer testing.allocator.free(sql_z);
         var errmsg: [*c]u8 = null;
@@ -407,6 +510,69 @@ test "consumer: end-to-end firehose append → translation log entry" {
     try testing.expect(n >= 1);
     try testing.expectEqual(subscription.Direction.at_to_ap, log_rows[0].direction);
     try testing.expectEqualStrings(uri, log_rows[0].sourceId());
+}
+
+test "consumer: bridge target inbox enqueues into ap_federation_outbox" {
+    const db = try setupDb();
+    defer core.storage.sqlite.closeDb(db);
+
+    const did = "did:plc:bridge_alice";
+    const uri = "at://did:plc:bridge_alice/app.bsky.feed.post/post1";
+    const value = "{\"$type\":\"app.bsky.feed.post\",\"text\":\"bridged\",\"createdAt\":\"2026-05-19T00:00:00Z\"}";
+    const ts: i64 = 1_716_000_000;
+    try insertRecord(db, uri, did, "app.bsky.feed.post", value, ts);
+
+    setBridgeTargetInbox("https://mastodon.example/users/eve/inbox");
+    defer setBridgeTargetInbox("");
+
+    var sc = core.clock.SimClock.init(ts);
+    const consumer = try start(testing.allocator, db, sc.clock(), "relay.test");
+    defer stop(testing.allocator);
+
+    _ = try firehose.append(db, did, "bafycid", value, ts);
+
+    var spin: u32 = 0;
+    while (spin < 500) : (spin += 1) {
+        if (consumer.stats.translated_ok.load(.monotonic) > 0) break;
+        sleepNs(2 * std.time.ns_per_ms);
+    }
+    try testing.expect(consumer.stats.translated_ok.load(.monotonic) >= 1);
+
+    // Wait a beat for the post-translation enqueue to land.
+    sleepNs(50 * std.time.ns_per_ms);
+
+    // Assert the row landed in ap_federation_outbox addressed at the
+    // configured bridge target.
+    var outbox_count: i64 = -1;
+    var stmt: ?*c.sqlite3_stmt = null;
+    if (c.sqlite3_prepare_v2(db, "SELECT count(*) FROM ap_federation_outbox WHERE target_inbox = ?", -1, &stmt, null) == c.SQLITE_OK) {
+        defer _ = c.sqlite3_finalize(stmt);
+        const target = "https://mastodon.example/users/eve/inbox";
+        _ = c.sqlite3_bind_text(stmt, 1, target, target.len, c.sqliteTransientAsDestructor());
+        if (c.sqlite3_step(stmt.?) == c.SQLITE_ROW) {
+            outbox_count = c.sqlite3_column_int64(stmt, 0);
+        }
+    }
+    try testing.expectEqual(@as(i64, 1), outbox_count);
+
+    // Spot-check the payload — it should contain "Create" and our text.
+    var payload_buf: [4096]u8 = undefined;
+    var payload_len: usize = 0;
+    var p2: ?*c.sqlite3_stmt = null;
+    if (c.sqlite3_prepare_v2(db, "SELECT payload FROM ap_federation_outbox LIMIT 1", -1, &p2, null) == c.SQLITE_OK) {
+        defer _ = c.sqlite3_finalize(p2);
+        if (c.sqlite3_step(p2.?) == c.SQLITE_ROW) {
+            const ptr = c.sqlite3_column_text(p2, 0);
+            const n: usize = @intCast(c.sqlite3_column_bytes(p2, 0));
+            const cap = @min(n, payload_buf.len);
+            if (ptr != null and cap > 0) {
+                @memcpy(payload_buf[0..cap], ptr[0..cap]);
+                payload_len = cap;
+            }
+        }
+    }
+    try testing.expect(std.mem.indexOf(u8, payload_buf[0..payload_len], "\"type\":\"Create\"") != null);
+    try testing.expect(std.mem.indexOf(u8, payload_buf[0..payload_len], "bridged") != null);
 }
 
 test "consumer: unsupported collection is silently skipped (no error log row)" {

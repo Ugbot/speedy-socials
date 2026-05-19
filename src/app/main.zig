@@ -279,6 +279,32 @@ pub fn main() !void {
     // ring on a dedicated thread, calling `relay.handleFirehoseEvent`
     // on each record and appending to `relay_translation_log`. The
     // sink is unregistered + the worker joined on the `defer` below.
+    // W6: load the synthetic-key pepper from env before any
+    // synthetic actor is minted. A missing env value is a soft fail
+    // — the dev-default pepper still works but logs a warning so
+    // operators see it.
+    if (std.c.getenv("RELAY_SYNTHETIC_KEY_PEPPER")) |pep_c| {
+        const pep = std.mem.sliceTo(pep_c, 0);
+        if (pep.len > 0) {
+            relay.synthetic_keys.setPepper(pep);
+            log_ptr.info("boot", "relay synthetic-key pepper loaded from RELAY_SYNTHETIC_KEY_PEPPER");
+        }
+    }
+    if (relay.synthetic_keys.isDefaultPepper()) {
+        log_ptr.warn("boot", "relay synthetic-key pepper is the development default — set RELAY_SYNTHETIC_KEY_PEPPER for production");
+    }
+
+    // W6: optional AT→AP bridge delivery target. When set, every
+    // successful AT→AP translation enqueues an AP outbox row
+    // addressed at this inbox URL.
+    if (std.c.getenv("RELAY_BRIDGE_AP_TARGET")) |tgt_c| {
+        const tgt = std.mem.sliceTo(tgt_c, 0);
+        if (tgt.len > 0) {
+            relay.firehose_consumer.setBridgeTargetInbox(tgt);
+            log_ptr.info("boot", "relay AT→AP bridge target inbox configured");
+        }
+    }
+
     _ = relay.firehose_consumer.start(gpa_allocator, db, real_clock.clock(), "speedy-socials.local") catch |err| blk: {
         log_ptr.record(.warn, "boot", "relay firehose consumer failed to start", &.{
             .{ .k = "err", .v = @errorName(err) },
@@ -288,9 +314,9 @@ pub fn main() !void {
     defer relay.firehose_consumer.stop(gpa_allocator);
     log_ptr.info("boot", "relay firehose consumer started");
 
-    // W5.2: install the relay's AP-inbox hook. Fires after every
-    // accepted AP activity; the relay translates it into an AT-side
-    // log entry (and, when key infra lands, an AT repo commit).
+    // W5.2 + W6: install the relay's AP-inbox hook. Fires after
+    // every accepted AP activity; the relay translates it into a
+    // committed atp_records row + ap_to_at translation-log entry.
     relay.ap_to_at.setRelayHost("speedy-socials.local");
     activitypub.inbox.setRelayInboxHook(relay.ap_to_at.onActivityReceived);
     log_ptr.info("boot", "relay ap-to-at hook wired");

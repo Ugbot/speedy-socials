@@ -1,6 +1,6 @@
 # Feature Status — speedy-socials
 
-_Last updated: 2026-05-16 (post-W5 audit: relay bridge now live in both directions; media spillover wired). Reflects the Tiger-Style
+_Last updated: 2026-05-19 (post-W6: bridge actually writes — AP→AT commits real records, AT→AP enqueues real outbox rows). Reflects the Tiger-Style
 rewrite under `src/core/`, `src/app/`, `src/protocols/`. See ADR-001 ..
 ADR-004 in `docs/adr/` for context. Each line below was checked
 against the actual source tree at this commit — if you spot drift,
@@ -123,6 +123,28 @@ backlog of stale "stubbed" claims.
       W3.1 OpenSSL-backed default; OpenSSL link retained narrowly for
       RSA signing).
 
+## Recently shipped (W4 + W5 + W6)
+
+- [x] **W6 bridge functional completion.** Both directions now do
+      real writes, not just log entries:
+      - AP→AT: `relay.ap_to_at.onActivityReceived` mints a
+        deterministic Ed25519 keypair for the synthetic AT DID via
+        `relay.synthetic_keys.deriveKeypair(actor_url)`, ensures the
+        AT repo row, builds a dag-cbor record, and calls
+        `atproto.repo.commit` — a real `atp_records` + `atp_commits`
+        row lands per accepted activity.
+      - AT→AP: `relay.firehose_consumer` enqueues each translated
+        AP activity into `ap_federation_outbox` (target inbox set via
+        `RELAY_BRIDGE_AP_TARGET` env). The existing AP outbox worker
+        handles retries + signing + HTTP POST. JSON envelopes are
+        built per activity type (Create/Like/Announce/Follow).
+      - Synthetic-key pepper: 32-byte HMAC pepper loaded from
+        `RELAY_SYNTHETIC_KEY_PEPPER` env at boot (with a noisy
+        warning when the dev default is in use).
+      - Sim assertion: `relay_bridge_scenario` now verifies
+        `ap_federation_outbox` enqueue count + `atp_records` commit
+        count, not just translation-log entries.
+
 ## Recently shipped (W4 + W5)
 
 - [x] **W4 infrastructure borrow.** Vendored TigerBeetle stdx —
@@ -178,18 +200,19 @@ Real remaining gaps, ordered by impact.
       future tranche either patches ianic or stages a small
       pre-handshake peek to surface SNI. Single-cert deployments
       unaffected.
-- [ ] **AP federation delivery of translated activities.** The
-      relay's AT→AP and AP→AT pipelines log translations but do not
-      yet enqueue the resulting AP activities into the federation
-      outbox — that needs a per-synthetic-actor signing key + a
-      followers table. Translation log + sim scenarios are the
-      verifiable evidence that translation is correct; delivery is a
-      separately-scoped follow-up.
-- [ ] **AT repo commit from AP→AT translation.** Mirror of the
-      delivery gap: `ap_to_at.onActivityReceived` writes a log row
-      but does not yet `atproto.repo.commit` the translated record,
-      because the synthetic AT repos have no signing keys
-      provisioned. Same follow-up as the AP delivery side.
+- [ ] **AP signing-key publication.** W6 enqueues outbox rows with
+      `key_id = <actor>#main-key` but the synthetic AP actor's
+      public key is not yet exposed at the actor IRI for upstream
+      relays to fetch + verify. Today's signing infrastructure
+      (`activitypub.keys`) covers the AP plugin's owned actors;
+      the relay's synthetic actors need a parallel publication
+      path. Until then, the AT→AP outbox rows will get delivery
+      errors from peers that strict-verify signatures.
+- [ ] **AT repo broadcast.** W6 commits records into atp_records
+      and atp_commits, which means a local firehose subscriber
+      sees them — but if speedy-socials is *itself* fronting a
+      Bluesky-style PDS upstream relay, the relay protocol's
+      outbound replication path is not yet wired.
 - [ ] **Per-socket connect/read timeouts** for the outbound HTTP
       client. `timeout_ms` is plumbed but `std.Io.net` doesn't expose
       the underlying setsockopt portably yet. Track upstream Zig.

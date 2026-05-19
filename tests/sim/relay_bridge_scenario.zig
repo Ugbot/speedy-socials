@@ -52,9 +52,18 @@ fn run(gpa: std.mem.Allocator) !void {
     relay.ap_to_at.setRelayHost("relay.sim");
     defer relay.ap_to_at.setRelayHost("");
 
+    // W6: configure an AP bridge target so AT→AP enqueues a real
+    // ap_federation_outbox row we can assert on later.
+    relay.firehose_consumer.setBridgeTargetInbox("https://upstream.bridge/inbox");
+    defer relay.firehose_consumer.setBridgeTargetInbox("");
+
     // ── Scenario A: AT → AP ────────────────────────────────────────
+    // Run the consumer thread; assert one translation; then STOP the
+    // thread before Scenario B so the AT-side writes there don't
+    // race the consumer's atp_records reads on a NOMUTEX sqlite
+    // handle. The relay's production race-free path is single-thread
+    // per writer; this test mirrors that.
     const consumer = try relay.firehose_consumer.start(gpa, db, sc.clock(), "relay.sim");
-    defer relay.firehose_consumer.stop(gpa);
 
     const a_did = "did:plc:scenario_a_actor";
     const a_uri = "at://did:plc:scenario_a_actor/app.bsky.feed.post/aaa111";
@@ -65,8 +74,12 @@ fn run(gpa: std.mem.Allocator) !void {
 
     if (!waitUntil(&consumer.stats.translated_ok, 1, 500)) {
         std.debug.print("FAIL: AT→AP consumer did not translate within budget\n", .{});
+        relay.firehose_consumer.stop(gpa);
         return error.ScenarioFailedAtToAp;
     }
+
+    // Joining the consumer makes scenario B's commits exclusive.
+    relay.firehose_consumer.stop(gpa);
 
     // ── Scenario B: AP → AT ────────────────────────────────────────
     const ap_act: activitypub.activity.Activity = .{
@@ -110,13 +123,35 @@ fn run(gpa: std.mem.Allocator) !void {
         return error.ScenarioFailedApToAt;
     }
 
-    const enq = consumer.stats.enqueued.load(.monotonic);
-    const ok = consumer.stats.translated_ok.load(.monotonic);
-    const err = consumer.stats.translated_err.load(.monotonic);
+    // W6: the AT→AP path enqueued an AP federation outbox row; the
+    // AP→AT path committed a real atp_records row.
+    const outbox_count = try countRows(db, "SELECT count(*) FROM ap_federation_outbox WHERE target_inbox = ?", "https://upstream.bridge/inbox");
+    if (outbox_count != 1) {
+        std.debug.print("FAIL: expected 1 ap_federation_outbox row, got {d}\n", .{outbox_count});
+        return error.ScenarioFailedOutbox;
+    }
+    const atp_records_count = try countRows(db, "SELECT count(*) FROM atp_records WHERE collection = ?", "app.bsky.feed.post");
+    if (atp_records_count < 2) {
+        // 1 seeded for scenario A + 1 committed by scenario B.
+        std.debug.print("FAIL: expected ≥2 atp_records rows, got {d}\n", .{atp_records_count});
+        return error.ScenarioFailedAtRecords;
+    }
+
     std.debug.print(
-        "relay bridge: at_to_ap enq={d} ok={d} err={d}; ap_to_at log rows={d}\n",
-        .{ enq, ok, err, n },
+        "relay bridge: log rows={d}; ap_federation_outbox enqueued={d}; atp_records (post)={d}\n",
+        .{ n, outbox_count, atp_records_count },
     );
+}
+
+fn countRows(db: *c.sqlite3, sql: []const u8, param: []const u8) !i64 {
+    var stmt: ?*c.sqlite3_stmt = null;
+    const sql_z = try std.heap.page_allocator.dupeZ(u8, sql);
+    defer std.heap.page_allocator.free(sql_z);
+    if (c.sqlite3_prepare_v2(db, sql_z.ptr, -1, &stmt, null) != c.SQLITE_OK) return error.PrepareFailed;
+    defer _ = c.sqlite3_finalize(stmt);
+    _ = c.sqlite3_bind_text(stmt, 1, param.ptr, @intCast(param.len), c.sqliteTransientAsDestructor());
+    if (c.sqlite3_step(stmt.?) != c.SQLITE_ROW) return -1;
+    return c.sqlite3_column_int64(stmt, 0);
 }
 
 // ── Helpers ───────────────────────────────────────────────────────
@@ -125,6 +160,7 @@ fn openSchemaDb() !*c.sqlite3 {
     const db = try core.storage.sqlite.openWriter(":memory:");
     inline for ([_]type{
         atproto.schema,
+        activitypub.schema,
         relay.schema,
     }) |Module| {
         for (Module.all_migrations) |m| {
