@@ -668,6 +668,52 @@ test "A4: Update mutates the bridged record in place (CID changes)" {
     try testing.expectEqual(@as(i64, 1), row_count);
 }
 
+test "J4: fuzz onActivityReceived against random bodies + types" {
+    const db = try setupDb();
+    defer core.storage.sqlite.closeDb(db);
+    var sc = core.clock.SimClock.init(2_000_000_000);
+    setRelayHost("relay.fuzz");
+    defer setRelayHost("");
+
+    // Seed PRNG from the testing seed for determinism.
+    var prng_state = std.Random.DefaultPrng.init(testing.random_seed);
+    const rng = prng_state.random();
+
+    var i: u32 = 0;
+    while (i < 200) : (i += 1) {
+        // Random activity type + bounded random URLs.
+        const types = [_]ActivityType{ .create, .update, .delete, .like, .announce, .follow, .undo, .move, .block, .flag };
+        const t = types[rng.uintAtMost(usize, types.len - 1)];
+        var id_buf: [64]u8 = undefined;
+        const id = std.fmt.bufPrint(&id_buf, "https://fuzz.example/act/{x}", .{rng.int(u64)}) catch unreachable;
+        var actor_buf: [64]u8 = undefined;
+        const actor = std.fmt.bufPrint(&actor_buf, "https://fuzz.example/users/{d}", .{rng.uintAtMost(u32, 100)}) catch unreachable;
+        var obj_buf: [64]u8 = undefined;
+        const obj = std.fmt.bufPrint(&obj_buf, "https://fuzz.example/obj/{x}", .{rng.int(u64)}) catch unreachable;
+
+        const obj_type: []const u8 = if (t == .create or t == .update) "Note" else "";
+        const act: Activity = .{
+            .activity_type = t,
+            .id = id,
+            .actor = actor,
+            .object_id = obj,
+            .object_type = obj_type,
+            .target = "",
+            .published = "",
+            .to_first = "",
+        };
+        // Random body shape — sometimes valid JSON, sometimes garbage,
+        // always within bounds.
+        var body_buf: [256]u8 = undefined;
+        const body_len = rng.uintAtMost(usize, body_buf.len);
+        for (body_buf[0..body_len]) |*b| b.* = @intCast(rng.uintAtMost(u8, 127));
+        onActivityReceived(&act, body_buf[0..body_len], db, sc.clock());
+    }
+    // The point of the fuzz isn't to assert specific outputs — it's
+    // to assert NO PANICS over 200 random inputs. Reaching here is
+    // success.
+}
+
 test "B4: Follow then Undo removes the follower row" {
     const db = try setupDb();
     defer core.storage.sqlite.closeDb(db);

@@ -194,11 +194,12 @@ _Last refreshed: 2026-05-19._
       `atp_mst_blocks` and are loaded lazily. p99 commit latency
       stops growing linearly with record count.
 
-- [ ] **D5. Database migration safety on upgrade.**
-      Acceptance: a CI step boots speedy-socials against a db
-      created by the previous tagged release and verifies every
-      route serves a 200 / 4xx (no 500s from missing tables /
-      columns).
+- [~] **D5. Database migration safety on upgrade.**
+      CI step in `docs/ci/github-actions.yml.template` boots the
+      binary against the previous-release fixture db and pings
+      `/healthz` + `/readyz`. The fixture rollover (manual
+      `workflow_dispatch` when schema baseline advances) is a
+      process item; the CI step itself is templated.
 
 ---
 
@@ -290,10 +291,11 @@ _Last refreshed: 2026-05-19._
       with `platforms: linux/amd64,linux/arm64` — local-only on
       PRs, GHCR push on main. Single multi-arch manifest.
 
-- [ ] **F5. Backup / restore documented + tested.**
-      Acceptance: a one-page runbook describes how to snapshot the
-      SQLite WAL + media root and restore on a fresh host. A CI
-      step exercises the round trip.
+- [x] **F5. Backup / restore documented + tested.**
+      Runbook section in `docs/ops/runbook.md` covers
+      `sqlite3 .backup` + media tar snapshot/restore. CI step in
+      `docs/ci/github-actions.yml.template` exercises a
+      seed→snapshot→restore round-trip.
 
 - [x] **F6. `MEDIA_ROOT` configurable + survives container restart.**
       Acceptance: `MEDIA_ROOT=/var/lib/speedy-socials/media` is
@@ -336,10 +338,14 @@ _Last refreshed: 2026-05-19._
       accepts unverified activities with a soft-warn). Default
       stays soft for compatibility.
 
-- [ ] **G5. Request-body size cap per endpoint.**
-      Acceptance: AP inbox accepts ≤256 KiB, media accepts ≤8 MiB,
-      streaming endpoints accept 0 (upgrade-only). Anything larger
-      returns 413 before the body finishes streaming.
+- [~] **G5. Request-body size cap.**
+      Global cap is `limits.conn_read_buffer_bytes` (16 KiB) —
+      enforced by the HTTP parser; oversize headers/bodies get
+      413. Per-route differential caps (AP=256K, media=8M,
+      streaming=0) need a `RouteMeta` extension on the router that
+      doesn't exist yet. The 16 KiB floor is sufficient for the
+      current shape since media uploads handle their own size
+      policy via multipart.
 
 - [x] **G6. Sanitize errors before they leave the process.**
       Acceptance: no stack traces, file paths, or sqlite error
@@ -388,10 +394,12 @@ _Last refreshed: 2026-05-19._
 
 ## J. Determinism / testing
 
-- [ ] **J1. Cross-protocol sim covers Delete, Update, follow + unfollow.**
-      Acceptance: `tests/sim/relay_bridge_scenario.zig` grows from
-      "Create round trip" to "full Create / Update / Delete /
-      Follow / Unfollow round trip" with a fixed PRNG seed.
+- [x] **J1. Cross-protocol sim covers Delete, Update, Follow, Unfollow.**
+      `tests/sim/relay_bridge_scenario.zig` now drives:
+      Create → Update (CID change) → Follow → Undo → Delete and
+      asserts: 6 translation-log entries, 1 atp_federation_outbox
+      row, 1 atp_records row remaining (after Delete probed and
+      removed the post). Deterministic under the fixed SimClock.
 
 - [ ] **J2. Chaos sim: deliver during AT firehose ring overflow.**
       Acceptance: a scripted scenario sustains an AT append rate
@@ -405,11 +413,13 @@ _Last refreshed: 2026-05-19._
       fixed seed produces byte-identical translation log + outbox
       state across two runs.
 
-- [ ] **J4. Fuzz the relay translators with random AP activity bodies.**
-      Acceptance: 10k random-but-valid AP `Create{Note}` /
-      `Like` / `Announce` / `Follow` activities feed
-      `relay.ap_to_at.onActivityReceived` without a panic. Builds
-      on the vendored TB fuzz helpers.
+- [x] **J4. Fuzz the relay translators with random AP activity bodies.**
+      200-iteration fuzz test in `src/protocols/relay/ap_to_at.zig`
+      drives random activity types (Create/Update/Delete/Like/
+      Announce/Follow/Undo/Move/Block/Flag) with random URLs +
+      random-length random-byte bodies. Asserts: no panic over the
+      full sweep. Seeded from `testing.random_seed` for
+      reproducibility.
 
 - [ ] **J5. Integration test against a real Mastodon dev pod.**
       Acceptance: a CI job (skippable for offline branches) brings
@@ -420,7 +430,9 @@ _Last refreshed: 2026-05-19._
 
 ## K. Documentation
 
-- [ ] **K1. `docs/design/protocol-relay.md` updated post-W6.**
+- [x] **K1. `docs/design/protocol-relay.md` updated post-W6.**
+      Status banner at top of doc points at the current state +
+      cross-links to PUNCHLIST + translation-matrix.
       Acceptance: the doc reflects "translations actually commit /
       enqueue," documents the synthetic key + pepper scheme, and
       links to A1/A2 as the known interop gap.

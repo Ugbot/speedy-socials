@@ -1,5 +1,17 @@
 # Design: AT Protocol / ActivityPub Protocol Relay
 
+> **Status (2026-05-19, post-W6 + A/B/E rounds).** Both translation
+> pipelines write real records / outbox rows, not just log entries.
+> Synthetic-actor signing keys derive deterministically from a
+> process-wide pepper. The full Create / Update / Delete / Follow /
+> Unfollow lifecycle is covered by a deterministic sim. Per-actor
+> follower fanout replaces the single-env-target bootstrap.
+> Remaining production gaps (HTTPS-fronted WSS, multi-SNI, AT-side
+> deletion events, …) are tracked in `PUNCHLIST.md`. The doc below
+> captures the architectural intent — sections may pre-date the
+> current implementation; cross-reference
+> `docs/design/translation-matrix.md` for the live behaviour table.
+
 ## Overview
 
 A configurable translation layer that bridges AT Protocol and ActivityPub, deployable as either a local bridge (attached to a speedy-socials instance) or a standalone relay node (network infrastructure for cross-protocol communication).

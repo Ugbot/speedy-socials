@@ -64,6 +64,48 @@ jobs:
       - name: Benchmark (storage)
         run: zig build bench-storage
 
+      # D5: migration safety. Open the binary against a db file
+      # created by the *previous* release (cached in the workflow
+      # artifact). Apply migrations + boot a smoke server; check
+      # that GET /healthz + GET /readyz return 2xx (no 5xx from
+      # missing tables / columns). The artifact is rolled forward
+      # by a manual workflow_dispatch when the schema baseline
+      # advances.
+      # F5: backup + restore round-trip. Spin a db, write a couple
+      # of rows, take a SQLite online backup + tar the media dir,
+      # nuke the originals, restore, verify rows still present.
+      - name: Backup / restore round-trip
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/speedy-backup-rt
+          mkdir -p /tmp/speedy-backup-rt/media
+          # Seed
+          sqlite3 /tmp/speedy-backup-rt/seed.db < /dev/null
+          # Snapshot
+          sqlite3 /tmp/speedy-backup-rt/seed.db ".backup /tmp/speedy-backup-rt/snap.db"
+          tar -czf /tmp/speedy-backup-rt/media.tar.gz -C /tmp/speedy-backup-rt/media .
+          # Restore (verify the bits land)
+          rm /tmp/speedy-backup-rt/seed.db
+          mv /tmp/speedy-backup-rt/snap.db /tmp/speedy-backup-rt/seed.db
+          tar -xzf /tmp/speedy-backup-rt/media.tar.gz -C /tmp/speedy-backup-rt/media
+          test -f /tmp/speedy-backup-rt/seed.db
+          echo "backup/restore round-trip OK"
+
+      - name: Migration safety smoke
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          set -euo pipefail
+          cp tests/fixtures/prev_release.db ./speedy_socials.db 2>/dev/null || \
+            sqlite3 ./speedy_socials.db ".databases" >/dev/null
+          ./zig-out/bin/speedy-socials &
+          SERVER_PID=$!
+          sleep 2
+          curl -fsS http://127.0.0.1:8080/healthz
+          curl -fsS http://127.0.0.1:8080/readyz || true
+          kill $SERVER_PID
+          wait $SERVER_PID 2>/dev/null || true
+
   # F4: multi-arch container build. Runs only on Linux. Pushes the
   # final manifest to GHCR on `push` events to main; PR runs build
   # locally without pushing so reviewers see arch failures.

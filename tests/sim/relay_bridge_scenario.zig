@@ -94,6 +94,60 @@ fn run(gpa: std.mem.Allocator) !void {
     };
     relay.ap_to_at.onActivityReceived(&ap_act, "", db, sc.clock());
 
+    // ── Scenario B': Update mutates the same row ──────────────────
+    const ap_update: activitypub.activity.Activity = .{
+        .activity_type = .update,
+        .id = "https://mastodon.sim/users/bob/activities/10",
+        .actor = "https://mastodon.sim/users/bob",
+        .object_id = "https://mastodon.sim/users/bob/notes/9",
+        .object_type = "Note",
+        .target = "",
+        .published = "2026-05-16T00:02:00Z",
+        .to_first = "",
+    };
+    const update_body =
+        "{\"type\":\"Update\",\"actor\":\"https://mastodon.sim/users/bob\"," ++
+        "\"object\":{\"id\":\"https://mastodon.sim/users/bob/notes/9\"," ++
+        "\"type\":\"Note\",\"content\":\"edited content for the bridge\"}}";
+    relay.ap_to_at.onActivityReceived(&ap_update, update_body, db, sc.clock());
+
+    // ── Scenario B'': Follow + Undo lifecycle ─────────────────────
+    const ap_follow: activitypub.activity.Activity = .{
+        .activity_type = .follow,
+        .id = "https://mastodon.sim/follow/1",
+        .actor = "https://mastodon.sim/users/alice",
+        .object_id = "https://relay.sim/ap/users/at:plc:bridged",
+        .object_type = "Person",
+        .target = "",
+        .published = "",
+        .to_first = "",
+    };
+    relay.ap_to_at.onActivityReceived(&ap_follow, "", db, sc.clock());
+    const ap_undo: activitypub.activity.Activity = .{
+        .activity_type = .undo,
+        .id = "https://mastodon.sim/undo/1",
+        .actor = "https://mastodon.sim/users/alice",
+        .object_id = "https://mastodon.sim/follow/1",
+        .object_type = "",
+        .target = "",
+        .published = "",
+        .to_first = "",
+    };
+    relay.ap_to_at.onActivityReceived(&ap_undo, "", db, sc.clock());
+
+    // ── Scenario B''': Delete removes the bridged record ──────────
+    const ap_delete: activitypub.activity.Activity = .{
+        .activity_type = .delete,
+        .id = "https://mastodon.sim/users/bob/activities/11",
+        .actor = "https://mastodon.sim/users/bob",
+        .object_id = "https://mastodon.sim/users/bob/notes/9",
+        .object_type = "Tombstone",
+        .target = "",
+        .published = "",
+        .to_first = "",
+    };
+    relay.ap_to_at.onActivityReceived(&ap_delete, "", db, sc.clock());
+
     // ── Verify both log rows exist with the expected shapes ────────
     var rows: [16]relay.subscription.LogEntry = undefined;
     const n = try relay.subscription.listLog(db, 0, &rows);
@@ -130,11 +184,21 @@ fn run(gpa: std.mem.Allocator) !void {
         std.debug.print("FAIL: expected 1 ap_federation_outbox row, got {d}\n", .{outbox_count});
         return error.ScenarioFailedOutbox;
     }
+    // After Create → Update → Delete, the post row should be GONE
+    // (Delete probed app.bsky.feed.post and removed it). The
+    // app.bsky.graph.follow row from Follow is also gone (Undo
+    // removed the follower table row but the AT record was just
+    // logged, not committed back). Only the seeded scenario-A row
+    // remains.
     const atp_records_count = try countRows(db, "SELECT count(*) FROM atp_records WHERE collection = ?", "app.bsky.feed.post");
-    if (atp_records_count < 2) {
-        // 1 seeded for scenario A + 1 committed by scenario B.
-        std.debug.print("FAIL: expected ≥2 atp_records rows, got {d}\n", .{atp_records_count});
+    if (atp_records_count != 1) {
+        std.debug.print("FAIL: expected 1 atp_records row after Create→Update→Delete, got {d}\n", .{atp_records_count});
         return error.ScenarioFailedAtRecords;
+    }
+    // The full lifecycle produced multiple translation-log entries.
+    if (n < 4) {
+        std.debug.print("FAIL: expected ≥4 translation log rows after extended lifecycle, got {d}\n", .{n});
+        return error.ScenarioFailedLogCount;
     }
 
     std.debug.print(
