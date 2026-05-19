@@ -358,10 +358,22 @@ pub fn build(b: *std.Build) void {
     });
     const run_sim_relay = b.addRunArtifact(sim_relay_exe);
 
+    const sim_chaos_exe = b.addExecutable(.{
+        .name = "sim-relay-chaos",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/sim/relay_chaos_overflow.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &sim_imports,
+        }),
+    });
+    const run_sim_chaos = b.addRunArtifact(sim_chaos_exe);
+
     const sim_step = b.step("sim", "Run simulation tests");
     sim_step.dependOn(&run_sim_fed.step);
     sim_step.dependOn(&run_sim_fh.step);
     sim_step.dependOn(&run_sim_relay.step);
+    sim_step.dependOn(&run_sim_chaos.step);
 
     // The simulation scenarios also run as regular `zig build test` tests.
     const sim_fed_tests = b.addTest(.{

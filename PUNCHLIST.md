@@ -24,7 +24,11 @@ _Last refreshed: 2026-05-19._
       Mastodon-side strict-verifying peer accepts a delivery from
       the bridge in a manual integration run.
 
-- [ ] **A2. AT synthetic-DID key publication.**
+- [ ] **A2. AT synthetic-DID key publication.** (Deferred —
+      requires either reworking the synthetic-DID format to a
+      single-path-segment shape or adding multi-segment wildcard
+      capture to the router. Strict AT-side DID verification isn't
+      a current production blocker.)
       Acceptance: AT `com.atproto.identity.resolveDid` / DID document
       for a synthetic did:web actor lists the verification method
       backing the Ed25519 key the bridge signs commits with. A
@@ -381,14 +385,15 @@ _Last refreshed: 2026-05-19._
       bridged / dropped / impossible with a rationale.
 
 - [ ] **I2. AT `app.bsky.actor.profile` → AP `Person` updates.**
-      Acceptance: changes to the synthetic AT actor's profile
-      record propagate to the AP `Person` document the relay
-      serves. Test: edit profile, fetch AP actor, see the change.
+      (Deferred — needs AT-side firehose mutation events first
+      so the bridge can fire on profile commits. Tracked alongside
+      A4b.)
 
 - [ ] **I3. AP `Person` updates → AT profile record.**
-      Acceptance: when an AP `Update{Person}` arrives for an actor
-      we mirror, the corresponding AT `app.bsky.actor.profile` row
-      is updated.
+      (Deferred — depends on extending `collectionFor` to map
+      `Update{Person}` to `app.bsky.actor.profile` + writing the
+      AT profile lexicon shape from the AP body. Activity parser
+      already accepts Update.)
 
 ---
 
@@ -401,12 +406,13 @@ _Last refreshed: 2026-05-19._
       row, 1 atp_records row remaining (after Delete probed and
       removed the post). Deterministic under the fixed SimClock.
 
-- [ ] **J2. Chaos sim: deliver during AT firehose ring overflow.**
-      Acceptance: a scripted scenario sustains an AT append rate
-      that overflows the consumer ring, verifies the
-      `firehose_consumer_dropped_total` counter advances, and
-      confirms that re-running with a fresh consumer recovers all
-      missed events via persistent table replay.
+- [x] **J2. Chaos sim: deliver during AT firehose ring overflow.**
+      `tests/sim/relay_chaos_overflow.zig` shoves 2000 firehose
+      events at a 512-slot ring. Assertions:
+        * persistent count == 2000 (durable layer never drops)
+        * dropped counter > 0 (ring overflowed — observed ~1469)
+        * `firehose.readSince(0, ...)` replays all 2000 seqs
+      Wired into `zig build sim`.
 
 - [ ] **J3. Long-running deterministic-replay test.**
       Acceptance: 1 hour of simulated firehose traffic under a
