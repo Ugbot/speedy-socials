@@ -374,14 +374,15 @@ const Response = @import("http/response.zig");
 const max_metrics_body_bytes: usize = 32 * 1024;
 
 fn metricsHandler(hc: *http.HandlerContext) anyerror!void {
+    // Render into a fixed buffer via the std.Io.Writer that wraps a
+    // memory slice. Zig 0.16 retired `std.io.fixedBufferStream`; the
+    // replacement is `std.Io.Writer.fixed(slice)`.
     var buf: [max_metrics_body_bytes]u8 = undefined;
-    var stream = std.io.fixedBufferStream(&buf);
-    var bw_buf: [4096]u8 = undefined;
-    var bw = stream.writer().adaptToNewApi(&bw_buf);
-    global_registry.export_(&bw.new_interface) catch {
+    var writer: std.Io.Writer = .fixed(&buf);
+    global_registry.export_(&writer) catch {
         return hc.response.simple(.internal, "text/plain", "metrics render failed");
     };
-    const body = stream.getWritten();
+    const body = writer.buffered();
     try hc.response.startStatus(.ok);
     try hc.response.header("Content-Type", "text/plain; version=0.0.4");
     try hc.response.headerFmt("Content-Length", "{d}", .{body.len});

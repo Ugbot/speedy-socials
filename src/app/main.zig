@@ -24,6 +24,29 @@ fn alwaysReadyHook(_: ?*anyopaque) core.health.Status {
     return .ready;
 }
 
+/// F2: deep readiness — the writer thread is responsible for actually
+/// persisting plugin writes. If the channel is closed (writer
+/// stopped or crashed) we are not ready.
+fn writerReadyHook(ud: ?*anyopaque) core.health.Status {
+    const ch: *const core.storage.Channel = @ptrCast(@alignCast(ud orelse return .not_ready));
+    if (ch.closed.load(.acquire)) return .not_ready;
+    return .ready;
+}
+
+/// F2: the AP federation outbox worker drains pending deliveries.
+/// We surface `not_ready` when the worker has not yet been started.
+fn apOutboxReadyHook(_: ?*anyopaque) core.health.Status {
+    const st = activitypub.state.get();
+    if (!st.outbox.running.load(.acquire)) return .not_ready;
+    return .ready;
+}
+
+/// F2: relay firehose consumer.
+fn relayConsumerReadyHook(_: ?*anyopaque) core.health.Status {
+    if (relay.firehose_consumer.current() == null) return .not_ready;
+    return .ready;
+}
+
 // ── Inbound TLS (W3.2) wiring helpers ────────────────────────────────
 //
 // `InboundTlsHolder` owns the heap-allocated inbound TLS backend for
@@ -216,6 +239,9 @@ pub fn main() !void {
 
     var health = core.health.Health.init(&shutdown);
     try health.addHook("process", alwaysReadyHook, null);
+    // F2 deep-check hooks added AFTER the subsystems they probe boot.
+    // (See registrations further down in main once `channel`, etc.
+    // exist.)
 
     // Register the shutdown phases in canonical order. Server stop is
     // wired below once `server` exists.
@@ -272,6 +298,8 @@ pub fn main() !void {
     try stmt_table.prepareAll(db);
     try writer.start();
     defer writer.stop();
+    // F2: writer-channel health probe.
+    try health.addHook("storage_writer", writerReadyHook, @ptrCast(&channel));
 
     // Relay's admin queries reuse the writer connection — they are
     // rare, admin-bound, and synchronous (good enough for Phase 5).
@@ -331,6 +359,8 @@ pub fn main() !void {
     };
     defer relay.firehose_consumer.stop(gpa_allocator);
     log_ptr.info("boot", "relay firehose consumer started (dedicated db handle)");
+    // F2: probe.
+    try health.addHook("relay_firehose_consumer", relayConsumerReadyHook, null);
 
     // W5.2 + W6: install the relay's AP-inbox hook. Fires after
     // every accepted AP activity; the relay translates it into a
@@ -410,6 +440,8 @@ pub fn main() !void {
     }
 
     try shutdown.addPhase("flush_ap_outbox", flushApOutboxPhase, null);
+    // F2: probe the outbox worker.
+    try health.addHook("ap_outbox_worker", apOutboxReadyHook, null);
 
     // ── AT Protocol PDS wiring (Phase 4b) ──────────────────────────
     var atp_workers: core.workers.Pool(8) = undefined;

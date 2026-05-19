@@ -243,11 +243,14 @@ _Last refreshed: 2026-05-19._
       consumer + AP outbox worker before exit. Zero panics, zero
       half-written rows.
 
-- [ ] **F2. Health route deep-checks.**
-      Acceptance: `/healthz` returns 200 on quick liveness;
-      `/readyz` exercises DB writer, AP outbox worker, firehose
-      consumer, and TLS cert validity (expiry within N days fails
-      ready). Failure modes are visible in the response body.
+- [~] **F2. Health route deep-checks.**
+      `/readyz` now lists each registered hook with its status
+      (`ready` / `not_ready`) so operators see which subsystem is
+      blocking. Hooks wired: `process`, `storage_writer` (probes
+      `Channel.closed`), `ap_outbox_worker` (probes
+      `state.outbox.running`), `relay_firehose_consumer` (probes
+      `firehose_consumer.current()`). TLS cert expiry probe is the
+      one remaining sub-item (needs cert chain introspection).
 
 - [ ] **F3. Config from a single file (TOML or JSON) in addition to env.**
       Acceptance: `--config /etc/speedy-socials/config.toml` is

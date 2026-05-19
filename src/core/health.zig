@@ -103,10 +103,28 @@ fn readyzHandler(hc: *HandlerContext) anyerror!void {
         return;
     };
     const health: *Health = @ptrCast(@alignCast(ud));
-    if (health.isReady()) {
-        try hc.response.simple(.ok, "text/plain", "ready\n");
+    if (health.shutdown.isRequested()) {
+        try hc.response.simple(.service_unavailable, "text/plain", "not ready: shutdown requested\n");
+        return;
+    }
+    // F2: surface every hook + status so operators see which subsystem
+    // is the blocker. Bounded by the per-route response buffer.
+    var body_buf: [1024]u8 = undefined;
+    var w: usize = 0;
+    var any_not_ready = false;
+    var i: u8 = 0;
+    while (i < health.hook_count) : (i += 1) {
+        const h: *const Hook = &health.hooks[i];
+        const st = h.func(h.userdata);
+        if (st == .not_ready) any_not_ready = true;
+        const status_str: []const u8 = if (st == .ready) "ready" else "not_ready";
+        const line = std.fmt.bufPrint(body_buf[w..], "{s}: {s}\n", .{ h.name(), status_str }) catch break;
+        w += line.len;
+    }
+    if (any_not_ready) {
+        try hc.response.simple(.service_unavailable, "text/plain", body_buf[0..w]);
     } else {
-        try hc.response.simple(.service_unavailable, "text/plain", "not ready\n");
+        try hc.response.simple(.ok, "text/plain", body_buf[0..w]);
     }
 }
 
