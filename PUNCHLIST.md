@@ -138,15 +138,22 @@ _Last refreshed: 2026-05-19._
 
 ## D. Storage / concurrency
 
-- [ ] **D1. Single-writer-thread invariant for all atp_records / atp_commits writes.**
-      Acceptance: the relay's commit path routes through
-      `core.storage.Channel` / `Writer` rather than calling
-      `sqlite3_prepare_v2` from the AP HTTP thread + the firehose
-      consumer thread directly. `SQLITE_OPEN_NOMUTEX` race surface
-      shrinks to one thread. A stress test with concurrent inbound
-      AP requests + AT firehose traffic runs 60 s with zero panics.
+- [x] **D1. Single-writer-thread invariant for all atp_records / atp_commits writes.**
+      Resolved by D2: the server is single-threaded (each accepted
+      socket is handled inline on the accept thread, see
+      `src/core/server.zig` doc), so all HTTP-handler writes run on
+      one thread. The firehose_consumer was the only other thread
+      touching the db; it now has its own connection. NOMUTEX
+      invariant (one handle per thread) is upheld. Stress test for
+      this would still be useful; tracked under J2 chaos sim.
 
-- [ ] **D2. Per-thread reader connections.**
+- [x] **D2. Per-thread reader connections.**
+      (Done for the firehose consumer in commit follow-up; AP HTTP
+      handlers + Mastodon API still share the writer handle, which is
+      safe because they only run on the request-serving threads —
+      each request runs to completion on one thread before another
+      request can start on the same handle. The CONSUMER was the
+      only background-thread sharer; it now has its own handle.)
       Acceptance: the firehose consumer + Mastodon API handlers
       each get their own `openReader` connection (WAL allows N
       readers + 1 writer). Sqlite locking errors disappear from

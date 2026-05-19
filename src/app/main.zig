@@ -305,14 +305,29 @@ pub fn main() !void {
         }
     }
 
-    _ = relay.firehose_consumer.start(gpa_allocator, db, real_clock.clock(), "speedy-socials.local") catch |err| blk: {
+    // D1/D2: open a *separate* sqlite connection for the firehose
+    // consumer thread. Sqlite is opened with SQLITE_OPEN_NOMUTEX so
+    // a single handle is not safe across threads; each long-lived
+    // thread that touches the db needs its own handle. WAL mode +
+    // busy_timeout makes the rare concurrent writes between this
+    // thread and the HTTP handler thread cleanly serialize.
+    const consumer_db = core.storage.sqlite.openWriter(db_path) catch |err| blk: {
+        log_ptr.record(.warn, "boot", "relay consumer db open failed (using shared handle as fallback)", &.{
+            .{ .k = "err", .v = @errorName(err) },
+        });
+        break :blk db;
+    };
+    const consumer_db_owned = consumer_db != db;
+    defer if (consumer_db_owned) core.storage.sqlite.closeDb(consumer_db);
+
+    _ = relay.firehose_consumer.start(gpa_allocator, consumer_db, real_clock.clock(), "speedy-socials.local") catch |err| blk: {
         log_ptr.record(.warn, "boot", "relay firehose consumer failed to start", &.{
             .{ .k = "err", .v = @errorName(err) },
         });
         break :blk null;
     };
     defer relay.firehose_consumer.stop(gpa_allocator);
-    log_ptr.info("boot", "relay firehose consumer started");
+    log_ptr.info("boot", "relay firehose consumer started (dedicated db handle)");
 
     // W5.2 + W6: install the relay's AP-inbox hook. Fires after
     // every accepted AP activity; the relay translates it into a

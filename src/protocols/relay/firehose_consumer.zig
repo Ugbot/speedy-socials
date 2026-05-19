@@ -143,6 +143,14 @@ pub const Consumer = struct {
 
 /// Spawn the consumer. Idempotent — calling twice returns the
 /// already-installed instance.
+///
+/// D1/D2: the consumer uses its OWN sqlite handle (passed in by
+/// the composition root), not the writer-thread's handle. Sqlite
+/// connections opened with `SQLITE_OPEN_NOMUTEX` must not be
+/// shared across threads, so each long-lived consumer thread gets
+/// its own. File-level WAL locking + `busy_timeout` serialize the
+/// rare concurrent writes between this thread and the main
+/// HTTP-handler thread cleanly.
 pub fn start(
     allocator: std.mem.Allocator,
     db: *c.sqlite3,
