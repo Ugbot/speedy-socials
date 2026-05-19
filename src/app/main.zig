@@ -174,6 +174,18 @@ fn atDidFetchClosure(url: []const u8, out: []u8) core.errors.AtpError!usize {
 }
 
 pub fn main() !void {
+    // F3: optional config file. Loaded FIRST so existing env-driven
+    // boot logic picks up file-supplied values; pre-existing env
+    // vars override the file (file is the floor).
+    if (std.c.getenv("CONFIG_PATH")) |env_c| {
+        const path = std.mem.sliceTo(env_c, 0);
+        if (path.len > 0) {
+            core.config.loadFromFile(path) catch |err| {
+                std.debug.print("config: failed to load {s}: {s}\n", .{ path, @errorName(err) });
+            };
+        }
+    }
+
     // GPA only exists during boot, for the big static pool allocation.
     // After `serve()` starts, no further allocations occur on the hot
     // path. We do not pass `allocator` past this function.

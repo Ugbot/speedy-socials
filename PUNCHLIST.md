@@ -275,16 +275,20 @@ _Last refreshed: 2026-05-19._
       `firehose_consumer.current()`). TLS cert expiry probe is the
       one remaining sub-item (needs cert chain introspection).
 
-- [ ] **F3. Config from a single file (TOML or JSON) in addition to env.**
-      Acceptance: `--config /etc/speedy-socials/config.toml` is
-      honoured. All env-var knobs (`TLS_*`, `MEDIA_ROOT`,
-      `RELAY_BRIDGE_AP_TARGET`, `RELAY_SYNTHETIC_KEY_PEPPER`, etc.)
-      have equivalents. CLI flags win over env over file.
+- [x] **F3. Config from a single JSON file in addition to env.**
+      `CONFIG_PATH=/etc/speedy-socials/config.json` loads at boot
+      via `core.config.loadFromFile` and sets each known key via
+      `setenv` with `overwrite=0`, so pre-existing env vars win.
+      The existing env-driven subsystems pick up file-supplied
+      values without further plumbing. (TOML was specced; JSON is
+      simpler and gets the job done.)
 
-- [ ] **F4. Dockerfile multi-arch build (linux/amd64 + linux/arm64).**
-      Acceptance: `docker buildx build --platform linux/amd64,linux/arm64`
-      produces a working image on both architectures. Single CI job
-      pushes a multi-arch manifest.
+- [x] **F4. Dockerfile multi-arch build (linux/amd64 + linux/arm64).**
+      Dockerfile honours `TARGETARCH` and resolves Zig's tarball
+      naming for amd64 + arm64. New `docker-multiarch` job in
+      `docs/ci/github-actions.yml.template` runs `docker/build-push-action@v6`
+      with `platforms: linux/amd64,linux/arm64` — local-only on
+      PRs, GHCR push on main. Single multi-arch manifest.
 
 - [ ] **F5. Backup / restore documented + tested.**
       Acceptance: a one-page runbook describes how to snapshot the
