@@ -76,26 +76,30 @@ _Last refreshed: 2026-05-19._
 
 ## B. Follower / fanout model
 
-- [ ] **B1. Per-synthetic-actor follower table.**
-      Acceptance: a `relay_followers` table maps
-      `(synthetic_actor, follower_inbox, shared_inbox)`. Seeded via
-      AP `Follow` activities landing in the inbox for synthetic
-      actors (no admin route needed for the happy path).
+- [x] **B1. Per-synthetic-actor follower table.**
+      Schema migration 3004 + `relay.followers` module. AP Follow
+      arriving at the inbox writes a row keyed by (actor_url,
+      follower_inbox). Heuristic-derived follower inbox URL
+      (`<actor>/inbox`) — real Mastodon delivery uses the same
+      convention. Full peer-actor-fetch is a C-tier follow-up.
 
-- [ ] **B2. AT→AP fanout uses the follower table, not a single env target.**
-      Acceptance: when N AP peers follow a synthetic actor, one AT
-      commit produces N `ap_federation_outbox` rows. The
-      `RELAY_BRIDGE_AP_TARGET` env knob becomes a *fallback* (or is
-      removed entirely with a deprecation notice).
+- [x] **B2. AT→AP fanout uses the follower table, not a single env target.**
+      The firehose consumer now queries `relay.followers.list` for
+      the originating synthetic actor and enqueues one
+      `ap_federation_outbox` row per follower. The
+      `RELAY_BRIDGE_AP_TARGET` env knob is retained as a bootstrap
+      fallback (documented in the doc-comment).
 
-- [ ] **B3. Admin route `/relay/followers` to inspect + force-seed.**
-      Acceptance: `GET /relay/followers?actor=<synth>` lists the
-      follower set. `POST /relay/followers` (admin auth) injects an
-      entry for test or migration scenarios.
+- [x] **B3. Admin route `/admin/relay/followers` to inspect + force-seed.**
+      GET lists; POST injects (admin auth via `X-Relay-Admin: 1`,
+      same shape as the existing relay admin routes).
 
 - [ ] **B4. Unfollow propagation.**
-      Acceptance: AP `Undo{Follow}` removes the follower row;
-      subsequent AT commits do not deliver to that inbox.
+      Partially staged: `followers.removeByFollowIri` exists +
+      tested. Blocked on the AP parser supporting
+      `ActivityType.undo` — Undo activities currently fail to parse
+      and never reach the relay hook. Track as a small AP-parser
+      extension.
 
 - [ ] **B5. Outbox depth → consumer backpressure feedback.**
       Acceptance: when `ap_federation_outbox` row count exceeds a

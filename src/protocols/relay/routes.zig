@@ -28,6 +28,7 @@ const State = @import("state.zig");
 const identity_map = @import("identity_map.zig");
 const synthetic_keys = @import("synthetic_keys.zig");
 const ap_to_at_mod = @import("ap_to_at.zig");
+const followers_mod = @import("followers.zig");
 const activitypub = @import("protocol_activitypub");
 
 const max_response_bytes: usize = 8 * 1024;
@@ -325,6 +326,109 @@ fn makeUsername(did: []const u8, out: []u8) []const u8 {
     return out[0..n];
 }
 
+// ── B3: follower admin routes ────────────────────────────────────────
+
+fn handleListFollowers(hc: *HandlerContext) anyerror!void {
+    if (!requireAdmin(hc)) return writeJson(hc, .forbidden, "{\"error\":\"admin auth required\"}");
+    const state = State.get();
+    const db = state.reader_db orelse return writeJson(hc, .service_unavailable, "{\"error\":\"db not ready\"}");
+    const q = hc.request.pathAndQuery().query;
+    const actor = queryParam(q, "actor") orelse return writeJson(hc, .bad_request, "{\"error\":\"missing actor\"}");
+
+    var rows: [64]followers_mod.Follower = undefined;
+    const n = followers_mod.list(db, actor, &rows) catch return writeJson(hc, .internal, "{\"error\":\"list failed\"}");
+
+    var body_buf: [max_response_bytes]u8 = undefined;
+    var w: usize = 0;
+    body_buf[w] = '['; w += 1;
+    var i: u32 = 0;
+    while (i < n) : (i += 1) {
+        if (i > 0) {
+            if (w + 1 > body_buf.len) return writeJson(hc, .internal, "{\"error\":\"buf\"}");
+            body_buf[w] = ',';
+            w += 1;
+        }
+        const f = &rows[i];
+        const written = std.fmt.bufPrint(body_buf[w..], "{{\"inbox\":\"{s}\",\"shared_inbox\":\"{s}\"}}", .{ f.inbox(), f.sharedInbox() }) catch return writeJson(hc, .internal, "{\"error\":\"fmt\"}");
+        w += written.len;
+    }
+    if (w + 1 > body_buf.len) return writeJson(hc, .internal, "{\"error\":\"buf2\"}");
+    body_buf[w] = ']';
+    w += 1;
+    try writeJson(hc, .ok, body_buf[0..w]);
+}
+
+fn handleAddFollower(hc: *HandlerContext) anyerror!void {
+    if (!requireAdmin(hc)) return writeJson(hc, .forbidden, "{\"error\":\"admin auth required\"}");
+    const state = State.get();
+    const db = state.reader_db orelse return writeJson(hc, .service_unavailable, "{\"error\":\"db not ready\"}");
+
+    // JSON body: {"actor":"...", "inbox":"...", "shared_inbox":"...", "follow_iri":"..."}
+    var actor_url: []const u8 = "";
+    var inbox: []const u8 = "";
+    var shared: []const u8 = "";
+    var follow_iri: []const u8 = "";
+    parseFourStringFields(hc.request.body, "actor", &actor_url, "inbox", &inbox, "shared_inbox", &shared, "follow_iri", &follow_iri) catch {
+        return writeJson(hc, .bad_request, "{\"error\":\"malformed body\"}");
+    };
+    if (actor_url.len == 0 or inbox.len == 0) {
+        return writeJson(hc, .bad_request, "{\"error\":\"missing actor or inbox\"}");
+    }
+    // If no follow_iri provided, mint one tagging this as an admin
+    // injection so audit traces show it.
+    var iri_buf: [128]u8 = undefined;
+    const final_iri = if (follow_iri.len > 0) follow_iri else (std.fmt.bufPrint(&iri_buf, "admin:{d}", .{state.clock.wallUnix()}) catch return writeJson(hc, .internal, "{\"error\":\"iri\"}"));
+
+    followers_mod.add(db, state.clock, actor_url, inbox, shared, final_iri) catch {
+        return writeJson(hc, .internal, "{\"error\":\"add failed\"}");
+    };
+    try writeJson(hc, .ok, "{\"status\":\"ok\"}");
+}
+
+fn queryParam(query: []const u8, name: []const u8) ?[]const u8 {
+    var i: usize = 0;
+    while (i < query.len) {
+        const eq = std.mem.indexOfScalarPos(u8, query, i, '=') orelse return null;
+        const amp = std.mem.indexOfScalarPos(u8, query, eq, '&') orelse query.len;
+        if (eq - i == name.len and std.mem.eql(u8, query[i..eq], name)) {
+            return query[eq + 1 .. amp];
+        }
+        if (amp >= query.len) return null;
+        i = amp + 1;
+    }
+    return null;
+}
+
+fn parseFourStringFields(
+    body: []const u8,
+    k1: []const u8, v1: *[]const u8,
+    k2: []const u8, v2: *[]const u8,
+    k3: []const u8, v3: *[]const u8,
+    k4: []const u8, v4: *[]const u8,
+) !void {
+    var i: usize = 0;
+    while (i < body.len) {
+        const k_start = std.mem.indexOfScalarPos(u8, body, i, '"') orelse return;
+        const k_end = std.mem.indexOfScalarPos(u8, body, k_start + 1, '"') orelse return error.Malformed;
+        const key = body[k_start + 1 .. k_end];
+        var j = k_end + 1;
+        while (j < body.len and (body[j] == ' ' or body[j] == ':' or body[j] == '\t')) j += 1;
+        if (j >= body.len or body[j] != '"') {
+            i = j;
+            continue;
+        }
+        const v_start = j + 1;
+        var v_end = v_start;
+        while (v_end < body.len and body[v_end] != '"') v_end += 1;
+        if (v_end >= body.len) return error.Malformed;
+        if (std.mem.eql(u8, key, k1)) v1.* = body[v_start..v_end];
+        if (std.mem.eql(u8, key, k2)) v2.* = body[v_start..v_end];
+        if (std.mem.eql(u8, key, k3)) v3.* = body[v_start..v_end];
+        if (std.mem.eql(u8, key, k4)) v4.* = body[v_start..v_end];
+        i = v_end + 1;
+    }
+}
+
 // ── Registration ───────────────────────────────────────────────────────
 
 pub fn register(router: *Router, plugin_index: u16) !void {
@@ -332,6 +436,9 @@ pub fn register(router: *Router, plugin_index: u16) !void {
     try router.register(.delete, "/admin/relay/subscribe/:id", handleUnsubscribe, plugin_index);
     try router.register(.get, "/admin/relay/subscriptions", handleListSubscriptions, plugin_index);
     try router.register(.get, "/admin/relay/log", handleListLog, plugin_index);
+    // B3: follower admin.
+    try router.register(.get, "/admin/relay/followers", handleListFollowers, plugin_index);
+    try router.register(.post, "/admin/relay/followers", handleAddFollower, plugin_index);
     // A1: synthetic AP actor — strict-verifying peers fetch this to
     // pick up the public key for signature verification.
     try router.register(.get, "/ap/users/:synth", handleSyntheticActor, plugin_index);

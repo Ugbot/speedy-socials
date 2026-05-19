@@ -42,12 +42,19 @@ const plugin = @import("plugin.zig");
 const state = @import("state.zig");
 const subscription = @import("subscription.zig");
 
-/// W6: optional AP inbox URL to deliver translated AT events to. When
-/// set (typically via `RELAY_BRIDGE_AP_TARGET` env at boot), every
-/// successful AT→AP translation enqueues a row in `ap_federation_outbox`
-/// addressed at this inbox. When unset, the consumer still translates
-/// + logs but does not deliver. Bounded to 512 bytes; longer URLs are
-/// rejected at setBridgeTargetInbox.
+/// W6 + B2: AT→AP delivery targets.
+///
+/// The consumer fans out a translated activity to:
+///   1. Every row in `relay_followers` for the originating synthetic
+///      AP actor (B2 follower-table fanout — the normal production
+///      path).
+///   2. The single env-configured `bridge_target_inbox` URL if set,
+///      regardless of follower table state (a debug / pre-production
+///      knob, useful for sending every translated event to one peer
+///      while bootstrapping follower data).
+///
+/// When neither produces a recipient, the consumer translates + logs
+/// without delivering.
 var bridge_target_inbox_buf: [512]u8 = undefined;
 var bridge_target_inbox_len: u16 = 0;
 
@@ -319,14 +326,29 @@ fn processItem(self: *Consumer, item: *const QueueItem) !void {
         };
         _ = self.stats.translated_ok.fetchAdd(1, .monotonic);
 
-        // W6: deliver the translated activity to the configured AP
-        // bridge target inbox (if set). Failure to enqueue is logged
-        // but not fatal — the translation itself is recorded in
-        // `relay_translation_log` either way.
+        // B2: follower-table fanout. Look up everyone following the
+        // originating synthetic actor and enqueue one outbox row per
+        // follower. Bounded at 64 followers per activity for now
+        // (matches `activitypub.delivery.max_recipients_per_activity`);
+        // a future enhancement chunks larger sets into multiple
+        // enqueue calls.
+        var followers_buf: [64]@import("followers.zig").Follower = undefined;
+        const n_followers = @import("followers.zig").list(self.db, out.actor, &followers_buf) catch |err| blk: {
+            std.log.warn("relay consumer: followers.list failed: {s}", .{@errorName(err)});
+            break :blk 0;
+        };
+        for (followers_buf[0..n_followers]) |f| {
+            enqueueApDelivery(self.db, self.clock, &arena, out, f.inbox()) catch |err| {
+                std.log.warn("relay consumer: enqueueApDelivery (follower) failed: {s}", .{@errorName(err)});
+            };
+        }
+
+        // W6 fallback: deliver to the env-configured single inbox.
+        // Useful during bootstrap when no follower rows exist yet.
         const target = bridgeTargetInbox();
         if (target.len > 0) {
             enqueueApDelivery(self.db, self.clock, &arena, out, target) catch |err| {
-                std.log.warn("relay consumer: enqueueApDelivery failed: {s}", .{@errorName(err)});
+                std.log.warn("relay consumer: enqueueApDelivery (env target) failed: {s}", .{@errorName(err)});
             };
         }
     }

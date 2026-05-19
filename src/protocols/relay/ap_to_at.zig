@@ -34,6 +34,7 @@ const ActivityType = activitypub.activity.ActivityType;
 const identity_map = @import("identity_map.zig");
 const subscription = @import("subscription.zig");
 const synthetic_keys = @import("synthetic_keys.zig");
+const followers_mod = @import("followers.zig");
 const Arena = core.arena.Arena;
 
 const RelayError = core.errors.RelayError;
@@ -130,6 +131,28 @@ fn onActivityReceivedImpl(act: *const Activity, raw_body: []const u8, db: *c.sql
     if (isDelete(act)) {
         try processDelete(act, db, clock, did, &arena);
         return;
+    }
+
+    // B1: Follow targeting a synthetic AP actor — record the peer as
+    // a follower so the AT→AP fanout reaches them when the bridged
+    // actor posts. `act.object_id` is the followed actor URL (one of
+    // our synthetic IDs); `act.actor` is the AP peer. We heuristically
+    // derive the peer's inbox as `<actor>/inbox` — this matches
+    // Mastodon convention. A future C-tier feature is to fetch the
+    // peer's actor doc to discover the real inbox / sharedInbox.
+    if (act.activity_type == .follow and act.object_id.len > 0) {
+        // Derive `<follower>/inbox`. Bounded buffer.
+        var inbox_buf: [followers_mod.max_inbox_url_bytes]u8 = undefined;
+        if (act.actor.len + "/inbox".len <= inbox_buf.len) {
+            @memcpy(inbox_buf[0..act.actor.len], act.actor);
+            @memcpy(inbox_buf[act.actor.len..][0.."/inbox".len], "/inbox");
+            const inbox_slice = inbox_buf[0 .. act.actor.len + "/inbox".len];
+            followers_mod.add(db, clock, act.object_id, inbox_slice, "", act.id) catch |err| {
+                std.log.warn("relay followers.add failed: {s}", .{@errorName(err)});
+            };
+        }
+        // Fall through to the AT-side record commit so the bridge
+        // still produces an `app.bsky.graph.follow` row.
     }
 
     // Mint the synthetic Ed25519 signing key for this DID (deterministic

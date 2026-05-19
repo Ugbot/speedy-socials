@@ -79,8 +79,34 @@ pub const translation_log_migration: Migration = .{
     .down = "DROP TABLE relay_translation_log;",
 };
 
+/// B1: per-synthetic-actor follower table. Populated by inbound AP
+/// `Follow` activities targeting a bridge-owned actor and drained by
+/// AP `Undo{Follow}` activities. The AT→AP firehose consumer reads
+/// this table to fan out a translated activity to every known
+/// follower of the originating synthetic actor.
+pub const followers_migration: Migration = .{
+    .id = 3004,
+    .name = "relay:followers",
+    .up =
+    \\CREATE TABLE IF NOT EXISTS relay_followers (
+    \\    actor_url      TEXT NOT NULL,
+    \\    follower_inbox TEXT NOT NULL,
+    \\    shared_inbox   TEXT,
+    \\    follow_iri     TEXT NOT NULL,
+    \\    created_at     INTEGER NOT NULL,
+    \\    PRIMARY KEY (actor_url, follower_inbox)
+    \\) STRICT;
+    \\CREATE INDEX IF NOT EXISTS relay_followers_actor_idx
+    \\    ON relay_followers (actor_url);
+    \\CREATE INDEX IF NOT EXISTS relay_followers_follow_iri_idx
+    \\    ON relay_followers (follow_iri);
+    ,
+    .down = "DROP TABLE relay_followers;",
+};
+
 pub const all_migrations = [_]Migration{
     identity_map_migration,
     subscriptions_migration,
     translation_log_migration,
+    followers_migration,
 };
