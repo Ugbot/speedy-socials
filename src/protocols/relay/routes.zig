@@ -25,6 +25,10 @@ const Method = core.http.request.Method;
 
 const sub = @import("subscription.zig");
 const State = @import("state.zig");
+const identity_map = @import("identity_map.zig");
+const synthetic_keys = @import("synthetic_keys.zig");
+const ap_to_at_mod = @import("ap_to_at.zig");
+const activitypub = @import("protocol_activitypub");
 
 const max_response_bytes: usize = 8 * 1024;
 
@@ -205,6 +209,122 @@ fn parseTwoStringFields(
     }
 }
 
+// ── A1: synthetic AP actor route ─────────────────────────────────────
+//
+// Serves an ActivityStreams Person document for an AT-origin actor
+// the relay synthesizes onto the AP side. The synthetic actor URL is
+// `https://<host>/ap/users/at:<did-tail>` (see
+// `identity_map.syntheticActorForDid`). Strict-verifying peers fetch
+// this URL after seeing a signed delivery from the bridge; the
+// `publicKey.publicKeyPem` they pick up must validate the Ed25519
+// signature `core.crypto.openssl.rsaSign…` no — Ed25519 from
+// `keypair.Ed25519KeyPair.sign` produced by
+// `synthetic_keys.deriveKeypair(actor_url)`.
+
+const Arena = core.arena.Arena;
+
+fn writeJsonLd(hc: *HandlerContext, status: Status, body: []const u8) !void {
+    try hc.response.startStatus(status);
+    try hc.response.header("Content-Type", "application/activity+json; charset=utf-8");
+    try hc.response.headerFmt("Content-Length", "{d}", .{body.len});
+    try hc.response.header("Connection", "close");
+    try hc.response.finishHeaders();
+    try hc.response.body(body);
+}
+
+fn handleSyntheticActor(hc: *HandlerContext) anyerror!void {
+    // `:synth` is the path segment AFTER `/ap/users/`. The relay's
+    // `identity_map.syntheticActorForDid` mints this segment as
+    // `at:<did-tail>`. We accept both the raw segment and the
+    // `at:`-prefixed form for forgiveness; reject anything that
+    // doesn't reconstruct to a known mapping.
+    const synth = hc.params.get("synth") orelse {
+        return writeJson(hc, .bad_request, "{\"error\":\"missing synth\"}");
+    };
+    const state = State.get();
+    const db = state.reader_db orelse {
+        return writeJson(hc, .service_unavailable, "{\"error\":\"db not ready\"}");
+    };
+
+    // Reconstruct the full synthetic actor URL.
+    var actor_url_buf: [identity_map.max_actor_url_bytes]u8 = undefined;
+    const host = ap_to_at_mod.relayHostPublic();
+    if (host.len == 0) return writeJson(hc, .service_unavailable, "{\"error\":\"relay host unset\"}");
+    const actor_url = std.fmt.bufPrint(
+        &actor_url_buf,
+        "https://{s}/ap/users/{s}",
+        .{ host, synth },
+    ) catch return writeJson(hc, .internal, "{\"error\":\"buf\"}");
+
+    // Look up the AT DID this synthetic actor maps to. If the row is
+    // missing this is a 404 — we don't mint identities here, only
+    // serve ones the bridge has already minted via inbound traffic.
+    var arena_buf: [4 * 1024]u8 = undefined;
+    var arena = Arena.init(&arena_buf);
+    const did = identity_map.didForActor(db, actor_url, &arena) catch null;
+    if (did == null) return writeJson(hc, .not_found, "{\"error\":\"unknown synthetic actor\"}");
+
+    // Derive the Ed25519 keypair from the same identity the bridge
+    // uses when signing federation deliveries.
+    const kp = synthetic_keys.deriveKeypair(actor_url);
+
+    // Encode the Ed25519 public key as a PEM SPKI block.
+    var pem_buf: [256]u8 = undefined;
+    const pem_n = activitypub.keys.writeEd25519PublicPem(kp.public_key, &pem_buf) catch {
+        return writeJson(hc, .internal, "{\"error\":\"pem\"}");
+    };
+
+    // The shared inbox is the local host's `/inbox` — same one the
+    // AP plugin already serves for non-synthetic actors.
+    var shared_inbox_buf: [256]u8 = undefined;
+    const shared_inbox = std.fmt.bufPrint(
+        &shared_inbox_buf,
+        "https://{s}/inbox",
+        .{host},
+    ) catch return writeJson(hc, .internal, "{\"error\":\"buf2\"}");
+
+    // `preferredUsername` from the AT DID's identifier portion.
+    // Keep it ASCII-safe — Mastodon uses this as the @handle.
+    var uname_buf: [64]u8 = undefined;
+    const uname = makeUsername(did.?, &uname_buf);
+
+    var body_buf: [max_response_bytes]u8 = undefined;
+    const body = activitypub.actor.writeSyntheticPerson(.{
+        .actor_url = actor_url,
+        .preferred_username = uname,
+        .display_name = "",
+        .bio = "Bridged from atproto",
+        .public_key_pem = pem_buf[0..pem_n],
+        .shared_inbox_url = shared_inbox,
+    }, &body_buf) catch {
+        return writeJson(hc, .internal, "{\"error\":\"actor encode\"}");
+    };
+    try writeJsonLd(hc, .ok, body);
+}
+
+/// Best-effort handle extraction from an AT DID. `did:plc:abc123` →
+/// "abc123"; `did:web:example.com:user` → "user".
+fn makeUsername(did: []const u8, out: []u8) []const u8 {
+    var i: usize = did.len;
+    while (i > 0) {
+        i -= 1;
+        if (did[i] == ':') {
+            const tail = did[i + 1 ..];
+            const n = @min(tail.len, out.len);
+            for (tail[0..n], 0..) |ch, j| {
+                out[j] = switch (ch) {
+                    'a'...'z', 'A'...'Z', '0'...'9', '_', '-', '.' => ch,
+                    else => '_',
+                };
+            }
+            return out[0..n];
+        }
+    }
+    const n = @min(did.len, out.len);
+    @memcpy(out[0..n], did[0..n]);
+    return out[0..n];
+}
+
 // ── Registration ───────────────────────────────────────────────────────
 
 pub fn register(router: *Router, plugin_index: u16) !void {
@@ -212,6 +332,9 @@ pub fn register(router: *Router, plugin_index: u16) !void {
     try router.register(.delete, "/admin/relay/subscribe/:id", handleUnsubscribe, plugin_index);
     try router.register(.get, "/admin/relay/subscriptions", handleListSubscriptions, plugin_index);
     try router.register(.get, "/admin/relay/log", handleListLog, plugin_index);
+    // A1: synthetic AP actor — strict-verifying peers fetch this to
+    // pick up the public key for signature verification.
+    try router.register(.get, "/ap/users/:synth", handleSyntheticActor, plugin_index);
 }
 
 // ──────────────────────────────────────────────────────────────────────

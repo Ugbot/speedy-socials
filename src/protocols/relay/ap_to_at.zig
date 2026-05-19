@@ -53,6 +53,12 @@ fn relayHost() []const u8 {
     return relay_host_buf[0..relay_host_len];
 }
 
+/// Public accessor — other relay modules (`routes.zig` for A1) need
+/// the configured host to mint synthetic-actor URLs.
+pub fn relayHostPublic() []const u8 {
+    return relayHost();
+}
+
 /// Maps an AP `ActivityType` (plus, for Create, an inline object
 /// type) to its AT collection name. Returns null for activities the
 /// bridge does not translate today.

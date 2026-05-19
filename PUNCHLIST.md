@@ -15,7 +15,7 @@ _Last refreshed: 2026-05-19._
 
 ## A. Bridge correctness (load-bearing for the relay claim)
 
-- [ ] **A1. AP synthetic-actor key publication.**
+- [x] **A1. AP synthetic-actor key publication.**
       Acceptance: GET `https://<host>/ap/users/<synth>` returns an
       ActivityStreams Person with a `publicKey` block whose `id`
       matches the `key_id` stamped on `ap_federation_outbox` rows

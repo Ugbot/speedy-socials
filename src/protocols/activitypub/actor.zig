@@ -80,6 +80,62 @@ pub fn writePerson(cfg: Config, out: []u8) WriteError![]const u8 {
     return out[0..w];
 }
 
+/// Synthetic-actor variant (A1). Used by the protocol-relay to serve
+/// AS Person docs for bridged actors whose canonical URL is
+/// `<actor_url>` (e.g. `https://relay.example/ap/users/at:plc:abc`)
+/// — i.e. NOT the `<host>/users/<username>` shape of the local user
+/// table. Inbox / outbox / followers / following / shared-inbox URLs
+/// are derived by appending to `actor_url`; the shared-inbox URL is
+/// the local host's root `/inbox` (same shared inbox the AP plugin
+/// already serves).
+pub const SyntheticConfig = struct {
+    actor_url: []const u8,
+    preferred_username: []const u8,
+    display_name: []const u8 = "",
+    bio: []const u8 = "",
+    public_key_pem: []const u8 = "",
+    shared_inbox_url: []const u8,
+};
+
+pub fn writeSyntheticPerson(cfg: SyntheticConfig, out: []u8) WriteError![]const u8 {
+    var w: usize = 0;
+    w += try copy(out[w..],
+        "{\"@context\":[\"https://www.w3.org/ns/activitystreams\"," ++
+        "\"https://w3id.org/security/v1\"," ++
+        "{\"toot\":\"http://joinmastodon.org/ns#\"," ++
+        "\"discoverable\":\"toot:discoverable\"," ++
+        "\"indexable\":\"toot:indexable\"," ++
+        "\"manuallyApprovesFollowers\":\"as:manuallyApprovesFollowers\"}],");
+    w += try fmtInto(out[w..], "\"id\":\"{s}\",", .{cfg.actor_url});
+    w += try copy(out[w..], "\"type\":\"Person\",");
+    w += try fmtInto(out[w..], "\"preferredUsername\":\"{s}\",", .{cfg.preferred_username});
+    if (cfg.display_name.len > 0) {
+        w += try fmtInto(out[w..], "\"name\":\"{s}\",", .{cfg.display_name});
+    }
+    if (cfg.bio.len > 0) {
+        w += try fmtInto(out[w..], "\"summary\":\"{s}\",", .{cfg.bio});
+    }
+    w += try fmtInto(out[w..],
+        "\"inbox\":\"{s}/inbox\"," ++
+        "\"outbox\":\"{s}/outbox\"," ++
+        "\"followers\":\"{s}/followers\"," ++
+        "\"following\":\"{s}/following\"," ++
+        "\"endpoints\":{{\"sharedInbox\":\"{s}\"}},",
+        .{ cfg.actor_url, cfg.actor_url, cfg.actor_url, cfg.actor_url, cfg.shared_inbox_url });
+    // Bridge actors approve followers manually (we don't yet do
+    // auto-accept on Follow) and are discoverable by default.
+    w += try copy(out[w..], "\"manuallyApprovesFollowers\":false,");
+    w += try copy(out[w..], "\"discoverable\":true,");
+    w += try copy(out[w..], "\"indexable\":true,");
+    w += try fmtInto(out[w..],
+        "\"publicKey\":{{\"id\":\"{s}#main-key\"," ++
+        "\"owner\":\"{s}\",\"publicKeyPem\":\"",
+        .{ cfg.actor_url, cfg.actor_url });
+    w += try escapePem(out[w..], cfg.public_key_pem);
+    w += try copy(out[w..], "\"}}");
+    return out[0..w];
+}
+
 fn copy(dest: []u8, src: []const u8) WriteError!usize {
     if (src.len > dest.len) return error.BufferTooSmall;
     @memcpy(dest[0..src.len], src);

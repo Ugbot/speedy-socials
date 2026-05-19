@@ -110,3 +110,31 @@ test "deriveKeypair signs deterministically" {
     const s2 = kp2.sign(msg);
     try testing.expectEqualSlices(u8, &s1, &s2);
 }
+
+test "A1: published PEM + sign + verify round-trip" {
+    // The acceptance test for A1: a peer fetches the actor doc,
+    // pulls the public key PEM, and verifies a signature we made
+    // with the matching private key.
+    const activitypub = @import("protocol_activitypub");
+
+    const actor_url = "https://relay.example/ap/users/at:plc:alice";
+    const kp = deriveKeypair(actor_url);
+
+    var pem_buf: [256]u8 = undefined;
+    const pem_len = try activitypub.keys.writeEd25519PublicPem(kp.public_key, &pem_buf);
+    const pem = pem_buf[0..pem_len];
+
+    // The peer parses the PEM and extracts the raw public key. We
+    // reuse the AP keys' parser surface here.
+    const kid = try activitypub.keys.KeyId.fromSlice("https://relay.example/ap/users/at:plc:alice#main-key");
+    const parsed = try activitypub.keys.parsePublicKeyPem(pem, kid);
+    try testing.expect(parsed.algo == .ed25519);
+    try testing.expectEqualSlices(u8, &kp.public_key, &parsed.ed25519Bytes());
+
+    // Sign a payload + verify it parses through the same key the
+    // peer extracted. This is what `sig.verify` does internally on
+    // an inbound delivery.
+    const msg = "POST /inbox\nhost: peer.example\ndigest: sha-256=...";
+    const sig = kp.sign(msg);
+    try testing.expect(@import("protocol_atproto").keypair.verifyEd25519(msg, sig, parsed.ed25519Bytes()));
+}
