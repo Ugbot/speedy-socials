@@ -39,6 +39,7 @@ const request_mod = @import("http/request.zig");
 const response = @import("http/response.zig");
 const router_mod = @import("http/router.zig");
 const metrics_mod = @import("metrics.zig");
+const log_mod = @import("log.zig");
 
 /// Monotonic nanosecond timestamp. Std's `nanoTimestamp` was removed
 /// in Zig 0.16; use clock_gettime(CLOCK_MONOTONIC) directly. Returns
@@ -365,6 +366,21 @@ pub const Server = struct {
                 const dur_ns: i64 = if (t1_ns > t0_ns) t1_ns - t0_ns else 0;
                 const dur_s: f64 = @as(f64, @floatFromInt(dur_ns)) / @as(f64, std.time.ns_per_s);
                 metrics_mod.observeRequestLatency(dur_s);
+
+                // E4: one structured ring-log line per request.
+                // Response builder doesn't currently retain the
+                // chosen status; emitting method+path+dur covers the
+                // load-bearing access-log fields. Status can be
+                // added once Builder tracks it.
+                if (log_mod.global()) |lg| {
+                    var dur_ms_buf: [16]u8 = undefined;
+                    const dur_ms = std.fmt.bufPrint(&dur_ms_buf, "{d}", .{@divTrunc(dur_ns, std.time.ns_per_ms)}) catch "?";
+                    lg.record(.info, "access", "request", &.{
+                        .{ .k = "method", .v = request.method_raw },
+                        .{ .k = "path", .v = path_query.path },
+                        .{ .k = "dur_ms", .v = dur_ms },
+                    });
+                }
             },
             .not_found => try rb.simple(.not_found, "text/plain", "not found"),
             .method_not_allowed => try rb.simple(.method_not_allowed, "text/plain", "method not allowed"),

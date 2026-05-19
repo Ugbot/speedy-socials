@@ -119,6 +119,24 @@ const ring_mask: u32 = ring_capacity - 1;
 /// receive it indirectly via `Context` (wired in a later phase) or via
 /// the package-level convenience functions in this module after
 /// `installGlobal()`.
+// ── Process-wide log singleton (E4) ────────────────────────────────
+//
+// `Log` instances are normally passed by pointer to the consumers
+// that emit. For cross-cutting instrumentation (access log,
+// structured warnings inside `core/server.zig`, etc.) it's awkward
+// to thread the pointer everywhere — so we expose a process-wide
+// global set once at boot.
+
+var global_log: ?*Log = null;
+
+pub fn setGlobal(log: *Log) void {
+    global_log = log;
+}
+
+pub fn global() ?*Log {
+    return global_log;
+}
+
 pub const Log = struct {
     lock: Spinlock = .{},
     /// Total entries published (monotonically increasing modulo u64).

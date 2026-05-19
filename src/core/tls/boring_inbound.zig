@@ -1,8 +1,15 @@
 //! Inbound TLS server backed by the system OpenSSL link (W3.1).
 //!
-//! Replaces the W1.1 `NativeInboundBackend` stub. Implements the
-//! `core.tls.TlsBackend` vtable so it slots into `core.server` without
-//! any caller-side churn:
+//! **Alternative inbound backend.** The default since W3.2 is
+//! `ianic_inbound` (pure-Zig TLS 1.3). This file is kept in tree as
+//! the FIPS-sensitive / TLS-1.2-server escape hatch: ianic is 1.3
+//! only on the server side, so deployments that must support 1.2
+//! clients can switch to this backend by editing the boot wiring in
+//! `src/app/main.zig`. Tests still run as part of `zig build test`
+//! to prevent silent bit-rot.
+//!
+//! Implements the `core.tls.TlsBackend` vtable so it slots into
+//! `core.server` without any caller-side churn:
 //!
 //!   * `wrap_stream` — accepts a raw TCP stream, drives the TLS server
 //!     handshake via `SSL_accept`, and (on success) stashes the `*SSL`

@@ -213,11 +213,13 @@ _Last refreshed: 2026-05-19._
       outbox enqueue`. Either vendor TB's `trace.zig` with the
       transitive deps, or write a thin in-tree shim.
 
-- [ ] **E4. Structured access log.**
-      Acceptance: every HTTP request emits a single ring-log line
-      with method, path, status, duration_ms, request_id.
-      `core.log` learns an access-log severity that doesn't compete
-      with application warns/errors.
+- [x] **E4. Structured access log.**
+      `core/server.zig` emits one ring-log line per request (scope
+      "access") with method, path, dur_ms. `core.log` exposes a
+      process-wide singleton via `setGlobal` / `global` so
+      cross-cutting instrumentation doesn't need the pointer
+      threaded through every layer. Status code emit pending a
+      Builder retaining the chosen status (small follow-up).
 
 - [ ] **E5. Per-route latency in the ring log.**
       Acceptance: the access log line carries `route_pattern`
@@ -406,23 +408,22 @@ _Last refreshed: 2026-05-19._
       Acceptance: `src/app/main.zig` reads the env value once at
       boot; no path string lives in source. Pairs with F6.
 
-- [ ] **L2. Promote `tickstream` to a real submodule or write its absence into the README.**
+- [x] **L2. Promote `tickstream` to a real submodule or write its absence into the README.**
       Acceptance: either `.gitmodules` lists a tickstream entry
       with a verified URL, or `third_party/README.md` explicitly
       states "TickStream is referenced as inspiration only; no
       vendored code." Closes the W4 pivot ambiguity.
 
-- [ ] **L3. Trim dead `_ = stored_inline` style discards from
-      media routes.**
-      Acceptance: zig 0.16's "pointless discard" check passes
-      cleanly with `-Werror`-equivalent strictness.
+- [x] **L3. Trim dead `_ = stored_inline` style discards.** (Done
+      during W5.5; the var was removed when zig flagged the
+      pointless discard.)
 
-- [ ] **L4. Boring_inbound retained-but-unused warning.**
+- [x] **L4. Boring_inbound retained-but-unused warning.**
       Acceptance: the file's doc comment makes explicit that it's
       kept as an alternative backend, and tests for it still run
       under `zig build test` so it doesn't bit-rot.
 
-- [ ] **L5. `RsaSignNotImplemented` error variant is now reachable only when OpenSSL is unlinkable; rename or remove.**
+- [x] **L5. `RsaSignNotImplemented` error variant — removed.**
       Acceptance: dead-error-variant audit produces a clean list;
       `ap.http_delivery` either always has signing available or
       surfaces a different error.

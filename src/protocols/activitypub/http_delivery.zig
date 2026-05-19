@@ -10,11 +10,9 @@
 //!   3. Reconstructs the signing string via `sig.buildSigningString` so
 //!      the signing layout is *identical* to what `sig.verify` checks
 //!      on the inbound side (round-trip parity).
-//!   4. Signs with Ed25519 (stdlib). RSA signing isn't supported — the
-//!      stdlib RSA module exposes verify-only; `core.crypto.rsa` only
-//!      verifies. Until a sign primitive lands the path returns
-//!      `RsaSignNotImplemented` which the dispatcher classifies as a
-//!      *permanent* failure (dead-letter).
+//!   4. Signs with Ed25519 (stdlib) or RSA-PKCS1v15-SHA256 (via the
+//!      OpenSSL link in `core.crypto.rsa.signPkcs1v15Sha256`). Both
+//!      paths land here; the dispatcher chooses on `key.algo`.
 //!   5. POSTs via `core.http_client.Client.sendSync` and classifies the
 //!      result:
 //!        * 2xx → success
@@ -46,11 +44,6 @@ pub const max_path_bytes: usize = 2048;
 pub const DeliveryError = error{
     UnknownKey,
     SignFailed,
-    /// Retained in the error set for ABI stability; W3.1 wired RSA
-    /// signing through the system OpenSSL link, so this variant is no
-    /// longer produced by `deliverInner`. Surface kept so existing
-    /// dispatch tables continue to compile.
-    RsaSignNotImplemented,
     BuildFailed,
     HttpFailed,
 };
@@ -255,7 +248,7 @@ pub fn deliver(
 ) outbox_worker.DeliveryResult {
     return deliverInner(client, db, now_unix, target_inbox, payload, key_id) catch |err| switch (err) {
         // Permanent: this delivery cannot succeed without operator action.
-        error.UnknownKey, error.RsaSignNotImplemented, error.SignFailed, error.BuildFailed => .permanent_failure,
+        error.UnknownKey, error.SignFailed, error.BuildFailed => .permanent_failure,
         // Transport problem: try again later.
         error.HttpFailed => .transient_failure,
     };

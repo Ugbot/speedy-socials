@@ -190,6 +190,9 @@ pub fn main() !void {
     const log_ptr = try allocator.create(core.log.Log);
     defer allocator.destroy(log_ptr);
     log_ptr.* = core.log.Log.init(real_clock.clock());
+    // E4: expose globally so core.server can emit access-log lines
+    // without threading the pointer through every layer.
+    core.log.setGlobal(log_ptr);
 
     // Seed + build hash + start time go in as the first entries.
     {
