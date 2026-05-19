@@ -336,6 +336,17 @@ pub fn main() !void {
         }
     }
 
+    // B5: outbox-depth backpressure cap. When `ap_federation_outbox`
+    // has more than this many pending rows the consumer pauses
+    // translation. Default unset = disabled.
+    if (std.c.getenv("RELAY_OUTBOX_BACKPRESSURE_CAP")) |cap_c| {
+        const s = std.mem.sliceTo(cap_c, 0);
+        if (std.fmt.parseInt(u64, s, 10)) |cap| {
+            relay.firehose_consumer.setOutboxBackpressureCap(cap);
+            log_ptr.info("boot", "relay consumer outbox backpressure cap configured");
+        } else |_| {}
+    }
+
     // D1/D2: open a *separate* sqlite connection for the firehose
     // consumer thread. Sqlite is opened with SQLITE_OPEN_NOMUTEX so
     // a single handle is not safe across threads; each long-lived
@@ -384,6 +395,18 @@ pub fn main() !void {
     // `alg=rsa-sha256` actually verify (Mastodon's default).
     activitypub.keys.setRsaVerifyHook(core.crypto.rsa.verifyPkcs1v15Sha256);
     log_ptr.info("boot", "rsa verify hook wired (core.crypto.rsa.verifyPkcs1v15Sha256)");
+
+    // G4: STRICT_HTTP_SIG=1 makes the AP inbox reject unverified
+    // activities. Default soft acceptance matches the historic
+    // behaviour; production deployments that federate with
+    // strict-verifying peers should set this.
+    if (std.c.getenv("STRICT_HTTP_SIG")) |envp| {
+        const v = std.mem.sliceTo(envp, 0);
+        if (v.len > 0 and (v[0] == '1' or v[0] == 't' or v[0] == 'T')) {
+            activitypub.state.setStrictHttpSig(true);
+            log_ptr.info("boot", "AP inbox strict HTTP-signature mode enabled");
+        }
+    }
 
     // Build the outbound HTTPS client. It shares a dedicated 4-thread
     // pool so federation fetches don't contend with inbox workers.
@@ -581,7 +604,18 @@ pub fn main() !void {
     }
 
     log_ptr.info("shutdown", "running phases");
-    if (shutdown.runPhases()) |first_err| {
+    // F1: SHUTDOWN_GRACE_MS (default 10s) is a soft budget. The
+    // phases run to completion; a warning fires when they overrun.
+    const grace_ms: u64 = blk: {
+        if (std.c.getenv("SHUTDOWN_GRACE_MS")) |envp| {
+            const s = std.mem.sliceTo(envp, 0);
+            if (std.fmt.parseInt(u64, s, 10)) |n| {
+                break :blk n;
+            } else |_| {}
+        }
+        break :blk 10_000;
+    };
+    if (shutdown.runPhasesWithBudget(grace_ms)) |first_err| {
         log_ptr.record(.err, "shutdown", "phase reported error", &.{
             .{ .k = "err", .v = @errorName(first_err) },
         });

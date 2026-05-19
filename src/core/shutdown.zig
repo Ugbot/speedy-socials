@@ -88,9 +88,20 @@ pub const Shutdown = struct {
     /// first error seen (still runs remaining phases). Re-entry is
     /// disallowed via the `ran` flag.
     pub fn runPhases(self: *Shutdown) ?anyerror {
+        return self.runPhasesWithBudget(0);
+    }
+
+    /// F1: same as `runPhases` but logs a warning when total elapsed
+    /// time exceeds `budget_ms`. Phases are NOT pre-empted (we don't
+    /// have an async runtime to inject cancellation). The budget is
+    /// reported via the ring log so operators can tune
+    /// `SHUTDOWN_GRACE_MS` if their drain consistently overruns.
+    /// `budget_ms = 0` disables the warning.
+    pub fn runPhasesWithBudget(self: *Shutdown, budget_ms: u64) ?anyerror {
         assert(!self.ran);
         self.ran = true;
         var first_err: ?anyerror = null;
+        const start = monoMs();
         var i: u8 = 0;
         while (i < self.phase_count) : (i += 1) {
             var p: *Phase = &self.phases[i];
@@ -100,6 +111,10 @@ pub const Shutdown = struct {
                 if (first_err == null) first_err = e;
             };
         }
+        const elapsed_ms = monoMs() -% start;
+        if (budget_ms > 0 and elapsed_ms > budget_ms) {
+            std.log.warn("shutdown phases exceeded grace budget: {d} ms > {d} ms", .{ elapsed_ms, budget_ms });
+        }
         return first_err;
     }
 
@@ -108,6 +123,15 @@ pub const Shutdown = struct {
         return &self.phases[idx];
     }
 };
+
+/// Monotonic milliseconds via clock_gettime(CLOCK_MONOTONIC). Zero on
+/// platforms without a working clock (unlikely on the supported set).
+fn monoMs() u64 {
+    var ts: std.c.timespec = undefined;
+    const rc = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts);
+    if (rc != 0) return 0;
+    return @as(u64, @intCast(ts.sec)) * 1000 + @as(u64, @intCast(@divTrunc(ts.nsec, 1_000_000)));
+}
 
 // ── Signal handlers ────────────────────────────────────────────────
 

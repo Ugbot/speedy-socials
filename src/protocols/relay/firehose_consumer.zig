@@ -67,6 +67,26 @@ pub fn setBridgeTargetInbox(url: []const u8) void {
     bridge_target_inbox_len = @intCast(url.len);
 }
 
+/// B5: outbox-depth backpressure cap. When `ap_federation_outbox`
+/// has more than this many pending rows, the consumer pauses pop +
+/// translate so it doesn't pile more work behind a stuck delivery
+/// worker. 0 = disabled (default).
+var outbox_backpressure_cap: u64 = 0;
+
+pub fn setOutboxBackpressureCap(cap: u64) void {
+    outbox_backpressure_cap = cap;
+}
+
+fn outboxOverloaded(db: *c.sqlite3) bool {
+    const cap = outbox_backpressure_cap;
+    if (cap == 0) return false;
+    var stmt: ?*c.sqlite3_stmt = null;
+    if (c.sqlite3_prepare_v2(db, "SELECT count(*) FROM ap_federation_outbox WHERE state='pending'", -1, &stmt, null) != c.SQLITE_OK) return false;
+    defer _ = c.sqlite3_finalize(stmt);
+    if (c.sqlite3_step(stmt.?) != c.SQLITE_ROW) return false;
+    return @as(u64, @intCast(c.sqlite3_column_int64(stmt, 0))) > cap;
+}
+
 fn bridgeTargetInbox() []const u8 {
     return bridge_target_inbox_buf[0..bridge_target_inbox_len];
 }
@@ -257,6 +277,14 @@ fn popBlocking(self: *Consumer) ?QueueItem {
     // costs ~500 wakeups/s in the idle case — negligible.
     while (true) {
         if (self.stop.load(.acquire)) return null;
+        // B5: when outbox is overloaded, sleep longer between
+        // attempts so we don't compete with the delivery worker
+        // for db locks. Items stay durable in atp_firehose_events
+        // so we don't lose data — we just slow down translation.
+        if (outboxOverloaded(self.db)) {
+            sleepNs(50 * std.time.ns_per_ms);
+            continue;
+        }
         while (self.lock.swap(true, .acquire)) std.atomic.spinLoopHint();
         if (self.ring.pop()) |item| {
             self.lock.store(false, .release);

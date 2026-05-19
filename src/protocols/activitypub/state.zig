@@ -98,6 +98,21 @@ pub fn setHostname(name: []const u8) void {
     instance.hostname_len = n;
 }
 
+/// G4: strict HTTP-signature mode. When `true` the AP inbox rejects
+/// activities whose signature cannot be verified (cavage header
+/// missing, key unresolvable, signature mismatch). Default `false`
+/// matches the historic "soft acceptance" behaviour documented in
+/// `PROTOCOL_AUDIT.md` AP-C2.
+var strict_http_sig: bool = false;
+
+pub fn setStrictHttpSig(enabled: bool) void {
+    strict_http_sig = enabled;
+}
+
+pub fn isStrictHttpSig() bool {
+    return strict_http_sig;
+}
+
 test "State get/reset cycle" {
     reset();
     const s = get();

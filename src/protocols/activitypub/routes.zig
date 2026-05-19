@@ -404,6 +404,11 @@ fn dispatchInbox(hc: *HandlerContext, st: *state_mod.State, db: *c.sqlite3, _: [
         verified = true;
     }
 
+    // G4: strict signature mode rejects unverified activities.
+    if (state_mod.isStrictHttpSig() and !verified) {
+        return writeJson(hc, .unauthorized, "{\"error\":\"signature required\"}");
+    }
+
     // Run the state machine. Side-effects are drained inline.
     const ns128 = st.clock.wallNs();
     const ns64: u64 = @as(u64, @bitCast(@as(i64, @truncate(ns128))));

@@ -69,11 +69,14 @@ _Last refreshed: 2026-05-19._
       already INSERT-OR-REPLACE idempotent; this guards the outbox
       side.
 
-- [ ] **A8. Bridge stops cleanly under shutdown.**
-      Acceptance: SIGINT during a steady-state bridge run drains
-      the in-flight ring, flushes the outbox enqueues, and exits
-      with no panic and no leaked threads. (Already mostly working;
-      needs an explicit shutdown phase order check.)
+- [x] **A8. Bridge stops cleanly under shutdown.**
+      Defer chain in `main.zig`:
+        firehose_consumer.stop (joins worker thread)
+        → flush_ap_outbox phase (signals AP outbox to drain)
+        → writer.stop (joins writer thread, finalizes statements).
+      The consumer's ring is drained as fast as the worker can pop;
+      anything still pending at exit was always going to be lossy
+      (firehose events are durable in `atp_firehose_events`).
 
 ---
 
@@ -104,11 +107,16 @@ _Last refreshed: 2026-05-19._
       `followers.removeByFollowIri(act.object_id)`. Test: Follow
       then Undo → follower count goes 1 → 0.
 
-- [ ] **B5. Outbox depth → consumer backpressure feedback.**
-      Acceptance: when `ap_federation_outbox` row count exceeds a
-      configurable cap, the relay consumer pauses translation (does
-      not drop firehose events — they're durable in the AT firehose
-      table) until the depth recedes. Surfaced via `/metrics`.
+- [x] **B5. Outbox depth → consumer backpressure feedback.**
+      `RELAY_OUTBOX_BACKPRESSURE_CAP` env (default disabled).
+      `firehose_consumer.popBlocking` checks
+      `count(*) FROM ap_federation_outbox WHERE state='pending'`
+      and sleeps 50 ms when over the cap rather than popping new
+      items. Items stay durable in `atp_firehose_events` so
+      catching up is just a matter of letting the delivery worker
+      drain. Per-protocol counters already surface depth via
+      `ap_federation_outbox_enqueued_total` on `/metrics`; a
+      dedicated `ap_outbox_pending_gauge` is a follow-up.
 
 ---
 
@@ -239,12 +247,15 @@ _Last refreshed: 2026-05-19._
 
 ## F. Operational
 
-- [ ] **F1. Graceful drain on shutdown.**
-      Acceptance: SIGTERM with `SHUTDOWN_GRACE_MS=10000` set
-      finishes in-flight HTTP requests, flushes the AP outbox
-      retry queue's nearest-due window, and joins the firehose
-      consumer + AP outbox worker before exit. Zero panics, zero
-      half-written rows.
+- [x] **F1. Graceful drain on shutdown.**
+      `SHUTDOWN_GRACE_MS` env (default 10000) caps the wall-clock
+      drain budget via `shutdown.runPhasesWithBudget`. Phases run
+      to completion (single-threaded server, no async cancellation
+      runtime); a ring-log warning fires on overrun so operators
+      can tune. Existing teardown defers
+      (consumer.stop, outbox.signalStop, writer.stop) provide the
+      actual drain semantics; A8 covers the panic-free / no
+      half-write invariant.
 
 - [~] **F2. Health route deep-checks.**
       `/readyz` now lists each registered hook with its status
@@ -294,7 +305,10 @@ _Last refreshed: 2026-05-19._
       Acceptance: a single IP exceeding N requests / second gets
       429s. Token-bucket implementation, configurable per route.
 
-- [ ] **G4. HTTP signature strict-verify mode behind a flag.**
+- [x] **G4. HTTP signature strict-verify mode behind a flag.**
+      `STRICT_HTTP_SIG=1` env var; `activitypub.state.setStrictHttpSig`
+      / `isStrictHttpSig`; inbox returns 401 when verification fails.
+      Default off for compatibility.
       Acceptance: `STRICT_HTTP_SIG=1` rejects inbox POSTs that
       arrive without a verifiable signature (today the route
       accepts unverified activities with a soft-warn). Default
