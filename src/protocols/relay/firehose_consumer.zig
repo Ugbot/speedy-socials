@@ -230,6 +230,7 @@ fn pushBlocking(self: *Consumer, item: QueueItem) void {
         // dropped count on the admin status route.
         _ = self.ring.pop();
         _ = self.stats.dropped.fetchAdd(1, .monotonic);
+        core.metrics.incRelayConsumerDropped();
     }
     self.ring.push_assume_capacity(item);
     _ = self.stats.enqueued.fetchAdd(1, .monotonic);
@@ -325,6 +326,8 @@ fn processItem(self: *Consumer, item: *const QueueItem) !void {
             else => return err,
         };
         _ = self.stats.translated_ok.fetchAdd(1, .monotonic);
+        // E2: per-protocol counter.
+        core.metrics.incRelayAtToAp();
 
         // B2: follower-table fanout. Look up everyone following the
         // originating synthetic actor and enqueue one outbox row per
@@ -382,6 +385,7 @@ fn enqueueApDelivery(
 
     const recipients = [_]activitypub.delivery.Recipient{.{ .inbox = target_inbox }};
     _ = try activitypub.delivery.enqueueDeliveries(db, clock, &recipients, payload, key_id);
+    core.metrics.incApOutboxEnqueued();
     _ = alloc; // silence unused when we don't take more arena allocations
 }
 

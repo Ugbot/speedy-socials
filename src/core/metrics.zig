@@ -66,6 +66,85 @@ pub const Metric = struct {
     }
 };
 
+// ── E1/E2: process-wide metrics singleton ──────────────────────────
+//
+// A static `Registry` keeps the API simple for instrumentation call
+// sites scattered across plugins. The registry is reset at boot, and
+// the route handler in `core.metrics.handleMetrics` renders it on
+// demand. Plugins call `core.metrics.observeRequestLatency` /
+// `core.metrics.incCounter` without threading state through every
+// callback.
+
+var global_registry: Registry = .{};
+var registry_initialized: std.atomic.Value(bool) = .init(false);
+
+pub const RequestLatencyMetricName = "http_request_duration_seconds";
+
+/// Standard Prometheus-style buckets covering 1 ms – 60 s.
+pub const default_latency_buckets = [_]f64{ 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0 };
+
+/// Pre-registered metric ids. Filled in by `initGlobal`. Other code
+/// uses `getRequestLatencyId`/etc. rather than re-resolving by name.
+var request_latency_id: ?MetricId = null;
+var relay_at_to_ap_id: ?MetricId = null;
+var relay_ap_to_at_id: ?MetricId = null;
+var relay_consumer_dropped_id: ?MetricId = null;
+var ap_outbox_enqueued_id: ?MetricId = null;
+
+/// Idempotent at-boot init. Call once from the composition root
+/// after any custom metrics that need to share the registry.
+pub fn initGlobal() void {
+    if (registry_initialized.swap(true, .seq_cst)) return;
+    request_latency_id = global_registry.registerHistogram(
+        RequestLatencyMetricName,
+        "HTTP request handler duration, seconds.",
+        &default_latency_buckets,
+    ) catch null;
+    relay_at_to_ap_id = global_registry.registerCounter(
+        "relay_translated_total_at_to_ap",
+        "Successful AT→AP bridge translations.",
+    ) catch null;
+    relay_ap_to_at_id = global_registry.registerCounter(
+        "relay_translated_total_ap_to_at",
+        "Successful AP→AT bridge translations.",
+    ) catch null;
+    relay_consumer_dropped_id = global_registry.registerCounter(
+        "relay_firehose_consumer_dropped_total",
+        "AT firehose events dropped because the relay consumer ring was full.",
+    ) catch null;
+    ap_outbox_enqueued_id = global_registry.registerCounter(
+        "ap_federation_outbox_enqueued_total",
+        "Outbound AP activities pushed to the federation outbox.",
+    ) catch null;
+}
+
+pub fn globalRegistry() *Registry {
+    return &global_registry;
+}
+
+/// Helper: observe a request-handler duration in seconds. No-op if
+/// the registry hasn't been initialised.
+pub fn observeRequestLatency(seconds: f64) void {
+    const id = request_latency_id orelse return;
+    _ = global_registry.observe(id, seconds) catch {};
+}
+
+pub fn incRelayAtToAp() void {
+    if (relay_at_to_ap_id) |id| _ = global_registry.inc(id) catch {};
+}
+
+pub fn incRelayApToAt() void {
+    if (relay_ap_to_at_id) |id| _ = global_registry.inc(id) catch {};
+}
+
+pub fn incRelayConsumerDropped() void {
+    if (relay_consumer_dropped_id) |id| _ = global_registry.inc(id) catch {};
+}
+
+pub fn incApOutboxEnqueued() void {
+    if (ap_outbox_enqueued_id) |id| _ = global_registry.inc(id) catch {};
+}
+
 pub const Registry = struct {
     items: [limits.max_metrics]Metric = undefined,
     count: u16 = 0,
@@ -281,6 +360,38 @@ fn writeHistogram(w: *std.Io.Writer, m: *const Metric) std.Io.Writer.Error!void 
 
     try w.writeAll(m.name());
     try w.print("_count {d}\n", .{h.observed.load(.monotonic)});
+}
+
+// ── /metrics route ─────────────────────────────────────────────────
+//
+// Renders the global registry as Prometheus text exposition into the
+// response body. Bounded by `max_metrics_body_bytes` — at the current
+// metric count we're nowhere near it.
+
+const http = @import("http/router.zig");
+const Response = @import("http/response.zig");
+
+const max_metrics_body_bytes: usize = 32 * 1024;
+
+fn metricsHandler(hc: *http.HandlerContext) anyerror!void {
+    var buf: [max_metrics_body_bytes]u8 = undefined;
+    var stream = std.io.fixedBufferStream(&buf);
+    var bw_buf: [4096]u8 = undefined;
+    var bw = stream.writer().adaptToNewApi(&bw_buf);
+    global_registry.export_(&bw.new_interface) catch {
+        return hc.response.simple(.internal, "text/plain", "metrics render failed");
+    };
+    const body = stream.getWritten();
+    try hc.response.startStatus(.ok);
+    try hc.response.header("Content-Type", "text/plain; version=0.0.4");
+    try hc.response.headerFmt("Content-Length", "{d}", .{body.len});
+    try hc.response.header("Connection", "close");
+    try hc.response.finishHeaders();
+    try hc.response.body(body);
+}
+
+pub fn registerMetricsRoute(router: *http.Router, plugin_index: u16) !void {
+    try router.register(.get, "/metrics", metricsHandler, plugin_index);
 }
 
 // ── Tests ──────────────────────────────────────────────────────────

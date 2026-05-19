@@ -107,6 +107,17 @@ pub fn onActivityReceived(act: *const Activity, raw_body: []const u8, db: *c.sql
 }
 
 fn onActivityReceivedImpl(act: *const Activity, raw_body: []const u8, db: *c.sqlite3, clock: core.clock.Clock) !void {
+    // B4: Undo runs BEFORE the `collectionFor` early-return because
+    // it has no AT-collection mapping. AP `Undo{Follow}` references
+    // the inner Follow activity by its `id`. Map: act.object_id ==
+    // follow.id. Remove the follower row keyed on that follow_iri.
+    if (act.activity_type == .undo and act.object_id.len > 0) {
+        const removed = followers_mod.removeByFollowIri(db, act.object_id) catch false;
+        const status_msg: []const u8 = if (removed) "" else "undo: no follower row";
+        _ = subscription.appendLog(db, clock, .ap_to_at, act.object_id, "[undone]", true, status_msg) catch {};
+        return;
+    }
+
     const collection = collectionFor(act) orelse return;
 
     var arena_buf: [16 * 1024]u8 = undefined;
@@ -232,6 +243,8 @@ fn onActivityReceivedImpl(act: *const Activity, raw_body: []const u8, db: *c.sql
     );
     const source_id = if (act.id.len > 0) act.id else act.object_id;
     _ = subscription.appendLog(db, clock, .ap_to_at, source_id, translated, true, "") catch {};
+    // E2: per-protocol counter.
+    core.metrics.incRelayApToAt();
 }
 
 /// A3: AP Delete → remove the bridged AT record(s).
@@ -625,6 +638,48 @@ test "A4: Update mutates the bridged record in place (CID changes)" {
         if (c.sqlite3_step(s3.?) == c.SQLITE_ROW) row_count = c.sqlite3_column_int64(s3, 0);
     }
     try testing.expectEqual(@as(i64, 1), row_count);
+}
+
+test "B4: Follow then Undo removes the follower row" {
+    const db = try setupDb();
+    defer core.storage.sqlite.closeDb(db);
+    var sc = core.clock.SimClock.init(1_716_000_000);
+    setRelayHost("relay.test");
+    defer setRelayHost("");
+
+    const follow_act: Activity = .{
+        .activity_type = .follow,
+        .id = "https://m.example/follow/42",
+        .actor = "https://m.example/users/frank",
+        .object_id = "https://relay.test/ap/users/at:plc:target",
+        .object_type = "Person",
+        .target = "",
+        .published = "",
+        .to_first = "",
+    };
+    onActivityReceived(&follow_act, "", db, sc.clock());
+
+    // The follower row was added.
+    var f_buf: [4]followers_mod.Follower = undefined;
+    const n_before = try followers_mod.list(db, follow_act.object_id, &f_buf);
+    try testing.expectEqual(@as(u32, 1), n_before);
+
+    const undo_act: Activity = .{
+        .activity_type = .undo,
+        .id = "https://m.example/undo/9",
+        .actor = "https://m.example/users/frank",
+        // AP convention: Undo's `object` is the IRI of the inner
+        // activity being undone — our follow_iri.
+        .object_id = "https://m.example/follow/42",
+        .object_type = "",
+        .target = "",
+        .published = "",
+        .to_first = "",
+    };
+    onActivityReceived(&undo_act, "", db, sc.clock());
+
+    const n_after = try followers_mod.list(db, follow_act.object_id, &f_buf);
+    try testing.expectEqual(@as(u32, 0), n_after);
 }
 
 test "A3: Create then Delete removes the bridged atp_records row" {

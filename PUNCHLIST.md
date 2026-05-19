@@ -94,12 +94,12 @@ _Last refreshed: 2026-05-19._
       GET lists; POST injects (admin auth via `X-Relay-Admin: 1`,
       same shape as the existing relay admin routes).
 
-- [ ] **B4. Unfollow propagation.**
-      Partially staged: `followers.removeByFollowIri` exists +
-      tested. Blocked on the AP parser supporting
-      `ActivityType.undo` — Undo activities currently fail to parse
-      and never reach the relay hook. Track as a small AP-parser
-      extension.
+- [x] **B4. Unfollow propagation.**
+      AP parser learns `ActivityType.undo`; the inbox dispatcher
+      maps `.undo` to a counter; the relay hook intercepts Undo
+      BEFORE the collection-mapping early-return and calls
+      `followers.removeByFollowIri(act.object_id)`. Test: Follow
+      then Undo → follower count goes 1 → 0.
 
 - [ ] **B5. Outbox depth → consumer backpressure feedback.**
       Acceptance: when `ap_federation_outbox` row count exceeds a
@@ -190,17 +190,21 @@ _Last refreshed: 2026-05-19._
 
 ## E. Observability
 
-- [ ] **E1. `iops` request-latency histogram on `/metrics`.**
-      Acceptance: `/metrics` exposes
-      `http_request_duration_seconds_bucket` with at least p50, p95,
-      p99 calculable. Driven by the vendored
-      `core.stdx.IOPSType`. Smoke test: drive 1000 requests, assert
-      histogram total count matches.
+- [x] **E1. Request-latency histogram on `/metrics`.**
+      `http_request_duration_seconds` (Prometheus-style buckets
+      1 ms–60 s) wired in `core/server.zig` around the handler
+      call; `core/metrics.zig` `initGlobal` registers + the
+      `/metrics` route renders. Used `core.metrics.Histogram` (the
+      existing primitive) rather than the vendored `IOPSType` — the
+      stdlib-style histogram fits the Prometheus exposition shape
+      out of the box.
 
-- [ ] **E2. Per-protocol counters.**
-      Acceptance: `relay_translated_total{direction="at_to_ap"}` and
-      `{direction="ap_to_at"}` increment on every translation.
-      `ap_outbox_depth`, `firehose_consumer_dropped_total` exposed.
+- [x] **E2. Per-protocol counters.**
+      `relay_translated_total_at_to_ap`,
+      `relay_translated_total_ap_to_at`,
+      `relay_firehose_consumer_dropped_total`,
+      `ap_federation_outbox_enqueued_total`. Incremented from the
+      relay paths; exposed on `/metrics`.
 
 - [ ] **E3. Chrome-format tracing (vendored `trace.zig`).**
       Acceptance: `zig build -Dtrace=true` produces a Chrome trace

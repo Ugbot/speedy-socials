@@ -38,6 +38,17 @@ const parser = @import("http/parser.zig");
 const request_mod = @import("http/request.zig");
 const response = @import("http/response.zig");
 const router_mod = @import("http/router.zig");
+const metrics_mod = @import("metrics.zig");
+
+/// Monotonic nanosecond timestamp. Std's `nanoTimestamp` was removed
+/// in Zig 0.16; use clock_gettime(CLOCK_MONOTONIC) directly. Returns
+/// 0 on failure (silently swallowed; metrics are best-effort).
+fn monotonicNow() i64 {
+    var ts: std.c.timespec = undefined;
+    const rc = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts);
+    if (rc != 0) return 0;
+    return @as(i64, @intCast(ts.sec)) * std.time.ns_per_s + @as(i64, @intCast(ts.nsec));
+}
 const Plugin = @import("plugin.zig");
 const Registry = @import("plugin.zig").Registry;
 const Context = @import("plugin.zig").Context;
@@ -339,17 +350,21 @@ pub const Server = struct {
                     .response = &rb,
                     .params = params,
                 };
+                // E1: time the handler and observe into the global
+                // request-latency histogram via posix CLOCK_MONOTONIC
+                // (std.time lost nanoTimestamp in Zig 0.16).
+                const t0_ns = monotonicNow();
                 handler(&hc) catch |err| {
                     // G6: opaque body to the client; the real error name
                     // goes to the ring log so operators can investigate.
-                    // Surfacing the Zig error name would leak internal
-                    // taxonomy (BadDid, KeyMismatch, OpenFailed, etc.) to
-                    // every caller — including hostile ones probing for
-                    // implementation details.
                     std.log.warn("handler returned error: {s}", .{@errorName(err)});
                     rb = response.Builder.init(&conn.write_buf);
                     try rb.simple(.internal, "text/plain", "internal error");
                 };
+                const t1_ns = monotonicNow();
+                const dur_ns: i64 = if (t1_ns > t0_ns) t1_ns - t0_ns else 0;
+                const dur_s: f64 = @as(f64, @floatFromInt(dur_ns)) / @as(f64, std.time.ns_per_s);
+                metrics_mod.observeRequestLatency(dur_s);
             },
             .not_found => try rb.simple(.not_found, "text/plain", "not found"),
             .method_not_allowed => try rb.simple(.method_not_allowed, "text/plain", "method not allowed"),

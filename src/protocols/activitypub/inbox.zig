@@ -144,6 +144,11 @@ pub fn dispatch(env: *const Envelope, effects: *SideEffectBuffer) ApError!void {
         .reject => try runReject(env, effects),
         .announce => try runAnnounce(env, effects),
         .like => try runLike(env, effects),
+        // B4: Undo {Follow / Like / Announce} — for the AP local
+        // user state machine there's nothing to do beyond emit a
+        // generic counter; the relay's inbox hook handles the
+        // bridge-specific cleanup (follower-table delete).
+        .undo => try effects.push(.{ .increment_counter = .{ .name = "ap.inbox.undo" } }),
     }
 }
 

@@ -35,6 +35,7 @@ pub const ActivityType = enum {
     reject,
     announce,
     like,
+    undo,
 
     pub fn parse(s: []const u8) ?ActivityType {
         // Type strings are typically PascalCase, but some servers send
@@ -47,6 +48,7 @@ pub const ActivityType = enum {
         if (std.ascii.eqlIgnoreCase(s, "Reject")) return .reject;
         if (std.ascii.eqlIgnoreCase(s, "Announce")) return .announce;
         if (std.ascii.eqlIgnoreCase(s, "Like")) return .like;
+        if (std.ascii.eqlIgnoreCase(s, "Undo")) return .undo;
         return null;
     }
 };

@@ -461,6 +461,13 @@ pub fn main() !void {
     // Health routes use plugin slot u16::MAX as a sentinel — they
     // don't belong to any registered plugin.
     try core.health.registerRoutes(&router, std.math.maxInt(u16));
+
+    // E1/E2: initialise the global metrics registry + register
+    // /metrics. Done before plugins so they can find the registry
+    // ids if they want to register custom metrics.
+    core.metrics.initGlobal();
+    try core.metrics.registerMetricsRoute(&router, std.math.maxInt(u16));
+    log_ptr.info("boot", "metrics registry initialised; /metrics serving");
     try registry.registerAllRoutes(&ctx, &router);
 
     // ── WebSocket subscription registry (W2.1) ─────────────────────

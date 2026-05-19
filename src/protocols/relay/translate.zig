@@ -220,7 +220,7 @@ pub fn apActivityToAtRecord(
         // we surface them as posts with an empty text + the activity id
         // recorded as subject. The relay's higher-level pipeline can
         // choose to drop them.
-        .update, .delete, .accept, .reject => return error.UnsupportedKind,
+        .update, .delete, .accept, .reject, .undo => return error.UnsupportedKind,
     };
 
     if (out.kind == .post) {
