@@ -73,7 +73,8 @@ pub fn loadFromFile(path: []const u8) Error!void {
         total += @intCast(got);
     }
     if (total == body.len) {
-        const peek = std.c.read(fd, &[_]u8{0}, 1);
+        var peek_buf: [1]u8 = undefined;
+        const peek = std.c.read(fd, &peek_buf, 1);
         if (peek > 0) return error.FileTooLarge;
     }
     try applyJson(body[0..total]);
