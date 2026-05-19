@@ -70,7 +70,12 @@ pub fn relayHostPublic() []const u8 {
 /// which collection the object lived in.
 pub fn collectionFor(act: *const Activity) ?[]const u8 {
     return switch (act.activity_type) {
-        .create => blk: {
+        .create, .update => blk: {
+            // A4: Update follows the same target as Create — we
+            // re-commit with the same rkey (derived from object_id),
+            // so INSERT-OR-REPLACE on `atp_records` mutates the row
+            // in place. The inner content extracted from the raw
+            // body changes the CID when it actually changed.
             if (std.ascii.eqlIgnoreCase(act.object_type, "Note")) {
                 break :blk "app.bsky.feed.post";
             }
@@ -94,13 +99,13 @@ fn isDelete(act: *const Activity) bool {
 /// Hook entrypoint — installed by `relay.init` via
 /// `activitypub.inbox.setRelayInboxHook`. MUST NOT throw: failures
 /// log + return.
-pub fn onActivityReceived(act: *const Activity, db: *c.sqlite3, clock: core.clock.Clock) void {
-    onActivityReceivedImpl(act, db, clock) catch |err| {
+pub fn onActivityReceived(act: *const Activity, raw_body: []const u8, db: *c.sqlite3, clock: core.clock.Clock) void {
+    onActivityReceivedImpl(act, raw_body, db, clock) catch |err| {
         std.log.warn("relay ap_to_at: failed: {s}", .{@errorName(err)});
     };
 }
 
-fn onActivityReceivedImpl(act: *const Activity, db: *c.sqlite3, clock: core.clock.Clock) !void {
+fn onActivityReceivedImpl(act: *const Activity, raw_body: []const u8, db: *c.sqlite3, clock: core.clock.Clock) !void {
     const collection = collectionFor(act) orelse return;
 
     var arena_buf: [16 * 1024]u8 = undefined;
@@ -135,12 +140,14 @@ fn onActivityReceivedImpl(act: *const Activity, db: *c.sqlite3, clock: core.cloc
     try atproto.repo.ensureRepo(db, did, act.actor, clock.wallUnix());
 
     // Build a dag-cbor record body shaped for the target collection.
-    // We deliberately keep this minimal: just enough fields for an AT
-    // subscriber to render the bridge entry. Lexicon-perfect encoding
-    // is a separate concern (and likely involves AT-side schema
-    // negotiation that is out of scope here).
-    var record_buf: [4096]u8 = undefined;
-    const record_cbor = try buildBridgeRecord(act, collection, &record_buf);
+    // We pull the inner Note's `content` from the raw body (Mastodon
+    // sends HTML in object.content) so Update activities that change
+    // the content actually produce a different CID — A4's requirement
+    // — and so Create's bridged record carries the real text rather
+    // than the literal string "Note".
+    var record_buf: [16 * 1024]u8 = undefined;
+    const inner_content = extractApInnerContent(raw_body);
+    const record_cbor = try buildBridgeRecord(act, collection, inner_content, &record_buf);
 
     // Generate a stable rkey from the AP *object id* (NOT the activity
     // id). A future Delete activity references the object id alone —
@@ -255,10 +262,13 @@ fn processDelete(act: *const Activity, db: *c.sqlite3, clock: core.clock.Clock, 
 /// the `facets` array from a Mastodon HTML body without an HTML
 /// stripper. This minimum body lets AT consumers see the bridge entry
 /// and follow `bridgedFrom` back to the AP source.
-fn buildBridgeRecord(act: *const Activity, collection: []const u8, out: []u8) ![]const u8 {
+fn buildBridgeRecord(act: *const Activity, collection: []const u8, inner_content: []const u8, out: []u8) ![]const u8 {
     var enc = atproto.dag_cbor.Encoder.init(out);
     const map_size: u32 = switch (act.activity_type) {
-        .create => 5, // $type, bridgedFrom, bridgedActor, text, createdAt
+        // Create + Update both emit text+createdAt; their AT records
+        // are otherwise indistinguishable (Update is just a mutation
+        // of the existing rkey).
+        .create, .update => 5, // $type, bridgedFrom, bridgedActor, text, createdAt
         .like, .announce => 4, // $type, bridgedFrom, bridgedActor, subject
         .follow => 4, // $type, bridgedFrom, bridgedActor, subject
         else => 3,
@@ -271,12 +281,12 @@ fn buildBridgeRecord(act: *const Activity, collection: []const u8, out: []u8) ![
     try enc.writeText("bridgedActor");
     try enc.writeText(act.actor);
     switch (act.activity_type) {
-        .create => {
+        .create, .update => {
             try enc.writeText("text");
-            // Mastodon-style Note bodies are HTML; we don't strip
-            // tags. Downstream consumers must treat `text` as
-            // potentially-marked-up.
-            try enc.writeText(if (act.object_type.len > 0) act.object_type else "Note");
+            // Inner Note body's `content` field if present (HTML for
+            // Mastodon); fall back to object_type label when absent.
+            const text = if (inner_content.len > 0) inner_content else act.object_type;
+            try enc.writeText(if (text.len > 0) text else "Note");
             try enc.writeText("createdAt");
             try enc.writeText(if (act.published.len > 0) act.published else "1970-01-01T00:00:00Z");
         },
@@ -291,6 +301,41 @@ fn buildBridgeRecord(act: *const Activity, collection: []const u8, out: []u8) ![
         else => {},
     }
     return enc.written();
+}
+
+/// Best-effort extraction of the inner activity object's `content`
+/// field. Mastodon-style Update / Create activities carry an inline
+/// `object` map with `"content": "..."`. We pull the FIRST occurrence
+/// of `"content":"<text>"` in the body — works because AP bodies
+/// contain at most one such field at the relevant nesting level.
+/// Returns an empty slice when not found.
+fn extractApInnerContent(raw_body: []const u8) []const u8 {
+    const needle = "\"content\"";
+    var i: usize = 0;
+    while (i + needle.len <= raw_body.len) : (i += 1) {
+        if (std.mem.eql(u8, raw_body[i..][0..needle.len], needle)) {
+            // Skip whitespace + ':' + whitespace.
+            var j: usize = i + needle.len;
+            while (j < raw_body.len and (raw_body[j] == ' ' or raw_body[j] == '\t')) : (j += 1) {}
+            if (j >= raw_body.len or raw_body[j] != ':') return "";
+            j += 1;
+            while (j < raw_body.len and (raw_body[j] == ' ' or raw_body[j] == '\t')) : (j += 1) {}
+            if (j >= raw_body.len or raw_body[j] != '"') return "";
+            j += 1;
+            const start = j;
+            // Scan to the closing unescaped quote.
+            while (j < raw_body.len) : (j += 1) {
+                if (raw_body[j] == '\\') {
+                    j += 1;
+                    if (j >= raw_body.len) return "";
+                    continue;
+                }
+                if (raw_body[j] == '"') return raw_body[start..j];
+            }
+            return "";
+        }
+    }
+    return "";
 }
 
 /// Derive a short rkey from an AP id. We don't need cryptographic
@@ -395,7 +440,7 @@ test "onActivityReceived: Create{Note} writes ap_to_at log row + mints AT DID" {
         .published = "2026-05-16T00:00:00Z",
         .to_first = "https://www.w3.org/ns/activitystreams#Public",
     };
-    onActivityReceived(&act, db, sc.clock());
+    onActivityReceived(&act, "", db, sc.clock());
 
     var rows: [4]subscription.LogEntry = undefined;
     const n = try subscription.listLog(db, 0, &rows);
@@ -457,11 +502,106 @@ test "onActivityReceived: Like translates to app.bsky.feed.like" {
         .published = "",
         .to_first = "",
     };
-    onActivityReceived(&act, db, sc.clock());
+    onActivityReceived(&act, "", db, sc.clock());
     var rows: [2]subscription.LogEntry = undefined;
     const n = try subscription.listLog(db, 0, &rows);
     try testing.expectEqual(@as(u32, 1), n);
     try testing.expect(std.mem.indexOf(u8, rows[0].translatedId(), "app.bsky.feed.like") != null);
+}
+
+test "A4: Update mutates the bridged record in place (CID changes)" {
+    const db = try setupDb();
+    defer core.storage.sqlite.closeDb(db);
+    var sc = core.clock.SimClock.init(1_715_500_000);
+    setRelayHost("relay.test");
+    defer setRelayHost("");
+
+    const create_body =
+        "{\"type\":\"Create\",\"id\":\"https://m.example/users/eve/activities/100\"," ++
+        "\"actor\":\"https://m.example/users/eve\"," ++
+        "\"object\":{\"id\":\"https://m.example/users/eve/notes/100\"," ++
+        "\"type\":\"Note\",\"content\":\"original text\"}}";
+    const create_act: Activity = .{
+        .activity_type = .create,
+        .id = "https://m.example/users/eve/activities/100",
+        .actor = "https://m.example/users/eve",
+        .object_id = "https://m.example/users/eve/notes/100",
+        .object_type = "Note",
+        .target = "",
+        .published = "2026-05-19T01:00:00Z",
+        .to_first = "",
+    };
+    onActivityReceived(&create_act, create_body, db, sc.clock());
+
+    // Grab the CID after Create.
+    var arena_buf: [1024]u8 = undefined;
+    var arena = Arena.init(&arena_buf);
+    const did = (try identity_map.didForActor(db, create_act.actor, &arena)).?;
+    var cid_a_buf: [128]u8 = undefined;
+    var cid_a_len: usize = 0;
+    var s1: ?*c.sqlite3_stmt = null;
+    if (c.sqlite3_prepare_v2(db, "SELECT cid FROM atp_records WHERE did = ? AND collection = 'app.bsky.feed.post'", -1, &s1, null) == c.SQLITE_OK) {
+        defer _ = c.sqlite3_finalize(s1);
+        _ = c.sqlite3_bind_text(s1, 1, did.ptr, @intCast(did.len), c.sqliteTransientAsDestructor());
+        if (c.sqlite3_step(s1.?) == c.SQLITE_ROW) {
+            const p = c.sqlite3_column_text(s1, 0);
+            const n: usize = @intCast(c.sqlite3_column_bytes(s1, 0));
+            const cap = @min(n, cid_a_buf.len);
+            if (p != null and cap > 0) {
+                @memcpy(cid_a_buf[0..cap], p[0..cap]);
+                cid_a_len = cap;
+            }
+        }
+    }
+    try testing.expect(cid_a_len > 0);
+
+    // Send Update with different content.
+    const update_body =
+        "{\"type\":\"Update\",\"id\":\"https://m.example/users/eve/activities/101\"," ++
+        "\"actor\":\"https://m.example/users/eve\"," ++
+        "\"object\":{\"id\":\"https://m.example/users/eve/notes/100\"," ++
+        "\"type\":\"Note\",\"content\":\"edited text — totally different\"}}";
+    const update_act: Activity = .{
+        .activity_type = .update,
+        .id = "https://m.example/users/eve/activities/101",
+        .actor = "https://m.example/users/eve",
+        .object_id = "https://m.example/users/eve/notes/100",
+        .object_type = "Note",
+        .target = "",
+        .published = "2026-05-19T01:05:00Z",
+        .to_first = "",
+    };
+    onActivityReceived(&update_act, update_body, db, sc.clock());
+
+    // CID after Update must differ.
+    var cid_b_buf: [128]u8 = undefined;
+    var cid_b_len: usize = 0;
+    var s2: ?*c.sqlite3_stmt = null;
+    if (c.sqlite3_prepare_v2(db, "SELECT cid FROM atp_records WHERE did = ? AND collection = 'app.bsky.feed.post'", -1, &s2, null) == c.SQLITE_OK) {
+        defer _ = c.sqlite3_finalize(s2);
+        _ = c.sqlite3_bind_text(s2, 1, did.ptr, @intCast(did.len), c.sqliteTransientAsDestructor());
+        if (c.sqlite3_step(s2.?) == c.SQLITE_ROW) {
+            const p = c.sqlite3_column_text(s2, 0);
+            const n: usize = @intCast(c.sqlite3_column_bytes(s2, 0));
+            const cap = @min(n, cid_b_buf.len);
+            if (p != null and cap > 0) {
+                @memcpy(cid_b_buf[0..cap], p[0..cap]);
+                cid_b_len = cap;
+            }
+        }
+    }
+    try testing.expect(cid_b_len > 0);
+    try testing.expect(!std.mem.eql(u8, cid_a_buf[0..cid_a_len], cid_b_buf[0..cid_b_len]));
+
+    // Exactly one row still — replaced not appended.
+    var row_count: i64 = -1;
+    var s3: ?*c.sqlite3_stmt = null;
+    if (c.sqlite3_prepare_v2(db, "SELECT count(*) FROM atp_records WHERE did = ?", -1, &s3, null) == c.SQLITE_OK) {
+        defer _ = c.sqlite3_finalize(s3);
+        _ = c.sqlite3_bind_text(s3, 1, did.ptr, @intCast(did.len), c.sqliteTransientAsDestructor());
+        if (c.sqlite3_step(s3.?) == c.SQLITE_ROW) row_count = c.sqlite3_column_int64(s3, 0);
+    }
+    try testing.expectEqual(@as(i64, 1), row_count);
 }
 
 test "A3: Create then Delete removes the bridged atp_records row" {
@@ -481,7 +621,7 @@ test "A3: Create then Delete removes the bridged atp_records row" {
         .published = "2026-05-19T00:00:00Z",
         .to_first = "https://www.w3.org/ns/activitystreams#Public",
     };
-    onActivityReceived(&create_act, db, sc.clock());
+    onActivityReceived(&create_act, "", db, sc.clock());
 
     // Verify the bridged row exists.
     var arena_buf: [1024]u8 = undefined;
@@ -507,7 +647,7 @@ test "A3: Create then Delete removes the bridged atp_records row" {
         .published = "2026-05-19T00:01:00Z",
         .to_first = "",
     };
-    onActivityReceived(&delete_act, db, sc.clock());
+    onActivityReceived(&delete_act, "", db, sc.clock());
 
     // Row should be gone.
     var post_count: i64 = -1;
@@ -537,7 +677,7 @@ test "A3: Delete for an unknown object id is a logged no-op" {
         .published = "",
         .to_first = "",
     };
-    onActivityReceived(&delete_act, db, sc.clock());
+    onActivityReceived(&delete_act, "", db, sc.clock());
 
     // No atp_records changes, but a log entry exists.
     var rows: [4]subscription.LogEntry = undefined;
@@ -559,7 +699,7 @@ test "onActivityReceived: unsupported activity type is silently dropped" {
         .published = "",
         .to_first = "",
     };
-    onActivityReceived(&act, db, sc.clock());
+    onActivityReceived(&act, "", db, sc.clock());
     var rows: [2]subscription.LogEntry = undefined;
     const n = try subscription.listLog(db, 0, &rows);
     try testing.expectEqual(@as(u32, 0), n);

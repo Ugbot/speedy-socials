@@ -428,7 +428,7 @@ fn dispatchInbox(hc: *HandlerContext, st: *state_mod.State, db: *c.sqlite3, _: [
     // is a no-op when no relay is running; failures inside are
     // swallowed at the relay — they do not affect the inbox
     // response.
-    if (inbox.currentRelayInboxHook()) |hook| hook(&act, db, st.clock);
+    if (inbox.currentRelayInboxHook()) |hook| hook(&act, body, db, st.clock);
 
     const status: Status = if (verified) .ok else .ok;
     try writeJson(hc, status, "{\"status\":\"accepted\"}");

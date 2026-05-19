@@ -41,10 +41,13 @@ _Last refreshed: 2026-05-19._
       Acceptance for A3b: deleting an AT record emits an AP Delete
       activity into `ap_federation_outbox`.
 
-- [ ] **A4. Update translation, both directions.**
-      Acceptance: AP `Update{Note}` mutates the bridged
-      `atp_records` row in place (CID changes; firehose event
-      emitted). AT record updates produce AP `Update` activities.
+- [~] **A4. Update translation, both directions.**
+      AP→AT *done*: `collectionFor` recognises Update + the bridge
+      re-commits with the same rkey, INSERT-OR-REPLACE on
+      `atp_records`. Content is extracted from the raw inbound body
+      via `extractApInnerContent` so the CID changes when content
+      changes. AT→AP *open*: the firehose consumer doesn't yet emit
+      AP Update for AT record mutations.
 
 - [ ] **A5. Move + Block activity translation.**
       Acceptance: AP `Move`, `Block`, `Flag` activities each produce

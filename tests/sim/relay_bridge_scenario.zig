@@ -92,7 +92,7 @@ fn run(gpa: std.mem.Allocator) !void {
         .published = "2026-05-16T00:01:00Z",
         .to_first = "https://www.w3.org/ns/activitystreams#Public",
     };
-    relay.ap_to_at.onActivityReceived(&ap_act, db, sc.clock());
+    relay.ap_to_at.onActivityReceived(&ap_act, "", db, sc.clock());
 
     // ── Verify both log rows exist with the expected shapes ────────
     var rows: [16]relay.subscription.LogEntry = undefined;

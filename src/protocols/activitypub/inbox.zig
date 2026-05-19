@@ -54,6 +54,7 @@ const sqlite_c = @import("sqlite").c;
 
 pub const RelayInboxHook = *const fn (
     act: *const Activity,
+    raw_body: []const u8,
     db: *sqlite_c.sqlite3,
     clock: Clock,
 ) void;
