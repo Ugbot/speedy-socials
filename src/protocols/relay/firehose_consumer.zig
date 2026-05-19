@@ -304,6 +304,15 @@ fn processItem(self: *Consumer, item: *const QueueItem) !void {
 
     var arena_buf: [32 * 1024]u8 = undefined;
     for (rows[0..n]) |row| {
+        // A7: dedup. If we've already successfully translated this
+        // at_uri, the firehose is replaying (or a sink fired twice).
+        // Skip without writing — atp_records is already idempotent
+        // via INSERT-OR-REPLACE, but the AP outbox would otherwise
+        // accumulate duplicate delivery rows.
+        if (subscription.hasSuccessfulLog(self.db, .at_to_ap, row.uri())) {
+            continue;
+        }
+
         var arena = Arena.init(&arena_buf);
         const ev: plugin.FirehoseEvent = .{
             .at_uri = row.uri(),
@@ -319,10 +328,16 @@ fn processItem(self: *Consumer, item: *const QueueItem) !void {
             ev,
             &arena,
         ) catch |err| switch (err) {
-            // Unsupported collections (threadgate, lists, …) are
-            // expected — the relay only translates the four core
-            // shapes today. Don't count as errors.
-            error.UnsupportedKind => continue,
+            // A6: log unsupported collections explicitly so /admin/relay/log
+            // shows we saw the event rather than silently dropping. The
+            // translation log entry carries the collection name as the
+            // error_msg field; downstream tooling can pivot on it.
+            error.UnsupportedKind => {
+                var reason_buf: [128]u8 = undefined;
+                const reason = std.fmt.bufPrint(&reason_buf, "unsupported collection: {s}", .{ev.collection}) catch "unsupported collection";
+                _ = subscription.appendLog(self.db, self.clock, .at_to_ap, ev.at_uri, "", true, reason) catch {};
+                continue;
+            },
             else => return err,
         };
         _ = self.stats.translated_ok.fetchAdd(1, .monotonic);
@@ -609,7 +624,7 @@ test "consumer: bridge target inbox enqueues into ap_federation_outbox" {
     try testing.expect(std.mem.indexOf(u8, payload_buf[0..payload_len], "bridged") != null);
 }
 
-test "consumer: unsupported collection is silently skipped (no error log row)" {
+test "A6: unsupported collection is logged with reason (not silently dropped)" {
     const db = try setupDb();
     defer core.storage.sqlite.closeDb(db);
 
@@ -635,4 +650,12 @@ test "consumer: unsupported collection is silently skipped (no error log row)" {
     try testing.expect(consumer.stats.enqueued.load(.monotonic) >= 1);
     try testing.expectEqual(@as(u64, 0), consumer.stats.translated_ok.load(.monotonic));
     try testing.expectEqual(@as(u64, 0), consumer.stats.translated_err.load(.monotonic));
+
+    // A6: the unsupported-collection event is now logged with a
+    // reason so /admin/relay/log shows we saw it.
+    var rows: [4]subscription.LogEntry = undefined;
+    const n = try subscription.listLog(db, 0, &rows);
+    try testing.expect(n >= 1);
+    try testing.expectEqual(subscription.Direction.at_to_ap, rows[0].direction);
+    try testing.expect(std.mem.startsWith(u8, rows[0].errorMsg(), "unsupported collection"));
 }

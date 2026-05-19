@@ -120,6 +120,15 @@ fn onActivityReceivedImpl(act: *const Activity, raw_body: []const u8, db: *c.sql
 
     const collection = collectionFor(act) orelse return;
 
+    // A7: dedup on (direction, source_id). source_id we'll use is
+    // the same one appendLog records — the activity id (or
+    // object_id fallback). If a successful row already exists, the
+    // bridge has already mirrored this activity; skip.
+    const dedup_source_id = if (act.id.len > 0) act.id else act.object_id;
+    if (subscription.hasSuccessfulLog(db, .ap_to_at, dedup_source_id)) {
+        return;
+    }
+
     var arena_buf: [16 * 1024]u8 = undefined;
     var arena = Arena.init(&arena_buf);
 

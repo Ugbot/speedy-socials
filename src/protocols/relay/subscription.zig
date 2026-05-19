@@ -222,6 +222,27 @@ pub const LogEntry = struct {
     }
 };
 
+/// A7: cheap dedup check — returns true if a successful translation
+/// has already been logged for `(direction, source_id)`. The
+/// firehose consumer + AP inbox hook call this before processing so
+/// a replay of the same event is a no-op rather than producing
+/// duplicate atp_records mutations or AP outbox rows.
+pub fn hasSuccessfulLog(
+    db: *c.sqlite3,
+    direction: Direction,
+    source_id: []const u8,
+) bool {
+    if (source_id.len == 0) return false;
+    const sql = "SELECT 1 FROM relay_translation_log WHERE direction = ? AND source_id = ? AND success = 1 LIMIT 1";
+    var stmt: ?*c.sqlite3_stmt = null;
+    if (c.sqlite3_prepare_v2(db, sql, -1, &stmt, null) != c.SQLITE_OK) return false;
+    defer _ = c.sqlite3_finalize(stmt);
+    const dir_str = direction.label();
+    _ = c.sqlite3_bind_text(stmt, 1, dir_str.ptr, @intCast(dir_str.len), c.sqliteTransientAsDestructor());
+    _ = c.sqlite3_bind_text(stmt, 2, source_id.ptr, @intCast(source_id.len), c.sqliteTransientAsDestructor());
+    return c.sqlite3_step(stmt.?) == c.SQLITE_ROW;
+}
+
 /// Append a translation log entry. Returns the new row id.
 pub fn appendLog(
     db: *c.sqlite3,

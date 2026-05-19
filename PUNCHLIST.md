@@ -54,17 +54,20 @@ _Last refreshed: 2026-05-19._
       a translation-log entry referencing the bridged AT analogue
       (or land in a "consciously dropped" log with rationale).
 
-- [ ] **A6. Activity coverage for `app.bsky.graph.listitem`, `app.bsky.feed.threadgate`, `app.bsky.graph.list`.**
-      Acceptance: each of those AT collections produces a
-      translation-log entry (or is logged as explicitly out-of-scope
-      with the reason). Today they hit the silent-skip path.
+- [x] **A6. Activity coverage for `app.bsky.graph.listitem`, `app.bsky.feed.threadgate`, `app.bsky.graph.list`.**
+      The firehose consumer now logs an explicit "unsupported
+      collection: <name>" entry in `relay_translation_log` instead
+      of silently dropping. `/admin/relay/log` audit trace reflects
+      every event the bridge saw. Translation matrix doc updated.
 
-- [ ] **A7. Idempotency on replay.**
-      Acceptance: replaying the same firehose seq through the
-      consumer twice produces exactly one outbox row + one
-      atp_records mutation. Today the consumer uses (did, ts) which
-      is precise *enough* under sane clock skew; an idempotency key
-      tied to `at_uri` would make this airtight.
+- [x] **A7. Idempotency on replay.**
+      `subscription.hasSuccessfulLog(direction, source_id)` — fast
+      indexed point lookup. The firehose consumer keys on the AT
+      URI; the inbox hook keys on the activity id (or object_id
+      fallback). Replay of the same event short-circuits before
+      hitting atp_records / ap_federation_outbox. Atp_records is
+      already INSERT-OR-REPLACE idempotent; this guards the outbox
+      side.
 
 - [ ] **A8. Bridge stops cleanly under shutdown.**
       Acceptance: SIGINT during a steady-state bridge run drains
@@ -330,7 +333,7 @@ _Last refreshed: 2026-05-19._
 
 ## I. Activity-type coverage matrix (cross-cutting; pairs with A3–A6)
 
-- [ ] **I1. Translation matrix doc.**
+- [x] **I1. Translation matrix doc.** `docs/design/translation-matrix.md`.
       Acceptance: `docs/design/translation-matrix.md` lists every
       AP activity type × AT collection and marks each cell as
       bridged / dropped / impossible with a rationale.
