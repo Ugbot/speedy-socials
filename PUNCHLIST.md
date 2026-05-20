@@ -15,6 +15,47 @@ Raw protocol-spec conformance gaps live in
 DUAL-1..DUAL-5), with the underlying audit in
 [`PROTOCOL_AUDIT.md`](PROTOCOL_AUDIT.md).
 
+_Last refreshed: 2026-05-20 (post-operational-spec batch)._
+
+## 2026-05-20 operational-spec batch
+
+Closed: **A3b** (firehose change-hook for AT deletes / updates wired
+into the relay's `at_to_ap_changes` module → enqueues AP Delete /
+Update into ap_federation_outbox), **A4b** (same path covers
+record mutation via `ChangeKind.update`), **I2 / I3** (profile-mode
+covered by the same hook for `app.bsky.actor.profile`), **C2**
+(SNI cert table data structure + env parser; live dispatch awaits
+ianic upstream), **C4** (`core.tls_cert_admin.reloadFromPaths` +
+backend pointer registration), **C5** (outbound cert-pinning hook
+seam — verification deferred until std exposes peer cert chain),
+**D3** (multi-level firehose write-back ring → `firehose_buffer.Ring`
+with bounded slots + transactional drain), **E3** (`core.trace` —
+Chrome-format ring + JSON exporter), **F2** (`core.cert_probe.probe`
+returns notAfter + expiring_soon flag for /readyz wiring), **G5**
+(`Router.RouteMeta` + `registerWithMeta` + `matchMeta` for per-route
+body caps), **H1/H2/H3** (`core.tenancy` — Host→tenant table, env
+parser, thread-local current tenant, lifecycle states), **J3**
+(`tests/sim/deterministic_replay.zig` — fingerprint comparison
+across two seeded runs), **J5** (CI workflow template at
+`docs/ci/mastodon-e2e.yml.template`), **K4** (`docs/design/core-api.md`
+public-API surface).
+
+Still open (genuinely upstream-blocked or aspirational):
+
+- **C1** HTTPS-fronted WebSocket data plane — needs ianic upstream
+  to distinguish WouldBlock from EOF in the blocking `Connection`
+  reader. Mitigation today: terminate TLS at an LB/sidecar.
+- **C3** Per-socket connect/read timeouts on outbound client —
+  `timeout_ms` is plumbed through but `std.Io.net` doesn't expose
+  the fd's `setsockopt` surface. Tracked against upstream Zig.
+- **A2** AT synthetic-DID key publication — needs router-level
+  multi-segment wildcard capture or a synthetic-DID-format change.
+  Documented as deferred.
+
+After this batch: every Critical / High / Medium item from both
+SPEC_PUNCHLIST.md and this file is closed or has a documented
+upstream block.
+
 _Last refreshed: 2026-05-19._
 
 ---

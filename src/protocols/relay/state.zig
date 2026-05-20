@@ -33,6 +33,20 @@ pub const State = struct {
 
     /// Wall clock for `last_seen` and `ts` columns.
     clock: Clock = undefined,
+    /// Relay's local host name, used to mint synthetic AP actor IRIs
+    /// + AP activity IDs for AT→AP translation. Defaults to
+    /// "speedy-socials.local" when unset.
+    relay_host_buf: [128]u8 = undefined,
+    relay_host_len: u8 = 0,
+
+    pub fn relayHost(self: *const State) []const u8 {
+        if (self.relay_host_len == 0) return "speedy-socials.local";
+        return self.relay_host_buf[0..self.relay_host_len];
+    }
+
+    pub fn relay_host_or_default(self: *const State) []const u8 {
+        return self.relayHost();
+    }
 };
 
 var instance: State = .{};
@@ -48,6 +62,12 @@ pub fn init(atproto: ?*const Plugin, activitypub: ?*const Plugin, clock: Clock) 
 
 pub fn attachDb(db: *c.sqlite3) void {
     instance.reader_db = db;
+}
+
+pub fn setRelayHost(host: []const u8) void {
+    const cap = @min(host.len, instance.relay_host_buf.len);
+    @memcpy(instance.relay_host_buf[0..cap], host[0..cap]);
+    instance.relay_host_len = @intCast(cap);
 }
 
 pub fn get() *State {

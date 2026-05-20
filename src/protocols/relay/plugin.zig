@@ -51,6 +51,7 @@ pub const firehose_consumer = @import("firehose_consumer.zig");
 pub const ap_to_at = @import("ap_to_at.zig");
 pub const synthetic_keys = @import("synthetic_keys.zig");
 pub const followers = @import("followers.zig");
+pub const at_to_ap_changes = @import("at_to_ap_changes.zig");
 
 /// The relay holds a pointer to the registry between `attachRegistry`
 /// and `init`. `initAll` does not pass the registry through, so we

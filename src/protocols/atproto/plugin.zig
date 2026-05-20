@@ -120,6 +120,7 @@ test {
     _ = @import("plc_routes.zig");
     _ = @import("lexicon.zig");
     _ = @import("blob_gc.zig");
+    _ = @import("firehose_buffer.zig");
 }
 
 test "atproto plugin registers" {

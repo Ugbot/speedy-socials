@@ -369,11 +369,23 @@ pub fn build(b: *std.Build) void {
     });
     const run_sim_chaos = b.addRunArtifact(sim_chaos_exe);
 
+    const sim_replay_exe = b.addExecutable(.{
+        .name = "sim-deterministic-replay",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/sim/deterministic_replay.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &sim_imports,
+        }),
+    });
+    const run_sim_replay = b.addRunArtifact(sim_replay_exe);
+
     const sim_step = b.step("sim", "Run simulation tests");
     sim_step.dependOn(&run_sim_fed.step);
     sim_step.dependOn(&run_sim_fh.step);
     sim_step.dependOn(&run_sim_relay.step);
     sim_step.dependOn(&run_sim_chaos.step);
+    sim_step.dependOn(&run_sim_replay.step);
 
     // The simulation scenarios also run as regular `zig build test` tests.
     const sim_fed_tests = b.addTest(.{

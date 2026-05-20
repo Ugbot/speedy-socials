@@ -292,6 +292,9 @@ pub fn main() !void {
     // (order matters only conceptually; the AP NodeInfo handler reads
     // this on each request).
     activitypub.state.setAdvertiseAtproto(true);
+    // Op-A: wire the relay's record-change hook so AT deletes /
+    // updates emit AP Delete / Update activities.
+    atproto.repo.setChangeHook(relay.at_to_ap_changes.onChange);
     // Relay registers AFTER its siblings — its `init` calls
     // `Registry.find` for "atproto" and "activitypub" (the sole
     // sibling-lookup carve-out; see src/protocols/relay/plugin.zig).

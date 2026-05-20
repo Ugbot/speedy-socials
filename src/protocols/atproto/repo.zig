@@ -222,6 +222,16 @@ pub fn commit(
         var uri_buf: [512]u8 = undefined;
         const uri_str = std.fmt.bufPrint(&uri_buf, "at://{s}/{s}/{s}", .{ did, op.collection, rkey }) catch return error.BufferTooSmall;
 
+        // Op-A: detect create vs update *before* writing the row.
+        const pre_existing = blk: {
+            var prev: ?*c.sqlite3_stmt = null;
+            const sel = "SELECT 1 FROM atp_records WHERE uri = ?";
+            if (c.sqlite3_prepare_v2(db, sel, -1, &prev, null) != c.SQLITE_OK) break :blk false;
+            defer _ = c.sqlite3_finalize(prev);
+            _ = c.sqlite3_bind_text(prev, 1, uri_str.ptr, @intCast(uri_str.len), c.sqliteTransientAsDestructor());
+            break :blk c.sqlite3_step(prev.?) == c.SQLITE_ROW;
+        };
+
         // Persist record row.
         const ins_sql = "INSERT OR REPLACE INTO atp_records (uri, did, collection, rkey, cid, value, indexed_at) VALUES (?,?,?,?,?,?,?)";
         var ins_stmt: ?*c.sqlite3_stmt = null;
@@ -235,6 +245,8 @@ pub fn commit(
         _ = c.sqlite3_bind_blob(ins_stmt, 6, op.value_cbor.ptr, @intCast(op.value_cbor.len), c.sqliteTransientAsDestructor());
         _ = c.sqlite3_bind_int64(ins_stmt, 7, committed_at);
         if (c.sqlite3_step(ins_stmt.?) != c.SQLITE_DONE) return error.StepFailed;
+
+        fireChange(if (pre_existing) ChangeKind.update else ChangeKind.create, did, op.collection, rkey, record_cid_s);
     }
 
     // Compute new MST root.
@@ -423,7 +435,45 @@ pub fn deleteRecord(
     _ = c.sqlite3_bind_text(stmt, 2, collection.ptr, @intCast(collection.len), c.sqliteTransientAsDestructor());
     _ = c.sqlite3_bind_text(stmt, 3, rkey.ptr, @intCast(rkey.len), c.sqliteTransientAsDestructor());
     if (c.sqlite3_step(stmt.?) != c.SQLITE_DONE) return error.StepFailed;
-    return c.sqlite3_changes(db) > 0;
+    const changed = c.sqlite3_changes(db) > 0;
+    // Op-A / A3b: fire the change hook so the relay can emit an
+    // AP Delete activity for bridged records.
+    if (changed) {
+        if (change_hook) |h| h(.delete, did, collection, rkey, "");
+    }
+    return changed;
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Record-change hook (Op-A — A3b / A4b / I2 / I3)
+//
+// The firehose path already publishes #commit events. AP-side
+// translation needs richer signals: knowing *which* records were
+// created, updated, or deleted in a commit so it can emit AP Delete /
+// Update for bridged collections. The hook fires synchronously on
+// the writer thread; the relay's implementation must enqueue work
+// + return quickly.
+// ──────────────────────────────────────────────────────────────────────
+
+pub const ChangeKind = enum { create, update, delete };
+
+pub const ChangeHook = *const fn (kind: ChangeKind, did: []const u8, collection: []const u8, rkey: []const u8, cid: []const u8) void;
+
+var change_hook: ?ChangeHook = null;
+
+pub fn setChangeHook(hook: ?ChangeHook) void {
+    change_hook = hook;
+}
+
+pub fn currentChangeHook() ?ChangeHook {
+    return change_hook;
+}
+
+/// Internal: fire the hook for a single operation. Called from the
+/// commit path after the record is persisted but before the
+/// firehose event is appended.
+fn fireChange(kind: ChangeKind, did: []const u8, collection: []const u8, rkey: []const u8, cid: []const u8) void {
+    if (change_hook) |h| h(kind, did, collection, rkey, cid);
 }
 
 // ── Tests ──────────────────────────────────────────────────────────

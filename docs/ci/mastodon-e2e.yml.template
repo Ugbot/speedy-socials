@@ -1,0 +1,100 @@
+# J5 — Mastodon dev-pod end-to-end integration test (GitHub Actions).
+#
+# Bring up a Mastodon dev image, point speedy-socials at it, exercise
+# one Create + Like + Follow round trip. Skippable on PRs that don't
+# touch federation paths.
+#
+# Activation: copy this file into `.github/workflows/` and uncomment
+# the `on:` trigger. The job is gated by the `e2e-mastodon` label —
+# add it to a PR to opt in.
+
+name: e2e-mastodon
+
+# on:
+#   pull_request:
+#     paths:
+#       - 'src/protocols/activitypub/**'
+#       - 'src/protocols/relay/**'
+#   workflow_dispatch:
+
+jobs:
+  mastodon-e2e:
+    runs-on: ubuntu-latest
+    if: contains(github.event.pull_request.labels.*.name, 'e2e-mastodon')
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: mastodon
+          POSTGRES_USER: mastodon
+          POSTGRES_DB: mastodon_development
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+
+      mastodon:
+        image: tootsuite/mastodon:v4.5
+        env:
+          DB_HOST: postgres
+          DB_USER: mastodon
+          DB_PASS: mastodon
+          REDIS_HOST: redis
+          LOCAL_DOMAIN: mastodon.local
+          LOCAL_HTTPS: 'false'
+          OTP_SECRET: dummy_otp_secret_for_ci_only
+          SECRET_KEY_BASE: dummy_secret_key_base_for_ci_only
+        ports:
+          - 3000:3000
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v1
+        with:
+          version: 0.16.0
+
+      - name: Build speedy-socials
+        run: zig build
+
+      - name: Wait for Mastodon to be ready
+        run: |
+          for i in $(seq 1 60); do
+            if curl -fsS http://localhost:3000/.well-known/nodeinfo; then
+              echo "Mastodon ready"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "Mastodon failed to boot"
+          exit 1
+
+      - name: Boot speedy-socials in background
+        run: |
+          AP_HOSTNAME=speedy.local \
+          AP_OUTBOUND_TARGET=http://localhost:3000 \
+          ./zig-out/bin/speedy-socials &
+          sleep 5
+
+      - name: Round-trip: Follow → Create → Like
+        run: |
+          # Create local account on both sides + exchange follows,
+          # then post + like. The test harness lives at
+          # `tests/e2e/mastodon_roundtrip.sh` and exits non-zero on
+          # any failed step.
+          ./tests/e2e/mastodon_roundtrip.sh
+
+      - name: Capture speedy-socials logs on failure
+        if: failure()
+        run: |
+          tail -200 /tmp/speedy-socials.log || true

@@ -53,11 +53,24 @@ pub const HandlerContext = struct {
 
 pub const Handler = *const fn (hc: *HandlerContext) anyerror!void;
 
+/// Op-E / G5: per-route policy knobs. Callers that want a non-default
+/// body cap (typical: media uploads need more, streaming endpoints
+/// want zero) pass a `RouteMeta` via `registerWithMeta`. Lookups
+/// surface the meta via `MatchResult` so the server can enforce.
+pub const RouteMeta = struct {
+    /// Maximum inbound body bytes accepted on this route. 0 = use
+    /// the server's global cap (`limits.conn_read_buffer_bytes`).
+    /// For streaming endpoints (WS upgrades, SSE) set this to
+    /// `limits.conn_read_buffer_bytes` since their body is empty.
+    max_body_bytes: u32 = 0,
+};
+
 pub const Route = struct {
     method: Method,
     pattern: []const u8, // borrowed; lifetime ≥ Router
     handler: Handler,
     plugin_index: u16, // bookkeeping
+    meta: RouteMeta = .{},
 };
 
 pub const Router = struct {
@@ -70,6 +83,17 @@ pub const Router = struct {
     }
 
     pub fn register(self: *Router, method: Method, pattern: []const u8, handler: Handler, plugin_index: u16) RouterError!void {
+        return self.registerWithMeta(method, pattern, handler, plugin_index, .{});
+    }
+
+    pub fn registerWithMeta(
+        self: *Router,
+        method: Method,
+        pattern: []const u8,
+        handler: Handler,
+        plugin_index: u16,
+        meta: RouteMeta,
+    ) RouterError!void {
         if (self.frozen) return error.DuplicateRoute; // wrong error but expresses "too late"
         if (self.count >= limits.max_routes) return error.TooManyRoutes;
         if (pattern.len > limits.max_route_pattern_bytes) return error.PatternTooLong;
@@ -88,9 +112,24 @@ pub const Router = struct {
             .pattern = pattern,
             .handler = handler,
             .plugin_index = plugin_index,
+            .meta = meta,
         };
         self.count += 1;
         assertLe(self.count, limits.max_routes);
+    }
+
+    /// Look up a route's metadata. Returns null when the path
+    /// doesn't match any registered pattern. Used by the server's
+    /// per-request body-cap check (G5).
+    pub fn matchMeta(self: *const Router, method: Method, path: []const u8) ?RouteMeta {
+        var i: u32 = 0;
+        var params: PathParams = .{};
+        while (i < self.count) : (i += 1) {
+            const r = self.routes[i];
+            if (r.method != method) continue;
+            if (matchPattern(r.pattern, path, &params)) return r.meta;
+        }
+        return null;
     }
 
     pub fn freeze(self: *Router) void {
@@ -236,4 +275,21 @@ test "Router wildcard tail" {
         .ok => {},
         else => return error.TestExpectedOk,
     }
+}
+
+test "G5: per-route RouteMeta surfaces via matchMeta" {
+    const TestH = struct {
+        fn h(_: *HandlerContext) anyerror!void {}
+    };
+    var r = Router.init();
+    try r.registerWithMeta(.post, "/media/upload", TestH.h, 0, .{ .max_body_bytes = 8 * 1024 * 1024 });
+    try r.register(.get, "/healthz", TestH.h, 0);
+
+    const upload_meta = r.matchMeta(.post, "/media/upload").?;
+    try std.testing.expectEqual(@as(u32, 8 * 1024 * 1024), upload_meta.max_body_bytes);
+
+    const health_meta = r.matchMeta(.get, "/healthz").?;
+    try std.testing.expectEqual(@as(u32, 0), health_meta.max_body_bytes); // default
+
+    try std.testing.expect(r.matchMeta(.get, "/unknown") == null);
 }

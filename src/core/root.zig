@@ -32,6 +32,9 @@ pub const secrets = @import("secrets.zig");
 pub const account = @import("account.zig");
 pub const dns = @import("dns.zig");
 pub const dual_identity = @import("dual_identity.zig");
+pub const trace = @import("trace.zig");
+pub const cert_probe = @import("cert_probe.zig");
+pub const tenancy = @import("tenancy.zig");
 
 /// W4: vendored TigerBeetle stdx primitives — `BoundedArrayType`,
 /// `RingBufferType`, `IOPSType`, `BitSetType`, plus the local
@@ -59,6 +62,7 @@ pub const crypto = struct {
 /// `core.crypto` so callers reach for it from the TLS-server side of
 /// the tree, not the crypto primitives.
 pub const tls_boring = @import("tls/boring_inbound.zig");
+pub const tls_cert_admin = @import("tls/cert_admin.zig");
 
 pub const testing = struct {
     pub const fuzz = @import("testing/fuzz.zig");
@@ -114,6 +118,9 @@ test {
     _ = account;
     _ = dns;
     _ = dual_identity;
+    _ = trace;
+    _ = cert_probe;
+    _ = tenancy;
     _ = crypto.ed25519;
     _ = crypto.multibase;
     _ = crypto.multicodec;
@@ -123,6 +130,7 @@ test {
     _ = crypto.argon2id;
     _ = crypto.openssl;
     _ = tls_boring;
+    _ = tls_cert_admin;
     _ = testing.fuzz;
     _ = http.parser;
     _ = http.request;
