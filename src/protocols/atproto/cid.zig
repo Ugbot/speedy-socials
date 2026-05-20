@@ -49,9 +49,20 @@ pub const Cid = struct {
 
 /// Compute a CIDv1 dag-cbor sha2-256 over the supplied data.
 pub fn computeDagCbor(data: []const u8) Cid {
+    return computeWithCodec(data, dag_cbor_codec);
+}
+
+/// Compute a CIDv1 raw (codec 0x55) sha2-256 over the supplied data.
+/// Used for blob CIDs in `com.atproto.repo.uploadBlob` responses and
+/// in BlobRef `$link` fields.
+pub fn computeRaw(data: []const u8) Cid {
+    return computeWithCodec(data, raw_codec);
+}
+
+fn computeWithCodec(data: []const u8, codec_byte: u8) Cid {
     var c: Cid = .{ .bytes = undefined };
     c.bytes[0] = 0x01;
-    c.bytes[1] = dag_cbor_codec;
+    c.bytes[1] = codec_byte;
     c.bytes[2] = sha2_256_code;
     c.bytes[3] = sha2_256_len;
     var hash: [32]u8 = undefined;
@@ -81,7 +92,7 @@ pub fn parseString(s: []const u8) AtpError!Cid {
     if (n != raw_cid_len) return error.BadCid;
 
     if (raw_buf[0] != 0x01) return error.BadCid;
-    if (raw_buf[1] != dag_cbor_codec) return error.BadCid;
+    if (raw_buf[1] != dag_cbor_codec and raw_buf[1] != raw_codec) return error.BadCid;
     if (raw_buf[2] != sha2_256_code) return error.BadCid;
     if (raw_buf[3] != sha2_256_len) return error.BadCid;
 
@@ -191,5 +202,30 @@ test "cid: BufferTooSmall on short output" {
 test "cid: distinct inputs yield distinct CIDs" {
     const a = computeDagCbor("alpha");
     const b = computeDagCbor("beta");
+    try std.testing.expect(!std.mem.eql(u8, a.raw(), b.raw()));
+}
+
+test "cid: raw codec roundtrip" {
+    const payload = "blob-bytes";
+    const cid = computeRaw(payload);
+    try std.testing.expectEqual(raw_codec, cid.codec());
+
+    var sbuf: [string_cid_len]u8 = undefined;
+    const s = try encodeString(cid, &sbuf);
+    // Raw codec CIDs use the `bafkrei…` prefix (vs `bafyrei…` for dag-cbor).
+    try std.testing.expectEqual(@as(u8, 'b'), s[0]);
+    try std.testing.expect(std.mem.startsWith(u8, s, "bafkrei"));
+
+    const parsed = try parseString(s);
+    try std.testing.expectEqualSlices(u8, cid.raw(), parsed.raw());
+    try std.testing.expectEqual(raw_codec, parsed.codec());
+}
+
+test "cid: dag-cbor and raw CIDs of same bytes differ" {
+    const payload = "abc";
+    const a = computeDagCbor(payload);
+    const b = computeRaw(payload);
+    // Same digest, different codec → different CID.
+    try std.testing.expectEqualSlices(u8, a.digest(), b.digest());
     try std.testing.expect(!std.mem.eql(u8, a.raw(), b.raw()));
 }

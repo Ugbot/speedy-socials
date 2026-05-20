@@ -106,6 +106,8 @@ pub const Scope = enum {
     }
 };
 
+pub const max_aud_bytes: usize = 256;
+
 pub const Claims = struct {
     /// Subject — the DID this token authorizes.
     sub_buf: [max_did_bytes]u8 = undefined,
@@ -119,12 +121,19 @@ pub const Claims = struct {
     /// JWT id — random opaque, used for refresh rotation tracking.
     jti_buf: [max_jti_bytes]u8 = undefined,
     jti_len: u8 = 0,
+    /// AT-17: audience (target DID of a service-auth grant). Empty
+    /// for regular session tokens.
+    aud_buf: [max_aud_bytes]u8 = undefined,
+    aud_len: u16 = 0,
 
     pub fn sub(self: *const Claims) []const u8 {
         return self.sub_buf[0..self.sub_len];
     }
     pub fn jti(self: *const Claims) []const u8 {
         return self.jti_buf[0..self.jti_len];
+    }
+    pub fn aud(self: *const Claims) []const u8 {
+        return self.aud_buf[0..self.aud_len];
     }
 
     pub fn setSub(self: *Claims, s: []const u8) AtpError!void {
@@ -138,6 +147,12 @@ pub const Claims = struct {
         @memcpy(self.jti_buf[0..s.len], s);
         self.jti_len = @intCast(s.len);
     }
+
+    pub fn setAud(self: *Claims, s: []const u8) AtpError!void {
+        if (s.len > max_aud_bytes) return error.BufferTooSmall;
+        @memcpy(self.aud_buf[0..s.len], s);
+        self.aud_len = @intCast(s.len);
+    }
 };
 
 // Header is fixed: {"alg":"EdDSA","typ":"JWT"} (base64url encoded).
@@ -148,13 +163,25 @@ const header_b64 = "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9";
 pub fn sign(kp: keypair.Ed25519KeyPair, claims: Claims, out: []u8) AtpError![]const u8 {
     if (out.len < max_jwt_bytes) return error.BufferTooSmall;
 
-    // Build payload JSON in a scratch buffer.
-    var payload_buf: [512]u8 = undefined;
-    const payload_json = std.fmt.bufPrint(
-        &payload_buf,
-        "{{\"sub\":\"{s}\",\"scope\":\"{s}\",\"iat\":{d},\"exp\":{d},\"jti\":\"{s}\"}}",
-        .{ claims.sub(), claims.scope.str(), claims.iat, claims.exp, claims.jti() },
-    ) catch return error.BufferTooSmall;
+    // Build payload JSON in a scratch buffer. `aud` is included
+    // only when non-empty (AT-17 service-auth grants set it; regular
+    // session tokens don't).
+    var payload_buf: [768]u8 = undefined;
+    const aud_str = claims.aud();
+    const payload_json = blk: {
+        if (aud_str.len > 0) {
+            break :blk std.fmt.bufPrint(
+                &payload_buf,
+                "{{\"sub\":\"{s}\",\"scope\":\"{s}\",\"iat\":{d},\"exp\":{d},\"jti\":\"{s}\",\"aud\":\"{s}\"}}",
+                .{ claims.sub(), claims.scope.str(), claims.iat, claims.exp, claims.jti(), aud_str },
+            ) catch return error.BufferTooSmall;
+        }
+        break :blk std.fmt.bufPrint(
+            &payload_buf,
+            "{{\"sub\":\"{s}\",\"scope\":\"{s}\",\"iat\":{d},\"exp\":{d},\"jti\":\"{s}\"}}",
+            .{ claims.sub(), claims.scope.str(), claims.iat, claims.exp, claims.jti() },
+        ) catch return error.BufferTooSmall;
+    };
 
     var pos: usize = 0;
     // Header.

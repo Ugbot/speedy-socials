@@ -6,6 +6,14 @@ ADR-004 in `docs/adr/` for context. Each line below was checked
 against the actual source tree at this commit — if you spot drift,
 fix it._
 
+> **See also**: [`PROTOCOL_AUDIT.md`](PROTOCOL_AUDIT.md) for the
+> definitive per-spec coverage map (AP + AT, file:line references,
+> present/partial/missing per row), and
+> [`SPEC_PUNCHLIST.md`](SPEC_PUNCHLIST.md) for the ticketed gap list
+> (AP-1..AP-30, AT-1..AT-25, DUAL-1..DUAL-5). This file tracks
+> shipped features; those two track what's left to ship to be a
+> full node on each network.
+
 ## Shipped
 
 ### Core runtime

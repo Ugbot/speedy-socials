@@ -19,6 +19,12 @@ pub const Config = struct {
     software_version: []const u8 = "0.1.0",
     /// Whether registration is open. NodeInfo `openRegistrations`.
     open_registrations: bool = false,
+    /// AP-27: this instance also speaks atproto. When true, the
+    /// NodeInfo `metadata.atproto.enabled` block is published so peer
+    /// servers can discover the dual-protocol surface; the
+    /// `metadata.atproto.did` value identifies the PDS in atproto's
+    /// did:web form.
+    atproto_enabled: bool = false,
 };
 
 pub const max_jrd_bytes: usize = 512;
@@ -84,7 +90,15 @@ pub fn writeNodeInfo(cfg: Config, stats: Stats, out: []u8) WriteError![]const u8
     try w.print("{d}", .{stats.local_posts});
     try w.writeAll("},\"metadata\":{\"hostname\":\"");
     try w.writeAll(cfg.hostname);
-    try w.writeAll("\"}}");
+    try w.writeAll("\"");
+    if (cfg.atproto_enabled) {
+        // AP-27: surface atproto support so peers crawling the
+        // fediverse can discover that this host is also a PDS.
+        try w.writeAll(",\"atproto\":{\"enabled\":true,\"did\":\"did:web:");
+        try w.writeAll(cfg.hostname);
+        try w.writeAll("\"}");
+    }
+    try w.writeAll("}}");
     return w.slice();
 }
 
@@ -106,6 +120,22 @@ test "NodeInfo 2.1 document includes required fields" {
     try std.testing.expect(std.mem.indexOf(u8, out, "\"activitypub\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"total\":42") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"localPosts\":99") != null);
+}
+
+test "AP-27: atproto block emitted when enabled" {
+    var buf: [max_nodeinfo_bytes]u8 = undefined;
+    const out = try writeNodeInfo(.{
+        .hostname = "pds.example",
+        .atproto_enabled = true,
+    }, .{}, &buf);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"atproto\":{\"enabled\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"did\":\"did:web:pds.example\"") != null);
+}
+
+test "AP-27: atproto block omitted when disabled" {
+    var buf: [max_nodeinfo_bytes]u8 = undefined;
+    const out = try writeNodeInfo(.{ .hostname = "ap-only.example" }, .{}, &buf);
+    try std.testing.expect(std.mem.indexOf(u8, out, "atproto") == null);
 }
 
 test "openRegistrations toggles correctly" {

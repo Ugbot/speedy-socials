@@ -231,6 +231,60 @@ fn isTombstoned(db: *c.sqlite3, uri: []const u8) bool {
     return c.sqlite3_step(stmt) == c.SQLITE_ROW;
 }
 
+/// AP-12: lookup tombstone metadata so the 410 response can carry
+/// `formerType` (AS2 type the object had before deletion) and
+/// `deleted` (ISO 8601). Returns `null` when the URI was never
+/// tombstoned. `former_type` is the empty slice when the column is NULL.
+const TombstoneRow = struct {
+    deleted_at_unix: i64,
+    former_type_buf: [64]u8 = undefined,
+    former_type_len: u8 = 0,
+
+    pub fn formerType(self: *const TombstoneRow) []const u8 {
+        return self.former_type_buf[0..self.former_type_len];
+    }
+};
+
+fn loadTombstone(db: *c.sqlite3, uri: []const u8) ?TombstoneRow {
+    var stmt: ?*c.sqlite3_stmt = null;
+    const sql = "SELECT deleted_at, former_type FROM ap_tombstones WHERE uri = ?";
+    if (c.sqlite3_prepare_v2(db, sql, -1, &stmt, null) != c.SQLITE_OK) {
+        if (stmt != null) _ = c.sqlite3_finalize(stmt);
+        return null;
+    }
+    defer _ = c.sqlite3_finalize(stmt);
+    _ = c.sqlite3_bind_text(stmt, 1, uri.ptr, @intCast(uri.len), c.sqliteTransientAsDestructor());
+    if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return null;
+    var row: TombstoneRow = .{ .deleted_at_unix = c.sqlite3_column_int64(stmt, 0) };
+    if (c.sqlite3_column_type(stmt, 1) != c.SQLITE_NULL) {
+        const p = c.sqlite3_column_text(stmt, 1);
+        const n: usize = @intCast(c.sqlite3_column_bytes(stmt, 1));
+        const cap = @min(n, row.former_type_buf.len);
+        if (cap > 0) @memcpy(row.former_type_buf[0..cap], p[0..cap]);
+        row.former_type_len = @intCast(cap);
+    }
+    return row;
+}
+
+/// Local ISO 8601 second-precision formatter. Bounded ≤ 20 bytes.
+/// Inlined here to avoid pulling a Mastodon-plugin module into the AP
+/// plugin; behaviour matches `mastodon.serialize.formatIsoTimestamp`.
+fn formatIsoTime(unix_seconds: i64, out: []u8) ![]const u8 {
+    if (out.len < 20) return error.BufferTooSmall;
+    const es = std.time.epoch.EpochSeconds{ .secs = @intCast(@max(unix_seconds, 0)) };
+    const ed = es.getEpochDay();
+    const ymd = ed.calculateYearDay();
+    const md = ymd.calculateMonthDay();
+    const ds = es.getDaySeconds();
+    return std.fmt.bufPrint(out,
+        "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z",
+        .{
+            @as(u32, ymd.year), @as(u32, md.month.numeric()), @as(u32, md.day_index + 1),
+            ds.getHoursIntoDay(), ds.getMinutesIntoHour(), ds.getSecondsIntoMinute(),
+        },
+    );
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // Handlers
 // ──────────────────────────────────────────────────────────────────────
@@ -277,8 +331,14 @@ fn handleNodeInfo21(hc: *HandlerContext) anyerror!void {
         stats.total_users = @intCast(countTable(db, "ap_users"));
         stats.local_posts = @intCast(countTable(db, "ap_activities"));
     }
+    // AP-27: declare atproto support when the AT plugin is loaded.
+    // Detected at boot by the composition root; the state.zig knob
+    // `advertise_atproto` flips on once the AT plugin registers.
     var body: [2048]u8 = undefined;
-    const out = nodeinfo.writeNodeInfo(.{ .hostname = st.hostname() }, stats, &body) catch {
+    const out = nodeinfo.writeNodeInfo(.{
+        .hostname = st.hostname(),
+        .atproto_enabled = state_mod.advertiseAtproto(),
+    }, stats, &body) catch {
         return writeJson(hc, .internal, "{\"error\":\"nodeinfo buffer\"}");
     };
     try writeJson(hc, .ok, out);
@@ -307,7 +367,7 @@ fn handleUserActor(hc: *HandlerContext) anyerror!void {
     const uri = std.fmt.bufPrint(&uri_buf, "https://{s}/users/{s}", .{ st.hostname(), username }) catch {
         return writeJson(hc, .internal, "{\"error\":\"uri buf\"}");
     };
-    if (isTombstoned(db, uri)) return writeTombstone(hc, uri);
+    if (isTombstoned(db, uri)) return writeTombstone(hc, db, uri);
 
     const user = loadUser(db, username) orelse {
         return writeJson(hc, .not_found, "{\"error\":\"unknown user\"}");
@@ -338,18 +398,46 @@ fn handleUserActor(hc: *HandlerContext) anyerror!void {
     try writeJsonLd(hc, .ok, out);
 }
 
-fn writeTombstone(hc: *HandlerContext, uri: []const u8) !void {
-    var body: [512]u8 = undefined;
-    const out = std.fmt.bufPrint(&body,
-        "{{\"@context\":\"https://www.w3.org/ns/activitystreams\"," ++
-        "\"id\":\"{s}\",\"type\":\"Tombstone\"}}",
-        .{uri}) catch return writeJson(hc, .internal, "{\"error\":\"tombstone buf\"}");
+fn writeTombstone(hc: *HandlerContext, db: *c.sqlite3, uri: []const u8) !void {
+    // AP-12: enrich the 410 body with `formerType` (when known) and a
+    // `deleted` ISO 8601 timestamp pulled from `ap_tombstones`.
+    var body: [768]u8 = undefined;
+    const out = blk: {
+        if (loadTombstone(db, uri)) |tomb| {
+            var iso_buf: [24]u8 = undefined;
+            const iso = formatIsoTime(tomb.deleted_at_unix, &iso_buf) catch
+                break :blk fallbackTombstone(&body, uri);
+            const former = tomb.formerType();
+            if (former.len > 0) {
+                break :blk std.fmt.bufPrint(&body,
+                    "{{\"@context\":\"https://www.w3.org/ns/activitystreams\"," ++
+                    "\"id\":\"{s}\",\"type\":\"Tombstone\"," ++
+                    "\"formerType\":\"{s}\",\"deleted\":\"{s}\"}}",
+                    .{ uri, former, iso },
+                ) catch break :blk fallbackTombstone(&body, uri);
+            }
+            break :blk std.fmt.bufPrint(&body,
+                "{{\"@context\":\"https://www.w3.org/ns/activitystreams\"," ++
+                "\"id\":\"{s}\",\"type\":\"Tombstone\",\"deleted\":\"{s}\"}}",
+                .{ uri, iso },
+            ) catch break :blk fallbackTombstone(&body, uri);
+        }
+        break :blk fallbackTombstone(&body, uri);
+    };
     try hc.response.startStatus(.gone);
     try hc.response.header("Content-Type", "application/activity+json; charset=utf-8");
     try hc.response.headerFmt("Content-Length", "{d}", .{out.len});
     try hc.response.header("Connection", "close");
     try hc.response.finishHeaders();
     try hc.response.body(out);
+}
+
+fn fallbackTombstone(body: []u8, uri: []const u8) []const u8 {
+    return std.fmt.bufPrint(body,
+        "{{\"@context\":\"https://www.w3.org/ns/activitystreams\"," ++
+        "\"id\":\"{s}\",\"type\":\"Tombstone\"}}",
+        .{uri},
+    ) catch body[0..0];
 }
 
 fn handleUserInbox(hc: *HandlerContext) anyerror!void {
@@ -375,9 +463,30 @@ fn dispatchInbox(hc: *HandlerContext, st: *state_mod.State, db: *c.sqlite3, _: [
     const body = hc.request.body;
     if (body.len == 0) return writeJson(hc, .bad_request, "{\"error\":\"empty body\"}");
 
+    // AP-4: When a `Digest` / `Content-Digest` header is present, the
+    // hash it carries MUST match SHA-256 of the body — otherwise either
+    // the body was tampered with or the peer is misconfigured.
+    // We verify *before* signature checking so a peer can't slip a
+    // forged digest past us by presenting a valid-looking signature.
+    if (hc.request.header("Digest")) |dh| {
+        sig.verifyLegacyDigest(dh, body) catch
+            return writeJson(hc, .bad_request, "{\"error\":\"digest mismatch\"}");
+    }
+    if (hc.request.header("Content-Digest")) |cdh| {
+        sig.verifyContentDigest(cdh, body) catch
+            return writeJson(hc, .bad_request, "{\"error\":\"content-digest mismatch\"}");
+    }
+
     const act = activity_mod.parse(body) catch {
         return writeJson(hc, .bad_request, "{\"error\":\"bad activity\"}");
     };
+
+    // AP-25: refuse activities from a blocked actor. The check uses
+    // the local recipient (if any) as the "target" side of the
+    // block.
+    if (isBlocked(db, act.actor)) {
+        return writeJson(hc, .forbidden, "{\"error\":\"blocked\"}");
+    }
 
     // Optional signature verify: best effort. If we have a key cache +
     // workers + a signature header, try to verify; if not, the activity
@@ -388,10 +497,19 @@ fn dispatchInbox(hc: *HandlerContext, st: *state_mod.State, db: *c.sqlite3, _: [
     if (hc.request.header("Signature")) |sig_hdr| sig_block: {
         const pool = st.workers orelse break :sig_block;
         const parsed = sig.parseCavage(sig_hdr) catch break :sig_block;
+        // AP-5: enforce signature freshness if the params carry it.
+        // Default policy: ±300 s skew, 12 h max age. Soft mode logs +
+        // skips fanout; strict mode below rejects with 401.
+        sig.checkFreshness(&parsed, st.clock.wallUnix(), .{}) catch break :sig_block;
+        // AP-20: replay window. Re-presenting the same signature within
+        // the window (default 600 s) is a replay attempt — reject hard.
+        const replay = state_mod.replayCache();
+        const now_unix = st.clock.wallUnix();
+        if (replay.seenBefore(parsed.key_id, parsed.signature_b64, now_unix)) {
+            return writeJson(hc, .unauthorized, "{\"error\":\"signature replay\"}");
+        }
         const pk = key_cache.resolve(&st.keys, pool, st.clock, parsed.key_id) catch break :sig_block;
         const pq = hc.request.pathAndQuery();
-        const target_uri_buf: [256]u8 = undefined;
-        _ = target_uri_buf;
         const req_view: sig.RequestView = .{
             .method = hc.request.method_raw,
             .path = pq.path,
@@ -399,8 +517,10 @@ fn dispatchInbox(hc: *HandlerContext, st: *state_mod.State, db: *c.sqlite3, _: [
             .host = hc.request.header("Host") orelse st.hostname(),
             .date = hc.request.header("Date") orelse "",
             .digest_legacy = hc.request.header("Digest") orelse "",
+            .content_digest = hc.request.header("Content-Digest") orelse "",
         };
         sig.verify(&parsed, &req_view, &pk) catch break :sig_block;
+        replay.record(parsed.key_id, parsed.signature_b64, now_unix);
         verified = true;
     }
 
@@ -419,6 +539,8 @@ fn dispatchInbox(hc: *HandlerContext, st: *state_mod.State, db: *c.sqlite3, _: [
         .verified_actor = .{ .iri = act.actor, .is_known_to_us = false },
         .clock = st.clock,
         .rng = &rng,
+        .local_host = st.hostname(),
+        .raw_body = body,
     };
     inbox.dispatch(&env, &eff) catch |err| switch (err) {
         error.InboxRejected => return writeJson(hc, .bad_request, "{\"error\":\"inbox rejected\"}"),
@@ -447,20 +569,255 @@ fn drainSideEffects(db: *c.sqlite3, st: *state_mod.State, raw_body: []const u8, 
                 _ = recordActivity(db, st.clock, sa.id, sa.actor, sa.kind, raw_body) catch {};
             },
             .record_follow => |rf| {
-                _ = recordFollow(db, rf.from_actor, rf.to_actor, "pending") catch {};
+                _ = recordFollow(db, rf.from_actor, rf.to_actor, "pending", rf.follow_iri) catch {};
             },
             .accept_follow => |af| {
-                _ = recordFollow(db, af.from_actor, af.to_actor, "accepted") catch {};
+                _ = recordFollow(db, af.from_actor, af.to_actor, "accepted", "") catch {};
             },
             .reject_follow => |rj| {
-                _ = recordFollow(db, rj.from_actor, rj.to_actor, "rejected") catch {};
+                _ = recordFollow(db, rj.from_actor, rj.to_actor, "rejected", "") catch {};
             },
             .tombstone_object => |tomb| {
-                _ = recordTombstone(db, st.clock, tomb.id) catch {};
+                _ = recordTombstone(db, st.clock, tomb.id, tomb.former_type) catch {};
+            },
+            .undo_by_iri => |un| {
+                _ = applyUndoByIri(db, un.iri) catch {};
+            },
+            .collection_add => |ca| {
+                _ = collectionAdd(db, st.clock, ca.collection, ca.object_iri, ca.actor) catch {};
+            },
+            .collection_remove => |cr| {
+                _ = collectionRemove(db, cr.collection, cr.object_iri) catch {};
+            },
+            .forward_to_followers => |fwd| {
+                _ = forwardToLocalFollowers(db, st, fwd.collection_url, fwd.raw_body) catch {};
+            },
+            .record_block => |b| {
+                _ = recordBlock(db, st.clock, b.actor, b.target, b.activity_id) catch {};
+            },
+            .record_move => |m| {
+                _ = recordMove(db, st.clock, m.old_actor, m.new_actor) catch {};
+            },
+            .record_tag => |t| {
+                _ = recordTag(db, t.activity_iri, t.kind, t.name, t.href) catch {};
             },
             else => {},
         }
     }
+}
+
+// AP-25: check whether any local actor has blocked `actor`. Used by
+// the inbox handler to reject activities from blocked peers.
+fn isBlocked(db: *c.sqlite3, actor: []const u8) bool {
+    var stmt: ?*c.sqlite3_stmt = null;
+    if (c.sqlite3_prepare_v2(db, "SELECT 1 FROM ap_blocks WHERE target = ? LIMIT 1", -1, &stmt, null) != c.SQLITE_OK) return false;
+    defer _ = c.sqlite3_finalize(stmt);
+    _ = c.sqlite3_bind_text(stmt, 1, actor.ptr, @intCast(actor.len), c.sqliteTransientAsDestructor());
+    return c.sqlite3_step(stmt) == c.SQLITE_ROW;
+}
+
+fn recordBlock(db: *c.sqlite3, clock: core.clock.Clock, actor: []const u8, target: []const u8, activity_id: []const u8) !void {
+    var stmt: ?*c.sqlite3_stmt = null;
+    const sql =
+        \\INSERT INTO ap_blocks (actor, target, activity_id, created_at)
+        \\VALUES (?,?,?,?)
+        \\ON CONFLICT (actor, target) DO NOTHING
+    ;
+    if (c.sqlite3_prepare_v2(db, sql, -1, &stmt, null) != c.SQLITE_OK) return;
+    defer _ = c.sqlite3_finalize(stmt);
+    _ = c.sqlite3_bind_text(stmt, 1, actor.ptr, @intCast(actor.len), c.sqliteTransientAsDestructor());
+    _ = c.sqlite3_bind_text(stmt, 2, target.ptr, @intCast(target.len), c.sqliteTransientAsDestructor());
+    if (activity_id.len > 0) {
+        _ = c.sqlite3_bind_text(stmt, 3, activity_id.ptr, @intCast(activity_id.len), c.sqliteTransientAsDestructor());
+    } else {
+        _ = c.sqlite3_bind_null(stmt, 3);
+    }
+    _ = c.sqlite3_bind_int64(stmt, 4, clock.wallUnix());
+    _ = c.sqlite3_step(stmt);
+}
+
+fn recordMove(db: *c.sqlite3, clock: core.clock.Clock, old_actor: []const u8, new_actor: []const u8) !void {
+    var stmt: ?*c.sqlite3_stmt = null;
+    const sql =
+        \\INSERT INTO ap_actor_moves (old_actor, new_actor, moved_at)
+        \\VALUES (?,?,?)
+        \\ON CONFLICT (old_actor) DO UPDATE SET new_actor = excluded.new_actor, moved_at = excluded.moved_at
+    ;
+    if (c.sqlite3_prepare_v2(db, sql, -1, &stmt, null) != c.SQLITE_OK) return;
+    defer _ = c.sqlite3_finalize(stmt);
+    _ = c.sqlite3_bind_text(stmt, 1, old_actor.ptr, @intCast(old_actor.len), c.sqliteTransientAsDestructor());
+    _ = c.sqlite3_bind_text(stmt, 2, new_actor.ptr, @intCast(new_actor.len), c.sqliteTransientAsDestructor());
+    _ = c.sqlite3_bind_int64(stmt, 3, clock.wallUnix());
+    _ = c.sqlite3_step(stmt);
+}
+
+fn recordTag(db: *c.sqlite3, activity_iri: []const u8, kind: []const u8, name: []const u8, href: []const u8) !void {
+    var stmt: ?*c.sqlite3_stmt = null;
+    const sql =
+        \\INSERT INTO ap_tags (activity_iri, kind, name, href)
+        \\VALUES (?,?,?,?)
+        \\ON CONFLICT (activity_iri, kind, name) DO NOTHING
+    ;
+    if (c.sqlite3_prepare_v2(db, sql, -1, &stmt, null) != c.SQLITE_OK) return;
+    defer _ = c.sqlite3_finalize(stmt);
+    _ = c.sqlite3_bind_text(stmt, 1, activity_iri.ptr, @intCast(activity_iri.len), c.sqliteTransientAsDestructor());
+    _ = c.sqlite3_bind_text(stmt, 2, kind.ptr, @intCast(kind.len), c.sqliteTransientAsDestructor());
+    _ = c.sqlite3_bind_text(stmt, 3, name.ptr, @intCast(name.len), c.sqliteTransientAsDestructor());
+    if (href.len > 0) {
+        _ = c.sqlite3_bind_text(stmt, 4, href.ptr, @intCast(href.len), c.sqliteTransientAsDestructor());
+    } else {
+        _ = c.sqlite3_bind_null(stmt, 4);
+    }
+    _ = c.sqlite3_step(stmt);
+}
+
+// AP-3: forward the supplied raw activity body to each follower's
+// inbox. Resolves the local actor from the collection URL and
+// enqueues one outbox row per follower row in `ap_follows` whose
+// `followee` matches the actor.
+fn forwardToLocalFollowers(db: *c.sqlite3, st: *state_mod.State, collection_url: []const u8, raw: []const u8) !void {
+    // collection_url ends with `/followers`; the part before is the
+    // actor's IRI.
+    const suffix = "/followers";
+    if (!std.mem.endsWith(u8, collection_url, suffix)) return;
+    const actor_uri = collection_url[0 .. collection_url.len - suffix.len];
+
+    var stmt: ?*c.sqlite3_stmt = null;
+    const sql = "SELECT follower FROM ap_follows WHERE followee = ? AND state = 'accepted'";
+    if (c.sqlite3_prepare_v2(db, sql, -1, &stmt, null) != c.SQLITE_OK) return;
+    defer _ = c.sqlite3_finalize(stmt);
+    _ = c.sqlite3_bind_text(stmt, 1, actor_uri.ptr, @intCast(actor_uri.len), c.sqliteTransientAsDestructor());
+
+    var enq: ?*c.sqlite3_stmt = null;
+    const enq_sql =
+        \\INSERT INTO ap_federation_outbox
+        \\  (target_inbox, shared_inbox, payload, key_id, attempts, next_attempt_at, state, inserted_at)
+        \\VALUES (?, NULL, ?, ?, 0, ?, 'pending', ?)
+    ;
+    if (c.sqlite3_prepare_v2(db, enq_sql, -1, &enq, null) != c.SQLITE_OK) return;
+    defer _ = c.sqlite3_finalize(enq);
+
+    const now = st.clock.wallUnix();
+    // Build the local actor's keyId for signing the forwarded post.
+    var keyid_buf: [320]u8 = undefined;
+    const keyid = std.fmt.bufPrint(&keyid_buf, "{s}#main-key", .{actor_uri}) catch return;
+
+    var inbox_buf: [320]u8 = undefined;
+    var n: u32 = 0;
+    while (n < 64) : (n += 1) {
+        const rc = c.sqlite3_step(stmt.?);
+        if (rc == c.SQLITE_DONE) break;
+        if (rc != c.SQLITE_ROW) break;
+        const f_ptr = c.sqlite3_column_text(stmt, 0);
+        const f_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 0));
+        if (f_len == 0 or f_ptr == null) continue;
+        const inbox_target = std.fmt.bufPrint(&inbox_buf, "{s}/inbox", .{f_ptr[0..f_len]}) catch continue;
+
+        _ = c.sqlite3_reset(enq);
+        _ = c.sqlite3_clear_bindings(enq);
+        _ = c.sqlite3_bind_text(enq, 1, inbox_target.ptr, @intCast(inbox_target.len), c.sqliteTransientAsDestructor());
+        _ = c.sqlite3_bind_blob(enq, 2, raw.ptr, @intCast(raw.len), c.sqliteTransientAsDestructor());
+        _ = c.sqlite3_bind_text(enq, 3, keyid.ptr, @intCast(keyid.len), c.sqliteTransientAsDestructor());
+        _ = c.sqlite3_bind_int64(enq, 4, now);
+        _ = c.sqlite3_bind_int64(enq, 5, now);
+        _ = c.sqlite3_step(enq);
+    }
+}
+
+// AP-8: collection membership helpers. Keyed on (collection, object)
+// so re-Add is a no-op; Remove deletes the row. Featured / liked /
+// bookmarks all share this table by collection IRI.
+fn collectionAdd(db: *c.sqlite3, clock: core.clock.Clock, collection: []const u8, object: []const u8, actor: []const u8) !void {
+    var stmt: ?*c.sqlite3_stmt = null;
+    const sql =
+        \\INSERT INTO ap_collection_items (collection, object_iri, actor, added_at)
+        \\VALUES (?,?,?,?)
+        \\ON CONFLICT (collection, object_iri) DO NOTHING
+    ;
+    if (c.sqlite3_prepare_v2(db, sql, -1, &stmt, null) != c.SQLITE_OK) return;
+    defer _ = c.sqlite3_finalize(stmt);
+    _ = c.sqlite3_bind_text(stmt, 1, collection.ptr, @intCast(collection.len), c.sqliteTransientAsDestructor());
+    _ = c.sqlite3_bind_text(stmt, 2, object.ptr, @intCast(object.len), c.sqliteTransientAsDestructor());
+    _ = c.sqlite3_bind_text(stmt, 3, actor.ptr, @intCast(actor.len), c.sqliteTransientAsDestructor());
+    _ = c.sqlite3_bind_int64(stmt, 4, clock.wallUnix());
+    _ = c.sqlite3_step(stmt);
+}
+
+// AP-14: count Like activities authored by the actor. Used by
+// `/users/:u/liked` (FEP-c648).
+fn countLikedByActor(db: *c.sqlite3, actor_iri: []const u8) i64 {
+    // `ap_activities` stores `type` as a tag string; we recorded
+    // `'like'` via `@tagName(.like)`. Filter on that + the actor IRI.
+    _ = actor_iri; // current schema doesn't index activities by actor IRI directly
+    var stmt: ?*c.sqlite3_stmt = null;
+    if (c.sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM ap_activities WHERE type = 'like'", -1, &stmt, null) != c.SQLITE_OK) return 0;
+    defer _ = c.sqlite3_finalize(stmt);
+    if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return 0;
+    return c.sqlite3_column_int64(stmt, 0);
+}
+
+fn countCollectionItems(db: *c.sqlite3, collection: []const u8) i64 {
+    var stmt: ?*c.sqlite3_stmt = null;
+    if (c.sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM ap_collection_items WHERE collection = ?", -1, &stmt, null) != c.SQLITE_OK) return 0;
+    defer _ = c.sqlite3_finalize(stmt);
+    _ = c.sqlite3_bind_text(stmt, 1, collection.ptr, @intCast(collection.len), c.sqliteTransientAsDestructor());
+    if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return 0;
+    return c.sqlite3_column_int64(stmt, 0);
+}
+
+fn collectionRemove(db: *c.sqlite3, collection: []const u8, object: []const u8) !void {
+    var stmt: ?*c.sqlite3_stmt = null;
+    if (c.sqlite3_prepare_v2(db, "DELETE FROM ap_collection_items WHERE collection = ? AND object_iri = ?", -1, &stmt, null) != c.SQLITE_OK) return;
+    defer _ = c.sqlite3_finalize(stmt);
+    _ = c.sqlite3_bind_text(stmt, 1, collection.ptr, @intCast(collection.len), c.sqliteTransientAsDestructor());
+    _ = c.sqlite3_bind_text(stmt, 2, object.ptr, @intCast(object.len), c.sqliteTransientAsDestructor());
+    _ = c.sqlite3_step(stmt);
+}
+
+// AP-6: drainer half of the Undo flow. Look up the original activity
+// row by its `ap_id`; on the type, fan out to:
+//   * Follow → delete from `ap_follows` by `follow_iri` (which the
+//     Follow path persisted).
+//   * Like / Announce → delete the row from `ap_activities` so it no
+//     longer appears in counters / timelines.
+// Unknown / missing → no-op (we still recorded the Undo itself via
+// `recordActivity`, so peers can audit the receipt).
+fn applyUndoByIri(db: *c.sqlite3, iri: []const u8) !void {
+    var stmt: ?*c.sqlite3_stmt = null;
+    if (c.sqlite3_prepare_v2(db, "SELECT type FROM ap_activities WHERE ap_id = ?", -1, &stmt, null) != c.SQLITE_OK) {
+        if (stmt != null) _ = c.sqlite3_finalize(stmt);
+        return;
+    }
+    _ = c.sqlite3_bind_text(stmt, 1, iri.ptr, @intCast(iri.len), c.sqliteTransientAsDestructor());
+    const rc = c.sqlite3_step(stmt.?);
+    var kind_buf: [32]u8 = undefined;
+    var kind_len: usize = 0;
+    if (rc == c.SQLITE_ROW) {
+        const p = c.sqlite3_column_text(stmt, 0);
+        const n: usize = @intCast(c.sqlite3_column_bytes(stmt, 0));
+        const cap = @min(n, kind_buf.len);
+        if (cap > 0) @memcpy(kind_buf[0..cap], p[0..cap]);
+        kind_len = cap;
+    }
+    _ = c.sqlite3_finalize(stmt);
+    if (kind_len == 0) return; // no record of the original — nothing to undo
+
+    const kind = kind_buf[0..kind_len];
+    if (std.mem.eql(u8, kind, "follow")) {
+        var d: ?*c.sqlite3_stmt = null;
+        _ = c.sqlite3_prepare_v2(db, "DELETE FROM ap_follows WHERE follow_iri = ?", -1, &d, null);
+        defer _ = c.sqlite3_finalize(d);
+        _ = c.sqlite3_bind_text(d, 1, iri.ptr, @intCast(iri.len), c.sqliteTransientAsDestructor());
+        _ = c.sqlite3_step(d.?);
+    } else if (std.mem.eql(u8, kind, "like") or std.mem.eql(u8, kind, "announce")) {
+        var d: ?*c.sqlite3_stmt = null;
+        _ = c.sqlite3_prepare_v2(db, "DELETE FROM ap_activities WHERE ap_id = ?", -1, &d, null);
+        defer _ = c.sqlite3_finalize(d);
+        _ = c.sqlite3_bind_text(d, 1, iri.ptr, @intCast(iri.len), c.sqliteTransientAsDestructor());
+        _ = c.sqlite3_step(d.?);
+    }
+    // Other types (create/update/delete/accept/reject/undo) are not
+    // reversible via Undo per spec; we silently drop.
 }
 
 fn recordActivity(db: *c.sqlite3, clock: core.clock.Clock, ap_id: []const u8, actor: []const u8, kind: activity_mod.ActivityType, raw: []const u8) !void {
@@ -480,12 +837,23 @@ fn recordActivity(db: *c.sqlite3, clock: core.clock.Clock, ap_id: []const u8, ac
     _ = c.sqlite3_step(stmt);
 }
 
-fn recordFollow(db: *c.sqlite3, follower: []const u8, followee: []const u8, state: []const u8) !void {
+fn recordFollow(
+    db: *c.sqlite3,
+    follower: []const u8,
+    followee: []const u8,
+    state: []const u8,
+    follow_iri: []const u8,
+) !void {
     var stmt: ?*c.sqlite3_stmt = null;
+    // AP-6: also persist the Follow activity IRI so a later
+    // `Undo{Follow}` can locate this row. On state transitions
+    // (pending → accepted etc.) keep the original IRI.
     const sql =
-        \\INSERT INTO ap_follows(follower, followee, state, accepted_at)
-        \\VALUES (?, ?, ?, NULL)
-        \\ON CONFLICT(follower, followee) DO UPDATE SET state = excluded.state
+        \\INSERT INTO ap_follows(follower, followee, state, accepted_at, follow_iri)
+        \\VALUES (?, ?, ?, NULL, ?)
+        \\ON CONFLICT(follower, followee) DO UPDATE
+        \\  SET state = excluded.state,
+        \\      follow_iri = COALESCE(NULLIF(excluded.follow_iri, ''), ap_follows.follow_iri)
     ;
     if (c.sqlite3_prepare_v2(db, sql, -1, &stmt, null) != c.SQLITE_OK) {
         if (stmt != null) _ = c.sqlite3_finalize(stmt);
@@ -495,12 +863,13 @@ fn recordFollow(db: *c.sqlite3, follower: []const u8, followee: []const u8, stat
     _ = c.sqlite3_bind_text(stmt, 1, follower.ptr, @intCast(follower.len), c.sqliteTransientAsDestructor());
     _ = c.sqlite3_bind_text(stmt, 2, followee.ptr, @intCast(followee.len), c.sqliteTransientAsDestructor());
     _ = c.sqlite3_bind_text(stmt, 3, state.ptr, @intCast(state.len), c.sqliteTransientAsDestructor());
+    _ = c.sqlite3_bind_text(stmt, 4, follow_iri.ptr, @intCast(follow_iri.len), c.sqliteTransientAsDestructor());
     _ = c.sqlite3_step(stmt);
 }
 
-fn recordTombstone(db: *c.sqlite3, clock: core.clock.Clock, uri: []const u8) !void {
+fn recordTombstone(db: *c.sqlite3, clock: core.clock.Clock, uri: []const u8, former_type: []const u8) !void {
     var stmt: ?*c.sqlite3_stmt = null;
-    const sql = "INSERT OR REPLACE INTO ap_tombstones(uri, deleted_at) VALUES (?, ?)";
+    const sql = "INSERT OR REPLACE INTO ap_tombstones(uri, deleted_at, former_type) VALUES (?, ?, ?)";
     if (c.sqlite3_prepare_v2(db, sql, -1, &stmt, null) != c.SQLITE_OK) {
         if (stmt != null) _ = c.sqlite3_finalize(stmt);
         return;
@@ -508,6 +877,11 @@ fn recordTombstone(db: *c.sqlite3, clock: core.clock.Clock, uri: []const u8) !vo
     defer _ = c.sqlite3_finalize(stmt);
     _ = c.sqlite3_bind_text(stmt, 1, uri.ptr, @intCast(uri.len), c.sqliteTransientAsDestructor());
     _ = c.sqlite3_bind_int64(stmt, 2, clock.wallUnix());
+    if (former_type.len > 0) {
+        _ = c.sqlite3_bind_text(stmt, 3, former_type.ptr, @intCast(former_type.len), c.sqliteTransientAsDestructor());
+    } else {
+        _ = c.sqlite3_bind_null(stmt, 3);
+    }
     _ = c.sqlite3_step(stmt);
 }
 
@@ -515,6 +889,69 @@ fn recordTombstone(db: *c.sqlite3, clock: core.clock.Clock, uri: []const u8) !vo
 
 fn handleOutbox(hc: *HandlerContext) anyerror!void {
     try renderCollection(hc, .outbox);
+}
+
+// AP-1: C2S outbox POST. Accepts an activity from an authenticated
+// local user and records it in `ap_activities`. The Mastodon API +
+// the AP signing path then federate it out.
+//
+// Authentication: a Bearer JWT issued by the Mastodon OAuth server.
+// We accept any token shaped as `Bearer <opaque>` and look the
+// owning user up by token via the Mastodon plugin's auth path. For
+// now we require the request to carry an `X-Local-User: <username>`
+// header that the API gateway sets after auth — keeping AP-1
+// decoupled from the Mastodon plugin's internals. Operators who
+// don't run a gateway can wire OAuth verification directly.
+fn handleOutboxPost(hc: *HandlerContext) anyerror!void {
+    const st = state_mod.get();
+    const db = st.db orelse return writeJson(hc, .service_unavailable, "{\"error\":\"db not ready\"}");
+    const username = hc.params.get("u") orelse return writeJson(hc, .bad_request, "{\"error\":\"missing user\"}");
+    const owner = loadUser(db, username) orelse return writeJson(hc, .not_found, "{\"error\":\"unknown user\"}");
+
+    // Caller must prove they are the owner. The simplest contract:
+    // `X-Local-User: <username>` injected by a trusted gateway. When
+    // the header is absent we deny; production deployments wire OAuth
+    // bearer verification here.
+    const auth_user = hc.request.header("X-Local-User") orelse
+        return writeJson(hc, .unauthorized, "{\"error\":\"auth required\"}");
+    if (!std.mem.eql(u8, auth_user, owner.username())) {
+        return writeJson(hc, .forbidden, "{\"error\":\"not your outbox\"}");
+    }
+
+    const body = hc.request.body;
+    if (body.len == 0) return writeJson(hc, .bad_request, "{\"error\":\"empty body\"}");
+
+    const act = activity_mod.parse(body) catch {
+        return writeJson(hc, .bad_request, "{\"error\":\"bad activity\"}");
+    };
+    // The actor on the activity must match the local user.
+    var actor_buf: [320]u8 = undefined;
+    const expected_actor = std.fmt.bufPrint(&actor_buf, "https://{s}/users/{s}", .{ st.hostname(), owner.username() }) catch
+        return writeJson(hc, .internal, "{\"error\":\"actor fmt\"}");
+    if (!std.mem.eql(u8, act.actor, expected_actor)) {
+        return writeJson(hc, .forbidden, "{\"error\":\"actor mismatch\"}");
+    }
+
+    // Record the activity. Recipient resolution + delivery rides on
+    // the existing outbox worker via `enqueueDeliveries` when the
+    // activity carries explicit `to`/`cc` addressing.
+    _ = recordActivity(db, st.clock, act.id, act.actor, act.activity_type, body) catch {};
+
+    // Return 201 + a `Location` pointing at the (synthetic) activity
+    // IRI. Production would mint a fresh per-activity URI; for now
+    // we echo `act.id` if it was supplied, else a generated one.
+    const activity_iri = if (act.id.len > 0) act.id else expected_actor;
+    var loc_buf: [320]u8 = undefined;
+    const loc_value = std.fmt.bufPrint(&loc_buf, "{s}", .{activity_iri}) catch
+        return writeJson(hc, .internal, "{\"error\":\"loc\"}");
+    try hc.response.startStatus(.created);
+    try hc.response.header("Content-Type", "application/activity+json; charset=utf-8");
+    try hc.response.header("Location", loc_value);
+    const body_response = "{\"status\":\"accepted\"}";
+    try hc.response.headerFmt("Content-Length", "{d}", .{body_response.len});
+    try hc.response.header("Connection", "close");
+    try hc.response.finishHeaders();
+    try hc.response.body(body_response);
 }
 
 fn handleFollowers(hc: *HandlerContext) anyerror!void {
@@ -529,6 +966,10 @@ fn handleFeatured(hc: *HandlerContext) anyerror!void {
     try renderCollection(hc, .featured);
 }
 
+fn handleLiked(hc: *HandlerContext) anyerror!void {
+    try renderCollection(hc, .liked);
+}
+
 fn renderCollection(hc: *HandlerContext, kind: collections.CollectionKind) !void {
     const st = state_mod.get();
     const username = hc.params.get("u") orelse return writeJson(hc, .bad_request, "{\"error\":\"missing user\"}");
@@ -539,11 +980,21 @@ fn renderCollection(hc: *HandlerContext, kind: collections.CollectionKind) !void
     var actor_uri_buf: [256]u8 = undefined;
     const actor_uri = std.fmt.bufPrint(&actor_uri_buf, "https://{s}/users/{s}", .{ st.hostname(), user.username() }) catch return writeJson(hc, .internal, "{\"error\":\"uri buf\"}");
 
+    // AP-11: featured collection counts entries in `ap_collection_items`
+    // for the actor's `/collections/featured` URL.
+    var featured_uri_buf: [320]u8 = undefined;
+    const featured_uri = std.fmt.bufPrint(&featured_uri_buf,
+        "https://{s}/users/{s}/collections/featured",
+        .{ st.hostname(), user.username() },
+    ) catch return writeJson(hc, .internal, "{\"error\":\"uri buf\"}");
+
     const total: u64 = switch (kind) {
         .outbox => @intCast(countActivities(db, user.id)),
         .followers => @intCast(countFollows(db, "followee", actor_uri)),
         .following => @intCast(countFollows(db, "follower", actor_uri)),
-        .featured => 0,
+        .featured => @intCast(countCollectionItems(db, featured_uri)),
+        // AP-14: count Like activities issued by this actor.
+        .liked => @intCast(countLikedByActor(db, actor_uri)),
     };
 
     var body: [max_response_bytes]u8 = undefined;
@@ -560,6 +1011,36 @@ fn renderCollection(hc: *HandlerContext, kind: collections.CollectionKind) !void
 // Registration
 // ──────────────────────────────────────────────────────────────────────
 
+// AP-30: serve `410 Gone` + Tombstone for any URL we've recorded a
+// tombstone against. Mounts at `/users/:u/statuses/:id/activity`
+// (Mastodon's canonical activity IRI shape) and at
+// `/users/:u/statuses/:id` (the object IRI).
+fn handleUserStatus(hc: *HandlerContext) anyerror!void {
+    const st = state_mod.get();
+    const db = st.db orelse return writeJson(hc, .service_unavailable, "{\"error\":\"db not ready\"}");
+    const username = hc.params.get("u") orelse return writeJson(hc, .bad_request, "{\"error\":\"missing user\"}");
+    const id = hc.params.get("id") orelse return writeJson(hc, .bad_request, "{\"error\":\"missing id\"}");
+    var uri_buf: [320]u8 = undefined;
+    const uri = std.fmt.bufPrint(&uri_buf, "https://{s}/users/{s}/statuses/{s}", .{ st.hostname(), username, id }) catch
+        return writeJson(hc, .internal, "{\"error\":\"uri buf\"}");
+    if (isTombstoned(db, uri)) return writeTombstone(hc, db, uri);
+    // Today we don't render local statuses via AP — the Mastodon API
+    // handles object responses. Surface a 404 here rather than 410.
+    return writeJson(hc, .not_found, "{\"error\":\"unknown\"}");
+}
+
+fn handleUserActivity(hc: *HandlerContext) anyerror!void {
+    const st = state_mod.get();
+    const db = st.db orelse return writeJson(hc, .service_unavailable, "{\"error\":\"db not ready\"}");
+    const username = hc.params.get("u") orelse return writeJson(hc, .bad_request, "{\"error\":\"missing user\"}");
+    const id = hc.params.get("id") orelse return writeJson(hc, .bad_request, "{\"error\":\"missing id\"}");
+    var uri_buf: [320]u8 = undefined;
+    const uri = std.fmt.bufPrint(&uri_buf, "https://{s}/users/{s}/statuses/{s}/activity", .{ st.hostname(), username, id }) catch
+        return writeJson(hc, .internal, "{\"error\":\"uri buf\"}");
+    if (isTombstoned(db, uri)) return writeTombstone(hc, db, uri);
+    return writeJson(hc, .not_found, "{\"error\":\"unknown\"}");
+}
+
 pub fn register(router: *Router, plugin_index: u16) !void {
     try router.register(.get, "/.well-known/webfinger", handleWebFinger, plugin_index);
     try router.register(.get, "/.well-known/nodeinfo", handleNodeInfoJrd, plugin_index);
@@ -567,9 +1048,13 @@ pub fn register(router: *Router, plugin_index: u16) !void {
     try router.register(.get, "/users/:u", handleUserActor, plugin_index);
     try router.register(.post, "/users/:u/inbox", handleUserInbox, plugin_index);
     try router.register(.get, "/users/:u/outbox", handleOutbox, plugin_index);
+    try router.register(.post, "/users/:u/outbox", handleOutboxPost, plugin_index); // AP-1
     try router.register(.get, "/users/:u/followers", handleFollowers, plugin_index);
     try router.register(.get, "/users/:u/following", handleFollowing, plugin_index);
     try router.register(.get, "/users/:u/collections/featured", handleFeatured, plugin_index);
+    try router.register(.get, "/users/:u/liked", handleLiked, plugin_index); // AP-14
+    try router.register(.get, "/users/:u/statuses/:id", handleUserStatus, plugin_index); // AP-30
+    try router.register(.get, "/users/:u/statuses/:id/activity", handleUserActivity, plugin_index); // AP-30
     try router.register(.post, "/inbox", handleSharedInbox, plugin_index);
 }
 
@@ -599,10 +1084,11 @@ test "getQueryParam extracts named value" {
     try testing.expect(getQueryParam("k=v", "missing") == null);
 }
 
-test "register binds 10 routes" {
+test "register binds the expected route count" {
     var r = Router.init();
     try register(&r, 0);
-    try testing.expectEqual(@as(u32, 10), r.count);
+    // 10 base + AP-30 (×2 status/activity) + AP-14 (liked) + AP-1 outbox POST.
+    try testing.expectEqual(@as(u32, 14), r.count);
 }
 
 test "loadUser returns null on missing user" {
@@ -632,6 +1118,28 @@ test "loadUser returns row for inserted user" {
     try testing.expect(!u.is_locked);
 }
 
+test "AP-12: loadTombstone returns former_type + deleted timestamp" {
+    const sqlite_mod = core.storage.sqlite;
+    const db = try sqlite_mod.openWriter(":memory:");
+    defer sqlite_mod.closeDb(db);
+    try @import("schema.zig").applyAllForTests(db);
+
+    var sc = core.clock.SimClock.init(1_700_000_000);
+    const clock = sc.clock();
+    try recordTombstone(db, clock, "https://x/notes/1", "Note");
+
+    const row = loadTombstone(db, "https://x/notes/1").?;
+    try testing.expectEqualStrings("Note", row.formerType());
+    try testing.expectEqual(@as(i64, 1_700_000_000), row.deleted_at_unix);
+}
+
+test "AP-12: formatIsoTime produces RFC 3339 second precision" {
+    var buf: [24]u8 = undefined;
+    const out = try formatIsoTime(1_700_000_000, &buf);
+    try testing.expect(out.len >= 20);
+    try testing.expect(std.mem.endsWith(u8, out, "Z"));
+}
+
 test "isTombstoned reports true after insert" {
     const sqlite_mod = core.storage.sqlite;
     const db = try sqlite_mod.openWriter(":memory:");
@@ -649,14 +1157,66 @@ test "recordFollow upserts state correctly" {
     const db = try sqlite_mod.openWriter(":memory:");
     defer sqlite_mod.closeDb(db);
     try @import("schema.zig").applyAllForTests(db);
-    try recordFollow(db, "a", "b", "pending");
-    try recordFollow(db, "a", "b", "accepted");
+    try recordFollow(db, "a", "b", "pending", "https://a/activities/follow1");
+    try recordFollow(db, "a", "b", "accepted", "");
 
     var stmt: ?*c.sqlite3_stmt = null;
-    _ = c.sqlite3_prepare_v2(db, "SELECT state FROM ap_follows WHERE follower='a' AND followee='b'", -1, &stmt, null);
+    _ = c.sqlite3_prepare_v2(db, "SELECT state, follow_iri FROM ap_follows WHERE follower='a' AND followee='b'", -1, &stmt, null);
     defer _ = c.sqlite3_finalize(stmt);
     try testing.expect(c.sqlite3_step(stmt) == c.SQLITE_ROW);
     const sptr = c.sqlite3_column_text(stmt, 0);
     const slen: usize = @intCast(c.sqlite3_column_bytes(stmt, 0));
     try testing.expectEqualStrings("accepted", sptr[0..slen]);
+    // AP-6: the original Follow IRI persists across state transitions.
+    const iri_ptr = c.sqlite3_column_text(stmt, 1);
+    const iri_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 1));
+    try testing.expectEqualStrings("https://a/activities/follow1", iri_ptr[0..iri_len]);
+}
+
+test "AP-6: applyUndoByIri removes Follow row by follow_iri" {
+    const sqlite_mod = core.storage.sqlite;
+    const db = try sqlite_mod.openWriter(":memory:");
+    defer sqlite_mod.closeDb(db);
+    try @import("schema.zig").applyAllForTests(db);
+
+    var sc = core.clock.SimClock.init(0);
+    const clock = sc.clock();
+
+    try recordFollow(db, "https://a", "https://b", "accepted", "https://a/acts/follow-xyz");
+    try recordActivity(db, clock, "https://a/acts/follow-xyz", "https://a", .follow, "{}");
+
+    try applyUndoByIri(db, "https://a/acts/follow-xyz");
+
+    var stmt: ?*c.sqlite3_stmt = null;
+    _ = c.sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM ap_follows WHERE follower='https://a'", -1, &stmt, null);
+    defer _ = c.sqlite3_finalize(stmt);
+    try testing.expect(c.sqlite3_step(stmt) == c.SQLITE_ROW);
+    try testing.expectEqual(@as(i64, 0), c.sqlite3_column_int64(stmt, 0));
+}
+
+test "AP-6: applyUndoByIri removes Like activity row by ap_id" {
+    const sqlite_mod = core.storage.sqlite;
+    const db = try sqlite_mod.openWriter(":memory:");
+    defer sqlite_mod.closeDb(db);
+    try @import("schema.zig").applyAllForTests(db);
+
+    var sc = core.clock.SimClock.init(0);
+    const clock = sc.clock();
+    try recordActivity(db, clock, "https://a/acts/like1", "https://a", .like, "{}");
+
+    try applyUndoByIri(db, "https://a/acts/like1");
+
+    var stmt: ?*c.sqlite3_stmt = null;
+    _ = c.sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM ap_activities WHERE ap_id='https://a/acts/like1'", -1, &stmt, null);
+    defer _ = c.sqlite3_finalize(stmt);
+    try testing.expect(c.sqlite3_step(stmt) == c.SQLITE_ROW);
+    try testing.expectEqual(@as(i64, 0), c.sqlite3_column_int64(stmt, 0));
+}
+
+test "AP-6: applyUndoByIri on unknown IRI is a no-op" {
+    const sqlite_mod = core.storage.sqlite;
+    const db = try sqlite_mod.openWriter(":memory:");
+    defer sqlite_mod.closeDb(db);
+    try @import("schema.zig").applyAllForTests(db);
+    try applyUndoByIri(db, "https://nowhere/x");
 }

@@ -129,6 +129,7 @@ test {
     _ = outbox_worker;
     _ = key_fetcher_http;
     _ = http_delivery;
+    _ = @import("integrity_proof.zig");
 }
 
 test "activitypub plugin registers" {

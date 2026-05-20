@@ -75,15 +75,43 @@ pub fn currentRelayInboxHook() ?RelayInboxHook {
 pub const SideEffect = union(enum) {
     store_activity: struct { id: []const u8, actor: []const u8, kind: ActivityType },
     store_object: struct { id: []const u8, kind: []const u8, actor: []const u8 },
-    record_follow: struct { from_actor: []const u8, to_actor: []const u8 },
+    /// `follow_iri` is the IRI of the Follow activity itself (used by
+    /// AP-6 to locate the row on Undo{Follow}). Empty when the
+    /// inbound Follow didn't carry an `id`.
+    record_follow: struct { from_actor: []const u8, to_actor: []const u8, follow_iri: []const u8 },
     accept_follow: struct { from_actor: []const u8, to_actor: []const u8 },
     reject_follow: struct { from_actor: []const u8, to_actor: []const u8 },
     enqueue_delivery: struct { target: []const u8, in_reply_to_id: []const u8 },
-    tombstone_object: struct { id: []const u8 },
+    tombstone_object: struct { id: []const u8, former_type: []const u8 },
     update_object: struct { id: []const u8, kind: []const u8 },
     record_announce: struct { actor: []const u8, object: []const u8 },
     record_like: struct { actor: []const u8, object: []const u8 },
     increment_counter: struct { name: []const u8 },
+    /// AP-6: reverse the side-effects of a prior Follow/Like/Announce
+    /// referenced by its IRI. The drainer looks up the original
+    /// activity row to learn its type, then deletes the
+    /// type-appropriate state (ap_follows row by `follow_iri`, or
+    /// ap_activities row by ap_id for Likes / Announces).
+    undo_by_iri: struct { iri: []const u8 },
+    /// AP-8: add `object` to `collection` (e.g. featured posts) or
+    /// remove it. The drainer writes / deletes a row in
+    /// `ap_collection_items`.
+    collection_add: struct { collection: []const u8, object_iri: []const u8, actor: []const u8 },
+    collection_remove: struct { collection: []const u8, object_iri: []const u8 },
+    /// AP-3: inbox forwarding (AP §7.1.3). When the activity's `cc`
+    /// names a local actor's followers collection, we forward the
+    /// (verbatim) raw body to that actor's followers. The drainer
+    /// expands the collection URL via the local follower index and
+    /// enqueues an outbox row per resolved inbox.
+    forward_to_followers: struct { collection_url: []const u8, raw_body: []const u8 },
+    /// AP-25: block enforcement. Records a (actor → target) pair so
+    /// subsequent activities from the blocked actor get 403'd.
+    record_block: struct { actor: []const u8, target: []const u8, activity_id: []const u8 },
+    /// AP-26: actor move (FEP-fb2a). Records the old→new actor
+    /// migration. Follower migration is a downstream worker.
+    record_move: struct { old_actor: []const u8, new_actor: []const u8 },
+    /// AP-17: tag from `tag[]` — a Mention / Hashtag / Emoji entry.
+    record_tag: struct { activity_iri: []const u8, kind: []const u8, name: []const u8, href: []const u8 },
     /// Returned only when the state machine wants to drop the activity
     /// with no other effect (e.g., duplicate Like). Caller logs.
     drop_silently: struct { reason: []const u8 },
@@ -121,6 +149,12 @@ pub const Envelope = struct {
     verified_actor: VerifiedActor,
     clock: Clock,
     rng: *Rng,
+    /// AP-3: local hostname (so state machines can detect local
+    /// followers collections in `cc`). Empty disables forwarding.
+    local_host: []const u8 = &.{},
+    /// AP-3: raw inbound body, used as the forwarded payload when
+    /// `forward_to_followers` fires. Empty disables forwarding.
+    raw_body: []const u8 = &.{},
 };
 
 // ──────────────────────────────────────────────────────────────────────
@@ -135,6 +169,25 @@ pub fn dispatch(env: *const Envelope, effects: *SideEffectBuffer) ApError!void {
     if (!std.mem.eql(u8, env.verified_actor.iri, env.activity.actor)) {
         return error.InboxRejected;
     }
+
+    // AP-17: persist any tags attached to the activity body.
+    var ti: u8 = 0;
+    while (ti < env.activity.tags.len) : (ti += 1) {
+        const t = env.activity.tags.items[ti];
+        const kind_str: []const u8 = switch (t.kind) {
+            .mention => "mention",
+            .hashtag => "hashtag",
+            .emoji => "emoji",
+            .other => "other",
+        };
+        if (t.name.len == 0) continue;
+        try effects.push(.{ .record_tag = .{
+            .activity_iri = env.activity.id,
+            .kind = kind_str,
+            .name = t.name,
+            .href = t.href,
+        } });
+    }
     switch (env.activity.activity_type) {
         .create => try runCreate(env, effects),
         .update => try runUpdate(env, effects),
@@ -144,15 +197,25 @@ pub fn dispatch(env: *const Envelope, effects: *SideEffectBuffer) ApError!void {
         .reject => try runReject(env, effects),
         .announce => try runAnnounce(env, effects),
         .like => try runLike(env, effects),
-        // B4: Undo {Follow / Like / Announce} — for the AP local
-        // user state machine there's nothing to do beyond emit a
-        // generic counter; the relay's inbox hook handles the
-        // bridge-specific cleanup (follower-table delete).
-        .undo => try effects.push(.{ .increment_counter = .{ .name = "ap.inbox.undo" } }),
-        // A5: explicitly-not-bridged. The relay hook records a
-        // "dropped" translation-log row; here we just count.
-        .move => try effects.push(.{ .increment_counter = .{ .name = "ap.inbox.move" } }),
-        .block => try effects.push(.{ .increment_counter = .{ .name = "ap.inbox.block" } }),
+        // AP-6: Undo{Follow/Like/Announce}. Emit `undo_by_iri` so the
+        // drainer can locate and remove the right state (follow row /
+        // activity row); also bump the per-activity counter.
+        .undo => try runUndo(env, effects),
+        // AP-8: Add{object → collection} / Remove{object → collection}.
+        .add => try runAddRemove(env, effects, .add),
+        .remove => try runAddRemove(env, effects, .remove),
+        // AP-16: Question/Poll. The Question itself is a stored
+        // object; vote replies arrive as Create{Note} with
+        // `inReplyTo = <question iri>`. For now we count + audit-log
+        // the Question; poll-tally aggregation needs an
+        // `ap_poll_options` table which is a future ticket.
+        .question => try effects.push(.{ .increment_counter = .{ .name = "ap.inbox.question" } }),
+        // AP-26: record the old→new mapping; downstream lookups
+        // chase via `ap_actor_moves`.
+        .move => try runMove(env, effects),
+        // AP-25: persist the block so subsequent activities from
+        // the blocked actor can be 403'd.
+        .block => try runBlock(env, effects),
         .flag => try effects.push(.{ .increment_counter = .{ .name = "ap.inbox.flag" } }),
     }
 }
@@ -197,6 +260,22 @@ fn runCreate(env: *const Envelope, eff: *SideEffectBuffer) ApError!void {
                         .target = env.activity.to_first,
                         .in_reply_to_id = env.activity.object_id,
                     } });
+                }
+                // AP-3: inbox forwarding. If any `cc` entry names a
+                // local actor's `/followers` collection, forward the
+                // verbatim raw body to that follower set.
+                if (env.local_host.len > 0 and env.raw_body.len > 0) {
+                    var ci: u8 = 0;
+                    while (ci < env.activity.cc.len) : (ci += 1) {
+                        const addr = env.activity.cc.items[ci];
+                        if (isLocalFollowersCollection(addr, env.local_host)) {
+                            try eff.push(.{ .forward_to_followers = .{
+                                .collection_url = addr,
+                                .raw_body = env.raw_body,
+                            } });
+                            break;
+                        }
+                    }
                 }
                 try eff.push(.{ .increment_counter = .{ .name = "ap.inbox.create" } });
                 s = .done;
@@ -259,7 +338,10 @@ fn runDelete(env: *const Envelope, eff: *SideEffectBuffer) ApError!void {
                 s = .tombstone;
             },
             .tombstone => {
-                try eff.push(.{ .tombstone_object = .{ .id = env.activity.object_id } });
+                try eff.push(.{ .tombstone_object = .{
+                    .id = env.activity.object_id,
+                    .former_type = env.activity.object_type,
+                } });
                 try eff.push(.{ .store_activity = .{
                     .id = env.activity.id,
                     .actor = env.activity.actor,
@@ -294,6 +376,7 @@ fn runFollow(env: *const Envelope, eff: *SideEffectBuffer) ApError!void {
                 try eff.push(.{ .record_follow = .{
                     .from_actor = env.activity.actor,
                     .to_actor = env.activity.object_id,
+                    .follow_iri = env.activity.id,
                 } });
                 s = .auto_accept;
             },
@@ -465,6 +548,139 @@ fn runLike(env: *const Envelope, eff: *SideEffectBuffer) ApError!void {
                 s = .done;
             },
             .done => unreachableState("Like.done reached in loop body"),
+        }
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Undo (AP-6)
+//
+// `Undo` reverses the side effects of a prior `Follow`, `Like`, or
+// `Announce` issued by the same actor. The Undo's `object` is the IRI
+// of the activity being reversed.
+//
+// We don't know the original activity's type just from the IRI — and
+// inline `object` types may or may not be present. The state machine
+// therefore emits a generic `undo_by_iri` effect; the drainer
+// dereferences the IRI in `ap_activities` (where we audit-log every
+// inbound activity) to learn the original type and run the right
+// cleanup.
+// ──────────────────────────────────────────────────────────────────────
+
+pub const UndoState = enum { start, validate, emit, done };
+
+fn runUndo(env: *const Envelope, eff: *SideEffectBuffer) ApError!void {
+    var s: UndoState = .start;
+    var guard: u32 = 0;
+    while (s != .done) : (guard += 1) {
+        assertLe(guard, 8);
+        switch (s) {
+            .start => s = .validate,
+            .validate => {
+                if (env.activity.object_id.len == 0) return error.BadObject;
+                s = .emit;
+            },
+            .emit => {
+                try eff.push(.{ .undo_by_iri = .{ .iri = env.activity.object_id } });
+                try eff.push(.{ .store_activity = .{
+                    .id = env.activity.id,
+                    .actor = env.activity.actor,
+                    .kind = .undo,
+                } });
+                try eff.push(.{ .increment_counter = .{ .name = "ap.inbox.undo" } });
+                s = .done;
+            },
+            .done => unreachableState("Undo.done reached in loop body"),
+        }
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// AP-25: Block
+// ──────────────────────────────────────────────────────────────────────
+
+fn runBlock(env: *const Envelope, eff: *SideEffectBuffer) ApError!void {
+    if (env.activity.object_id.len == 0) return error.BadObject;
+    try eff.push(.{ .record_block = .{
+        .actor = env.activity.actor,
+        .target = env.activity.object_id,
+        .activity_id = env.activity.id,
+    } });
+    try eff.push(.{ .store_activity = .{
+        .id = env.activity.id,
+        .actor = env.activity.actor,
+        .kind = .block,
+    } });
+    try eff.push(.{ .increment_counter = .{ .name = "ap.inbox.block" } });
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// AP-26: Move
+// ──────────────────────────────────────────────────────────────────────
+
+fn runMove(env: *const Envelope, eff: *SideEffectBuffer) ApError!void {
+    if (env.activity.target.len == 0) return error.BadObject;
+    try eff.push(.{ .record_move = .{
+        .old_actor = env.activity.actor,
+        .new_actor = env.activity.target,
+    } });
+    try eff.push(.{ .store_activity = .{
+        .id = env.activity.id,
+        .actor = env.activity.actor,
+        .kind = .move,
+    } });
+    try eff.push(.{ .increment_counter = .{ .name = "ap.inbox.move" } });
+}
+
+/// AP-3: detect whether `addr` is a local followers collection URL.
+fn isLocalFollowersCollection(addr: []const u8, local_host: []const u8) bool {
+    const prefix = "https://";
+    if (!std.mem.startsWith(u8, addr, prefix)) return false;
+    if (addr.len <= prefix.len + local_host.len) return false;
+    if (!std.mem.startsWith(u8, addr[prefix.len..], local_host)) return false;
+    return std.mem.endsWith(u8, addr, "/followers");
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Add / Remove (AP-8)
+// ──────────────────────────────────────────────────────────────────────
+
+pub const AddRemoveKind = enum { add, remove };
+pub const AddRemoveState = enum { start, validate, emit, done };
+
+fn runAddRemove(env: *const Envelope, eff: *SideEffectBuffer, kind: AddRemoveKind) ApError!void {
+    var s: AddRemoveState = .start;
+    var guard: u32 = 0;
+    while (s != .done) : (guard += 1) {
+        assertLe(guard, 8);
+        switch (s) {
+            .start => s = .validate,
+            .validate => {
+                if (env.activity.object_id.len == 0) return error.BadObject;
+                if (env.activity.target.len == 0) return error.BadObject;
+                s = .emit;
+            },
+            .emit => {
+                switch (kind) {
+                    .add => try eff.push(.{ .collection_add = .{
+                        .collection = env.activity.target,
+                        .object_iri = env.activity.object_id,
+                        .actor = env.activity.actor,
+                    } }),
+                    .remove => try eff.push(.{ .collection_remove = .{
+                        .collection = env.activity.target,
+                        .object_iri = env.activity.object_id,
+                    } }),
+                }
+                try eff.push(.{ .store_activity = .{
+                    .id = env.activity.id,
+                    .actor = env.activity.actor,
+                    .kind = if (kind == .add) .add else .remove,
+                } });
+                try eff.push(.{ .increment_counter = .{ .name = if (kind == .add) "ap.inbox.add" else "ap.inbox.remove" } });
+                s = .done;
+            },
+            .done => unreachableState("AddRemove.done reached in loop body"),
         }
     }
 }

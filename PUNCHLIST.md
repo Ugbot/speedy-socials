@@ -9,6 +9,12 @@ Sections are loose groupings, not phases — items within a section
 can be tackled in any order. Items between sections are usually
 independent too (dependencies are called out inline).
 
+**Scope of this file**: operational + bridge-correctness items.
+Raw protocol-spec conformance gaps live in
+[`SPEC_PUNCHLIST.md`](SPEC_PUNCHLIST.md) (AP-1..AP-30, AT-1..AT-25,
+DUAL-1..DUAL-5), with the underlying audit in
+[`PROTOCOL_AUDIT.md`](PROTOCOL_AUDIT.md).
+
 _Last refreshed: 2026-05-19._
 
 ---

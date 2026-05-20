@@ -154,6 +154,91 @@ pub const user_passwords_migration: Migration = .{
     .down = "DROP TABLE atp_user_passwords;",
 };
 
+// AT-3: distinguish event kinds on the firehose so subscribers receive
+// the right frame header (`#commit` / `#identity` / `#account` /
+// `#tombstone`). Pre-existing rows are commit events; the default
+// preserves their semantics.
+pub const firehose_event_kind_migration: Migration = .{
+    .id = 2010,
+    .name = "atproto:firehose_event_kind",
+    .up = "ALTER TABLE atp_firehose_events ADD COLUMN event_kind TEXT NOT NULL DEFAULT 'commit';",
+    .down = "",
+};
+
+// AT-21: moderation report storage. Reports are opaque JSON envelopes
+// today — admin tooling enumerates them; structured fields can be
+// promoted out of `subject_json` as moderation workflows mature.
+// AT-1: OAuth Pushed Authorization Requests.
+pub const oauth_par_migration: Migration = .{
+    .id = 2013,
+    .name = "atproto:oauth_par",
+    .up =
+    \\CREATE TABLE IF NOT EXISTS atp_oauth_par (
+    \\    request_uri    TEXT PRIMARY KEY,
+    \\    client_id      TEXT NOT NULL,
+    \\    redirect_uri   TEXT NOT NULL,
+    \\    code_challenge TEXT NOT NULL,
+    \\    scope          TEXT NOT NULL,
+    \\    expires_at     INTEGER NOT NULL
+    \\) STRICT;
+    ,
+    .down = "DROP TABLE atp_oauth_par;",
+};
+
+// AT-1: authorization codes minted after consent.
+pub const oauth_codes_migration: Migration = .{
+    .id = 2014,
+    .name = "atproto:oauth_codes",
+    .up =
+    \\CREATE TABLE IF NOT EXISTS atp_oauth_codes (
+    \\    code        TEXT PRIMARY KEY,
+    \\    did         TEXT NOT NULL,
+    \\    request_uri TEXT NOT NULL,
+    \\    expires_at  INTEGER NOT NULL
+    \\) STRICT;
+    ,
+    .down = "DROP TABLE atp_oauth_codes;",
+};
+
+// AT-20: labels (com.atproto.label). Each row is one labeller-issued
+// label against a subject URI/CID. Queried by `queryLabels`;
+// streamed via `subscribeLabels`.
+pub const labels_migration: Migration = .{
+    .id = 2012,
+    .name = "atproto:labels",
+    .up =
+    \\CREATE TABLE IF NOT EXISTS atp_labels (
+    \\    seq        INTEGER PRIMARY KEY AUTOINCREMENT,
+    \\    src        TEXT NOT NULL,
+    \\    uri        TEXT NOT NULL,
+    \\    cid        TEXT,
+    \\    val        TEXT NOT NULL,
+    \\    neg        INTEGER NOT NULL DEFAULT 0,
+    \\    created_at INTEGER NOT NULL,
+    \\    exp        INTEGER
+    \\) STRICT;
+    \\CREATE INDEX IF NOT EXISTS atp_labels_uri_idx ON atp_labels (uri);
+    \\CREATE INDEX IF NOT EXISTS atp_labels_src_idx ON atp_labels (src);
+    ,
+    .down = "DROP TABLE atp_labels;",
+};
+
+pub const reports_migration: Migration = .{
+    .id = 2011,
+    .name = "atproto:reports",
+    .up =
+    \\CREATE TABLE IF NOT EXISTS atp_reports (
+    \\    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    \\    reason_type  TEXT NOT NULL,
+    \\    reason_text  TEXT,
+    \\    subject_json BLOB NOT NULL,
+    \\    created_at   INTEGER NOT NULL
+    \\) STRICT;
+    \\CREATE INDEX IF NOT EXISTS atp_reports_created_idx ON atp_reports (created_at DESC);
+    ,
+    .down = "DROP TABLE atp_reports;",
+};
+
 pub const all_migrations = [_]Migration{
     repos_migration,
     commits_migration,
@@ -164,4 +249,9 @@ pub const all_migrations = [_]Migration{
     firehose_events_migration,
     sessions_migration,
     user_passwords_migration,
+    firehose_event_kind_migration,
+    reports_migration,
+    labels_migration,
+    oauth_par_migration,
+    oauth_codes_migration,
 };

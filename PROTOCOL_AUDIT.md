@@ -1,301 +1,456 @@
 # Protocol Conformance Audit
 
-**Date**: 2026-03-17
-**Scope**: ActivityPub (W3C + Mastodon extensions + FEPs) and AT Protocol (atproto PDS)
-**Baseline**: Latest specs as of March 2026
+**Date**: 2026-05-19 (full rewrite — supersedes the 2026-03-17 audit,
+which referenced files removed by the Tiger-Style restructure).
+**Scope**: ActivityPub (W3C REC + Mastodon extensions + FEPs) and
+AT Protocol (atproto PDS + relay).
+**Posture**: Are we a **full node on each network**, not just a bridge.
+**Paired with**: [`SPEC_PUNCHLIST.md`](SPEC_PUNCHLIST.md) (the ticketed
+gap list), [`PUNCHLIST.md`](PUNCHLIST.md) (operational items),
+[`docs/design/translation-matrix.md`](docs/design/translation-matrix.md)
+(per-activity bridge coverage), [`FEATURE_TODO.md`](FEATURE_TODO.md).
+
+This document audits what is in the tree against each spec. Each
+section marks every requirement as **present** / **partial** / **missing**
+with a file:line pointer. The companion `SPEC_PUNCHLIST.md` turns the
+gaps into tickets (AP-1..AP-30, AT-1..AT-25) with one-line acceptance
+criteria.
 
 ---
 
-## ActivityPub
+## Executive verdict
 
-### CRITICAL — Blocks federation with any real server
+| Posture                                          | Status |
+|---|---|
+| AP receiver / S2S federation peer (Mastodon-style) | ✅ production-shaped, with documented gaps |
+| AP independent server (clients post via AP C2S)    | ❌ not viable — no C2S outbox POST |
+| AT PDS for self-hosted accounts (legacy JWT auth)  | ⚠️ usable — repo + firehose work; OAuth missing |
+| AT participant on the live Bluesky network          | ❌ not viable — no `requestCrawl`, no full event stream, no OAuth, no account lifecycle |
+| AP↔AT bridge / relay                                | ✅ shipped (W6 + B + A1) — see [`docs/adr/002-protocol-relay.md`](docs/adr/002-protocol-relay.md) |
 
-#### AP-C1: HTTP Signatures are fake
-**Files**: `src/activitypub.zig:600-604`, `src/federation.zig:103-105`
-**Issue**: `generateHttpSignature()` fills the signature with `crypto.random.bytes` instead of performing RSA-SHA256 signing. No remote server will accept these.
-**Spec**: draft-cavage-http-signatures-12, RFC 9421
-**Fix**: Implement real RSA-PKCS1-v1_5 signing with SHA-256. Generate a 2048-bit RSA key pair per actor, store the private key in the database, and use it to sign the `(request-target)`, `host`, `date`, and `digest` headers.
-
-#### AP-C2: No HTTP Signature verification
-**File**: `src/activitypub.zig:380-390`
-**Issue**: `verifyHttpSignature()` returns `true` unconditionally. Any actor can forge activities to the inbox.
-**Spec**: draft-cavage-http-signatures-12 Section 3.2, RFC 9421
-**Fix**: Parse the `Signature` header, fetch the remote actor's public key via their `publicKey.id`, reconstruct the signing string from the declared headers, and verify the RSA-SHA256 signature.
-
-#### AP-C3: No RFC 9421 (HTTP Message Signatures) support
-**Issue**: Mastodon 4.5+ enables RFC 9421 by default. Servers that only speak draft-cavage will lose interop over time.
-**Spec**: RFC 9421
-**Fix**: Support both draft-cavage-12 and RFC 9421. On outbound, use draft-cavage for now with RFC 9421 as opt-in. On inbound, accept both. RFC 9421 uses separate `Signature-Input` and `Signature` headers and signs `@method`, `@target-uri`, `content-digest`, `content-type`.
-
-#### AP-C4: Mock RSA keys on actors
-**File**: `src/activitypub.zig:257`
-**Issue**: `publicKeyPem` is a hardcoded `"MOCK_PUBLIC_KEY"` string. Remote servers fetching the actor to verify signatures will get garbage.
-**Fix**: Generate a real RSA-2048 key pair on account creation. Store private key in a new `actor_keys` table. Serve the PEM-encoded public key in the actor's `publicKey.publicKeyPem` field.
-
-#### AP-C5: All incoming activity handlers are empty
-**File**: `src/activitypub.zig:455-522`
-**Issue**: `handleIncomingNote`, `handleIncomingFollow`, `handleIncomingLike`, `handleIncomingAccept`, `handleIncomingReject`, `handleIncomingUndo`, `handleIncomingUpdate`, `handleIncomingDelete` are all no-ops with `TODO` comments. The inbox accepts activities but discards them.
-**Fix**: Implement each handler:
-- `Follow` → store relationship, auto-send `Accept` (or queue for approval if `is_locked`), send `Accept`/`Reject` activity back
-- `Create(Note)` → store remote post with `federated=true` flag, resolve mentions, index for search
-- `Like` → increment favourite count, store remote like
-- `Announce` → store as reblog, increment reblog count
-- `Undo` → reverse the original activity (unfollow, unlike, unboost)
-- `Delete` → mark object as deleted, return 410 Gone on future fetches
-- `Update` → update stored remote object content
-- `Accept`/`Reject` → update pending follow state
-
-#### AP-C6: Hardcoded follower inboxes
-**File**: `src/activitypub.zig:742-743`
-**Issue**: `getFollowersInboxes()` returns hardcoded `mastodon.social/inbox` and `pixelfed.social/inbox` instead of querying the database. Would spam real public instances.
-**Fix**: Query the database for followers, join with a remote actors table that stores their inbox/shared inbox URLs. Deduplicate by shared inbox to reduce delivery requests.
-
-#### AP-C7: No Content-Type negotiation on actor endpoints
-**Issue**: Actor profiles must be served as `application/activity+json` when the client sends `Accept: application/activity+json` or `Accept: application/ld+json; profile="https://www.w3.org/ns/activitystreams"`. No Accept header checking exists in the server routing.
-**Spec**: W3C ActivityPub Section 3.2
-**Fix**: Check the `Accept` header on `/users/{username}` requests. If it includes `application/activity+json` or the LD+JSON profile, serve the ActivityPub JSON-LD representation. Otherwise serve the HTML profile page.
-
-#### AP-C8: Broken timestamp conversion
-**File**: `src/activitypub.zig:525-528`
-**Issue**: `timestampToIso8601()` always returns the hardcoded string `"2024-01-01T00:00:00Z"`. Every activity and note will have the same fake timestamp.
-**Fix**: Implement real Unix timestamp to ISO 8601 conversion using `std.time.epoch` or manual calculation.
+**Bottom line.** The core primitives are good — both protocols have
+real crypto, real storage, real signing, real firehose. The
+**ecosystem layer** is what's missing: AP C2S + recipient resolution,
+AT OAuth + relay registration + account lifecycle + non-`#commit`
+firehose events.
 
 ---
 
-### HIGH — Required for Mastodon interoperability
+# Part I — ActivityPub
 
-#### AP-H1: No NodeInfo endpoint
-**Issue**: `/.well-known/nodeinfo` is not implemented. Mastodon and other fediverse software use NodeInfo for server discovery, population stats, and protocol capability advertisement.
-**Spec**: NodeInfo 2.1 (FEP-f1d5, FEP-0151)
-**Fix**: Add `GET /.well-known/nodeinfo` returning a JRD with a link to a NodeInfo 2.1 document. The NodeInfo document must include `software.name`, `software.version`, `protocols: ["activitypub"]`, `openRegistrations`, and `usage.users` stats from the database.
+Source tree: `src/protocols/activitypub/`. Files: `activity.zig`,
+`actor.zig`, `collections.zig`, `delivery.zig`, `http_delivery.zig`,
+`inbox.zig`, `key_cache.zig`, `key_fetcher_http.zig`, `keys.zig`,
+`nodeinfo.zig`, `outbox_worker.zig`, `plugin.zig`, `routes.zig`,
+`schema.zig`, `sig.zig`, `state.zig`, `webfinger.zig`.
 
-#### AP-H2: Actor missing `featured` collection
-**Issue**: Mastodon expects a `featured` field on actors pointing to an `OrderedCollection` of pinned posts. Missing from `PersonObject`.
-**Spec**: Mastodon ActivityPub extensions (`toot:featured`)
-**Fix**: Add `featured` and `featuredTags` URLs to `PersonObject`. Serve `GET /users/{username}/collections/featured` as an `OrderedCollection`.
+## 1. Actor document (AP §4, AS2 §4.1)
 
-#### AP-H3: Actor missing `discoverable` and `indexable`
-**Issue**: These Mastodon namespace fields control profile directory inclusion and full-text search opt-in. Present in the Mastodon API `Account` type but missing from the ActivityPub `PersonObject`.
-**Spec**: Mastodon namespace (`toot:discoverable`, `toot:indexable`)
-**Fix**: Add `discoverable: bool` and `indexable: bool` to `PersonObject`. Source values from user profile settings.
+| Requirement | Status | Where | Note |
+|---|---|---|---|
+| Actor IRI (`id`)                              | ✅ | `actor.zig:39` | |
+| Actor type                                     | ⚠️ | `actor.zig:40` | `Person` only — no Service/Organization/Group |
+| `preferredUsername` / `name` / `summary`       | ✅ | `actor.zig:41-46` | |
+| `inbox` / `outbox`                             | ✅ | `actor.zig:49-50` | URLs emitted |
+| `followers` / `following`                      | ✅ | `actor.zig:51-52` | URLs emitted |
+| `featured`                                     | ✅ URL / ⚠️ contents | `actor.zig:53` | Collection always empty |
+| `featuredTags`                                 | ❌ | — | Not emitted |
+| `endpoints.sharedInbox`                        | ✅ | `actor.zig:54` | |
+| `publicKey` (FEP-521a / Mastodon-required)     | ✅ | `actor.zig:73-79` | Ed25519 or RSA SPKI PEM |
+| `manuallyApprovesFollowers`                    | ✅ | `actor.zig:63-64` | From `users.is_locked` |
+| `discoverable` / `indexable` (`toot:`)         | ✅ | `actor.zig:66-70` | |
+| Multiple keys (FEP-d36d Multikey)              | ❌ | — | Single key per actor |
+| JSON-LD `@context` array                       | ✅ | `actor.zig:33-38` | AS2 + toot namespace |
+| Conneg `application/activity+json`             | ✅ | `routes.zig:85-93` | Also LD+JSON profile |
 
-#### AP-H4: Actor missing `manuallyApprovesFollowers`
-**Issue**: Required for locked/approval-required accounts. The `is_locked` field exists in the database but is not exposed in the ActivityPub actor representation.
-**Spec**: ActivityStreams 2.0 extension (widely adopted)
-**Fix**: Add `manuallyApprovesFollowers: bool` to `PersonObject`, sourced from `users.is_locked`.
+## 2. Collections (AP §5, §6)
 
-#### AP-H5: No outbox endpoint
-**Issue**: Routes include `/users/{username}/inbox` but no `/users/{username}/outbox`. The outbox is required by the W3C spec as a readable `OrderedCollection` of the actor's published activities.
-**Spec**: W3C ActivityPub Section 5.1
-**Fix**: Implement `GET /users/{username}/outbox` returning an `OrderedCollection` with the user's public posts wrapped in `Create` activities, paginated.
+| Requirement | Status | Where | Note |
+|---|---|---|---|
+| OrderedCollection index                        | ✅ | `collections.zig:80-89` | `totalItems` + `first` |
+| OrderedCollectionPage page                     | ✅ | `collections.zig:102-128` | Single page |
+| `partOf` backpointer                           | ✅ | `collections.zig:106` | |
+| Multi-page (`next` / `prev`)                   | ❌ | — | No `next`/`prev` emitted; cap is `collections.max_page_items` (40) |
+| `?page=N` traversal                            | ⚠️ | `routes.zig:95-122` | Param parsed; only page=1 ever returned |
+| Followers / following / outbox routes          | ✅ | `routes.zig:569-572` | GET only |
+| `featured` collection contents                 | ❌ | — | Stub; route exists, items always empty |
+| `liked` collection (FEP-c648)                  | ❌ | — | Neither URL on actor nor route |
+| `replies` per-object                           | ❌ | — | Not emitted |
 
-#### AP-H6: No followers/following collection endpoints
-**Issue**: URLs for `followers` and `following` are generated in actor objects (`activitypub.zig:251-252`) but no server routes serve these collections.
-**Spec**: W3C ActivityPub Section 5.3, 5.4
-**Fix**: Implement `GET /users/{username}/followers` and `GET /users/{username}/following` as paginated `OrderedCollection` responses. For privacy, return only the `totalItems` count to non-authenticated requests, and the full list to the account owner.
+## 3. Inbox + S2S delivery (AP §7)
 
-#### AP-H7: No Delete/Tombstone handling
-**Issue**: The spec requires that deleted objects return 410 Gone with a `Tombstone` object. No implementation exists for sending `Delete` activities or responding with tombstones.
-**Spec**: W3C ActivityPub Section 6.4, ActivityStreams 2.0 `Tombstone` type
-**Fix**: When a user deletes a post, send a `Delete` activity with a `Tombstone` object to all followers. Store a tombstone record in the database. Return 410 with the tombstone on future GET requests for the deleted object's URI.
+| Requirement | Status | Where | Note |
+|---|---|---|---|
+| `POST /users/:u/inbox`                         | ✅ | `routes.zig:568` | |
+| `POST /inbox` (shared inbox)                   | ✅ | `routes.zig:573` | |
+| 202 Accepted                                   | ✅ | `routes.zig:426-427` | |
+| Actor-matches-signature check                  | ✅ | `inbox.zig:135-136` | |
+| Side-effect drain pattern                      | ✅ | `routes.zig:427-445` | Effects queued, drained after 202 |
+| Activity audit log                             | ✅ | `schema.zig:112-128` | `ap_activities` table |
+| Forwarding-from-inbox (AP §7.1.3)              | ⚠️ | `inbox.zig:194-202` | Create *does* enqueue delivery via `.fanout` to `to_first`. But: only first to-recipient, only Create. Spec wants full cc-followers redistribution per §7.1.3 |
+| Recipient resolution (`to`/`cc`/`bto`/`bcc`)    | ❌ | `activity.zig:84-86` | Only `to_first` parsed. `cc`/`bto`/`bcc`/`audience` never inspected on inbound |
+| `bto` / `bcc` stripping outbound               | ✅ | `delivery.zig:76-131` | |
+| Recipient dedup + shared-inbox preference      | ✅ | `delivery.zig:42-74` | |
+| Public addressing (`as:Public`)                | ❌ | — | No special handling |
 
-#### AP-H8: No `bto`/`bcc` stripping before delivery
-**Issue**: The spec mandates removing `bto` and `bcc` fields from activities before delivering them to remote servers (they are used only for recipient calculation).
-**Spec**: W3C ActivityPub Section 6.2
-**Fix**: Strip `bto` and `bcc` from the serialized activity JSON before sending to any remote inbox.
+### 3.1 Activity-type coverage (AS2 vocabulary)
 
-#### AP-H9: No recipient deduplication
-**Issue**: The spec requires deduplicating recipients across `to`, `cc`, `bto`, `bcc` and excluding the activity's own actor from the recipient list.
-**Spec**: W3C ActivityPub Section 6.10
-**Fix**: Build a deduplicated set of recipient inbox URLs. Remove the sending actor from the set. Use shared inboxes where available to reduce request count.
+| Activity | Status | Where |
+|---|---|---|
+| Create   | ✅ full state machine | `inbox.zig:164-207` |
+| Update   | ✅ | `inbox.zig:213-241` |
+| Delete   | ✅ tombstone + 410 | `inbox.zig:244-269`, `schema.zig` |
+| Follow   | ✅ auto-accept if unlocked | `inbox.zig:272-309` |
+| Accept   | ✅ | `inbox.zig:312-344` |
+| Reject   | ✅ | `inbox.zig:347-373` |
+| Announce | ✅ | `inbox.zig:376-402` |
+| Like     | ✅ | `inbox.zig:405-431` |
+| Undo     | ⚠️ counter only — no `unfollow`/`unlike`/`unboost` cleanup of stored state | `inbox.zig:151` |
+| Move     | ⚠️ counter only — no `Move{alsoKnownAs}` migration | `inbox.zig:154` |
+| Block    | ⚠️ counter only — no enforcement on subsequent activities | `inbox.zig:155` |
+| Flag     | ⚠️ counter only — no moderation queue | `inbox.zig:156` |
+| Add / Remove | ❌ | — |
+| Question (poll), Listen, Read, View, Travel, Arrive, Leave, Join, Offer, Invite, TentativeAccept, TentativeReject | ❌ | — |
 
-#### AP-H10: Like/Announce `object` field type mismatch
-**Files**: `src/activitypub.zig:358`, `src/activitypub.zig:374`
-**Issue**: For `Like` and `Announce` activities, the `object` field should be a URI string referencing the target. The code wraps it in a `NoteObject` struct with only an `id` field, which may not serialize correctly for remote servers.
-**Fix**: The `object` field for `Like` and `Announce` should be a plain URI string (the target post's ActivityPub ID), not a full object.
+## 4. Outbox (AP §6.3)
 
----
+| Requirement | Status | Where | Note |
+|---|---|---|---|
+| `GET /users/:u/outbox` (index)                 | ✅ | `routes.zig:569` | |
+| `GET ...?page=N` (page)                        | ⚠️ | `routes.zig:500-520` | Page 1 only |
+| `POST /users/:u/outbox` (C2S)                  | ❌ | `routes.zig:563-573` | Route not registered. Confirmed: only `.get` registered |
+| 201 Created + Location on C2S                  | ❌ | — | Not applicable until POST exists |
 
-### MEDIUM
+C2S is the load-bearing gap for "independent AP server" posture. Today
+clients use the Mastodon API (`/api/v1/statuses`) for posting.
 
-#### AP-M1: Deprecated Atom link in WebFinger
-**File**: `src/activitypub.zig:558-559`
-**Issue**: WebFinger includes `http://schemas.google.com/g/2010#updates-from` with an Atom XML link. This is from the OStatus era and no longer relevant.
-**Fix**: Remove the Atom link. Keep the `self` link (`application/activity+json`) and the `profile-page` link (`text/html`).
+## 5. HTTP signatures (`sig.zig`, `http_delivery.zig`, `keys.zig`)
 
-#### AP-M2: No `url` field on NoteObject
-**Issue**: ActivityPub Note objects should include a `url` field pointing to the human-readable HTML page for the post. Missing from `NoteObject`.
-**Fix**: Add `url: ?[]const u8` to `NoteObject`, set to `https://speedy-socials.local/@{username}/{post_id}`.
+| Scheme | Status | Where | Note |
+|---|---|---|---|
+| draft-cavage-12 verify (Ed25519)     | ✅ | `sig.zig:114-167, 425-432` | |
+| draft-cavage-12 verify (RSA-SHA256)  | ✅ | `sig.zig:434-438` | Via OpenSSL hook |
+| draft-cavage-12 sign (Ed25519)       | ✅ | `http_delivery.zig:190-260` | |
+| draft-cavage-12 sign (RSA-SHA256)    | ✅ | `core.crypto.rsa.signPkcs1v15Sha256` | OpenSSL-backed |
+| RFC 9421 verify (both algs)          | ✅ | `sig.zig:190-228, 407-442` | `Signature-Input` / `Signature` parsed |
+| RFC 9421 sign                        | ❌ outbound | `http_delivery.zig` | Outbound POST only emits cavage-style `Signature` + `Digest` |
+| `Digest` header verify (inbound)     | ❌ | `sig.zig:473-483` | Parsed; never compared against body bytes |
+| `Content-Digest` header verify       | ❌ | `sig.zig:485-497` | Parsed; never compared |
+| `Digest`/`Content-Digest` compute (outbound) | ✅ | `http_delivery.zig:206-207` | SHA-256 of body |
+| `created` / `expires` enforcement    | ❌ | `sig.zig:104-106, 156-159, 258-260` | Parsed into `expires_unix` but never compared to clock |
+| Replay window / nonce cache          | ❌ | — | Not implemented |
 
-#### AP-M3: WebFinger Content-Type inconsistency
-**Issue**: `federation.zig:321` correctly sets `application/jrd+json`, but `activitypub.zig:createWebFinger()` does not set a content type (it returns a struct, leaving content type to the caller). Ensure all WebFinger responses use `application/jrd+json`.
+## 6. WebFinger + discovery
 
----
+| Requirement | Status | Where |
+|---|---|---|
+| `GET /.well-known/webfinger?resource=acct:` | ✅ | `webfinger.zig`, `routes.zig:564` |
+| `subject` / `aliases` / `links`              | ✅ | `webfinger.zig:33-37` |
+| `self` (`application/activity+json`)         | ✅ | `webfinger.zig:36` |
+| `profile-page` (`text/html`)                 | ✅ | `webfinger.zig:37` |
+| Non-`acct:` resource URIs                    | ❌ | — |
+| Host-meta (deprecated)                       | — | Intentionally omitted |
 
-## AT Protocol
+## 7. NodeInfo (`nodeinfo.zig`)
 
-### CRITICAL — Not a functioning PDS
+| Requirement | Status | Where |
+|---|---|---|
+| `/.well-known/nodeinfo` JRD              | ✅ | `routes.zig:565`, `nodeinfo.zig:50-57` |
+| `/nodeinfo/2.1` document                 | ✅ | `nodeinfo.zig:70-86` |
+| `software.{name,version,repository}`     | ✅ | `nodeinfo.zig:71-75` |
+| `protocols`: `["activitypub"]`           | ✅ | `nodeinfo.zig:75` |
+| Should we declare `protocols: ["activitypub","atproto"]`? | ❌ | NodeInfo schema does not enumerate atproto, but the AT side has its own well-known. Worth advertising "atproto" via custom metadata |
+| `usage.users` / `usage.localPosts`       | ✅ | `nodeinfo.zig:79-84` |
 
-#### AT-C1: No repository (MST) implementation
-**Issue**: AT Protocol requires records to be stored in a Merkle Search Tree, producing content-addressed commits. Records are currently stored in a flat `ArrayList` in memory (`src/api/atproto.zig:11`). No CAR file export, no commit objects, no content addressing, no revision tracking.
-**Spec**: AT Protocol Repository specification (commit version 3, SHA-256 MST, DRISL-CBOR encoding)
-**Fix**: Implement the MST data structure: SHA-256 hashing with 2-bit chunk prefix counting, key-sorted record storage, deterministic tree shape. Store MST nodes in SQLite. Implement CAR v1 export for `getRepo`.
+## 8. FEP coverage
 
-#### AT-C2: No cryptographic signing of commits
-**Issue**: Repository commits must be signed with the account's signing key (Ed25519 or secp256k1). No key generation or signing exists.
-**Spec**: AT Protocol Repository — commit object `sig` field
-**Fix**: Generate a signing key pair on account creation. Sign the DRISL-CBOR serialized unsigned commit with SHA-256 hash. Store the raw signature bytes in the commit's `sig` field.
+| FEP | Status |
+|---|---|
+| FEP-f1d5 NodeInfo                | ✅ |
+| FEP-521a actor public keys       | ✅ (single key) |
+| FEP-d36d Multikey                | ❌ |
+| FEP-c0e0 emoji reactions         | ❌ |
+| FEP-c648 likes collection        | ❌ |
+| FEP-fb2a actor moves             | ⚠️ counted only |
+| FEP-ef61 portable objects        | ❌ |
+| FEP-8b32 Data Integrity Proofs   | ❌ |
+| FEP-7888 AT↔AP bridging          | ✅ (relay plugin) |
+| FEP-67ff `FEDERATION.md`         | ❌ not published |
+| FEP-844e capability negotiation  | ❌ |
+| FEP-1b12 group federation        | ❌ |
 
-#### AT-C3: No OAuth/DPoP authentication
-**Issue**: AT Protocol's primary auth system (since September 2024) is OAuth with mandatory DPoP (ES256), PKCE (S256 only), and PAR. The implementation only has a simplified Bearer token system.
-**Spec**: AT Protocol OAuth specification
-**Required endpoints**:
-- `/.well-known/oauth-protected-resource` — resource server metadata
-- `/.well-known/oauth-authorization-server` — authorization server metadata
-- PAR endpoint for pushed authorization requests
-- Token endpoint with DPoP validation
-**Fix**: This is a large implementation effort. As a stepping stone, the legacy `createSession`/`refreshSession` JWT auth is still supported for backward compatibility, but it needs real password verification and proper JWT signing.
+## 9. Object handling
 
-#### AT-C4: DID document non-compliant
-**File**: `src/api/atproto.zig:26-39`
-**Issues**:
-1. Service `id` is `"#bsky_pds"` — must be `"#atproto_pds"`
-2. Missing `alsoKnownAs` array containing `at://{handle}`
-3. Missing `verificationMethod` array with a `Multikey`-type entry, `id` ending in `#atproto`, and `publicKeyMultibase` field
-4. Returns the DID document as JSON — `/.well-known/atproto-did` should return the DID string as `text/plain`, not the document
-**Spec**: AT Protocol Identity — DID Document requirements
-**Fix**: Change `/.well-known/atproto-did` to return the DID string as plain text. Serve the DID document at `/.well-known/did.json` (for `did:web` resolution). Add required fields.
+`activity.zig` parses activities with a bounded scanner that captures
+`{id, type, actor, object_id, object_type, to_first}`. Object bodies
+are stored opaquely in the activity row. This means:
 
-#### AT-C5: `/.well-known/atproto-did` returns wrong format
-**File**: `src/api/atproto.zig:25-47`
-**Issue**: Returns a full JSON DID document. The spec requires this endpoint to return only the DID string (e.g., `did:web:speedy-socials.local`) as `text/plain`.
-**Fix**: Return just the DID string with `Content-Type: text/plain`.
+- No dedicated `ap_objects` table (objects live inside their owning
+  activity row). Trade-off: smaller schema, weaker "all replies to X"
+  queries.
+- `inReplyTo` / `attachment` / `tag` (Mention/Hashtag) / `sensitive` /
+  `content` are **not** extracted, so threading, hashtag indexing,
+  and content-warning surfaces all sit on the Mastodon API side, not
+  on AP-native paths.
+- `Tombstone` is recognised on Delete (✅), but a 410 GET response
+  for a deleted object does not yet return a Tombstone body.
 
-#### AT-C6: No sync endpoints
-**Issue**: The entire `com.atproto.sync.*` namespace is missing. This includes the critical `subscribeRepos` WebSocket firehose that relays and AppViews use to consume data. Without this, the PDS is isolated.
-**Required endpoints**: `getRepo`, `getRecord`, `getBlob`, `getBlocks`, `getLatestCommit`, `getRepoStatus`, `listBlobs`, `listRepos`, `subscribeRepos`, `notifyOfUpdate`, `requestCrawl`
-**Fix**: Implement after the MST/repository layer is in place.
+## 10. Linked Data Signatures
 
-#### AT-C7: No identity endpoints
-**Issue**: `com.atproto.identity.*` namespace is entirely missing.
-**Required endpoints**: `resolveHandle`, `resolveDid`, `resolveIdentity`, `updateHandle`, `getRecommendedDidCredentials`, PLC operation endpoints
-**Fix**: At minimum implement `resolveHandle` (returns DID for a handle) and `updateHandle`.
-
-#### AT-C8: ~65 missing XRPC endpoints
-**Issue**: Only 6 of ~70+ required XRPC endpoints are implemented: `describeServer`, `createSession`, `createRecord`, `listRecords`, `putRecord`, `getTimeline`.
-**Missing namespaces**: Most of `com.atproto.server` (account management, app passwords, email, invites), most of `com.atproto.repo` (deleteRecord, getRecord, applyWrites, uploadBlob), all of `com.atproto.sync`, all of `com.atproto.identity`, all of `com.atproto.label`, all of `com.atproto.moderation`, all of `com.atproto.admin`.
-
-#### AT-C9: `createSession` accepts any credential
-**File**: `src/api/atproto.zig:88`
-**Issue**: No password validation. Any identifier creates a valid session. This is a security vulnerability.
-**Fix**: Validate credentials against the users table. Hash the provided password and compare with `password_hash`. Return `AuthenticationRequired` error on mismatch.
-
-#### AT-C10: Records not persisted
-**File**: `src/api/atproto.zig:11`
-**Issue**: All AT Protocol records are stored in a global `ArrayList` in memory. Data is lost on process restart.
-**Fix**: Store records in SQLite, ideally as MST nodes. As an interim step, a `records` table with `repo`, `collection`, `rkey`, `value` (JSON), `cid`, `created_at` columns would suffice.
-
-#### AT-C11: Fake CIDs
-**File**: `src/api/atproto.zig:184`
-**Issue**: `createRecord` returns a random string as the CID. AT Protocol CIDs must be CIDv1 with SHA-256 hash and DAG-CBOR (or DRISL) codec, computed from the actual record content.
-**Fix**: Serialize the record as CBOR, SHA-256 hash it, and produce a CIDv1 with codec `0x71` (dag-cbor) and hash `0x12` (sha2-256).
-
-#### AT-C12: Fake record URIs
-**File**: `src/api/atproto.zig:183`
-**Issue**: Record key is hardcoded as `"record_id"`. AT Protocol record keys should be TIDs (timestamp-based identifiers: base32-sortable encoding of microsecond timestamp + clock ID).
-**Fix**: Generate proper TIDs. Format: 13-character base32-sortable string encoding a 64-bit timestamp in microseconds.
-
-#### AT-C13: `putRecord` delegates to `createRecord`
-**File**: `src/api/atproto.zig:281-285`
-**Issue**: `putRecord` just calls `createRecord`. Real put semantics require finding the existing record by collection+rkey, replacing it, updating the MST, and optionally supporting `swapRecord`/`swapCommit` for compare-and-swap.
-**Fix**: Implement actual upsert logic with CAS support.
-
----
-
-### HIGH
-
-#### AT-H1: No Lexicon validation
-**Issue**: Records should be validated against their Lexicon schema before storage. A record with `$type: "app.bsky.feed.post"` should be checked for required fields (`text`, `createdAt`, etc.). No validation exists.
-**Fix**: Implement Lexicon schema loading and validation. At minimum, validate the built-in `app.bsky.*` schemas.
-
-#### AT-H2: No `refreshSession` or `deleteSession`
-**Issue**: Session lifecycle is incomplete. Clients cannot refresh expired tokens or log out.
-**Fix**: Implement `com.atproto.server.refreshSession` (issue new access token from refresh token) and `com.atproto.server.deleteSession` (invalidate current session).
-
-#### AT-H3: `describeServer` missing fields
-**File**: `src/api/atproto.zig:49-56`
-**Issue**: Missing `contact` info and supported DID methods list. Should declare capabilities.
-**Fix**: Add `contact` object and `did` method support declaration.
-
-#### AT-H4: No blob handling
-**Issue**: `com.atproto.repo.uploadBlob`, `com.atproto.sync.getBlob`, `com.atproto.sync.listBlobs`, `com.atproto.repo.listMissingBlobs` are all missing. Media attachments cannot be stored or served.
-**Fix**: Implement blob upload (store in filesystem or object storage), generate CIDv1 references (raw codec `0x55`, SHA-256), and serve blobs with proper Content-Security-Policy headers.
+Intentionally **not** supported. HTTP signatures (cavage + RFC 9421)
+cover the live fediverse. RsaSignature2017 and Data Integrity Proofs
+are deferred unless a peer surfaces that needs them.
 
 ---
 
-### MEDIUM
+# Part II — AT Protocol (atproto)
 
-#### AT-M1: No XRPC error format
-**Issue**: XRPC errors should return `{"error": "ErrorName", "message": "description"}` with specific error codes like `InvalidRequest`, `AuthenticationRequired`, `AccountNotFound`. Current errors use a generic `{"error": "..."}` format.
-**Fix**: Define error types per the Lexicon definitions and return them consistently.
+Source tree: `src/protocols/atproto/`. Files: `auth.zig`, `car.zig`,
+`cid.zig`, `dag_cbor.zig`, `did_resolver.zig`, `did.zig`,
+`firehose.zig`, `keypair.zig`, `mst.zig`, `oauth_dpop.zig`,
+`plugin.zig`, `repo.zig`, `routes.zig`, `schema.zig`, `state.zig`,
+`sync_firehose.zig`, `syntax.zig`, `tid.zig`, `xrpc.zig`.
 
-#### AT-M2: No rate limiting on XRPC endpoints
-**Issue**: A rate limiter exists in `src/ratelimit.zig` but is not applied to AT Protocol XRPC endpoints.
-**Fix**: Apply rate limiting middleware to all XRPC endpoints, matching Bluesky's rate limit policies.
+## 1. Core primitives
+
+| Primitive | Status | Where | Note |
+|---|---|---|---|
+| CID v1 (sha2-256, dag-cbor 0x71)            | ✅ | `cid.zig` | base32-lower with `b` prefix |
+| CID raw codec 0x55 (blobs)                  | ⚠️ | `cid.zig` | Encoder exists, but `routes.zig:832` emits **hex SHA-256** as the blob CID — see AT-10 |
+| DAG-CBOR canonical encode                   | ✅ | `dag_cbor.zig` | Sorted map keys, no indefinite forms |
+| DAG-CBOR decoder                            | ✅ | `dag_cbor.zig` | Pull visitor |
+| CAR v1 writer                               | ✅ | `car.zig` | Varint, header, blocks, roots |
+| CAR v1 reader                               | ⚠️ | `car.zig:98+` | Skeleton — server-side write only |
+| TID (13-char base32-sortable)               | ✅ | `tid.zig` | Monotonic per-process clock id |
+| NSID syntax                                 | ✅ | `syntax.zig:96-111` | |
+| Handle syntax                               | ✅ | `syntax.zig:39-92` | |
+| AT-URI parsing                              | ⚠️ | `syntax.zig` | Constructs work in routes; parse roundtrip not heavily tested |
+| MST — read + write                          | ⚠️ | `mst.zig` | Flat sorted store + commit CID over leaf list. Hierarchical hash-derived fanout *not* implemented — header notes "tree-shape encoding... in follow-up phase" |
+
+## 2. Crypto + keys (`keypair.zig`, `core/crypto/`)
+
+| Capability | Status | Where | Note |
+|---|---|---|---|
+| Ed25519 sign / verify        | ✅ | `keypair.zig:54-73`, `core/crypto/ed25519.zig` | |
+| Ed25519 multicodec `0xed01`  | ✅ | `keypair.zig:94-105` | |
+| secp256k1 sign / verify (low-S) | ✅ | `core/crypto/secp256k1.zig`, `keypair.zig:75-92` | Layered on stdlib `EcdsaSecp256k1Sha256`; low-S normalize on emit, reject high-S on verify. **The "stub" comment in `keypair.zig:75` is stale** — the body calls the real `core.crypto.secp256k1.sign/verify` |
+| secp256k1 multicodec `0xe7`  | ✅ | `keypair.zig:106-112` | |
+| `did:key` Ed25519 round-trip | ✅ | `keypair.zig:127-143` | |
+| `did:key` secp256k1 round-trip | ✅ | `keypair.zig:106-112` | |
+| P-256 (ES256) sign / verify  | ❌ | — | Not implemented (used by DPoP-only clients) |
+| Argon2id password hashing    | ✅ | `auth.zig:35-88`, `core/crypto/argon2id.zig` | PHC-string round-trip |
+| Multibase encode/decode      | ✅ | `core/crypto/multibase.zig` | |
+| Multicodec varint            | ✅ | `core/crypto/multicodec.zig` | |
+
+## 3. Repository (`repo.zig`, `mst.zig`)
+
+| Capability | Status | Where | Note |
+|---|---|---|---|
+| Record persistence (`atp_records`)      | ✅ | `repo.zig`, `schema.zig` | |
+| Commit record (`atp_commits`)           | ✅ | `repo.zig:38-56`, `routes.zig:721-732` | |
+| Commit CBOR shape: full spec fields     | ❌ | `routes.zig:721-732` | Stub: `{did, data, sig}`. Missing `version`, `prev`, canonical `rev`. AT-11 |
+| Commit signature (Ed25519)              | ✅ | `repo.zig`, via `core.crypto.ed25519` | |
+| Commit signature (secp256k1)            | ✅ | now possible — `keypair.signSecp256k1` reachable | Untested at the commit-path boundary |
+| MST persistence as blocks (`atp_mst_blocks`) | ❌ | — | Full-tree reload per commit; tracked as PUNCHLIST D4 |
+| `prev` chain integrity                  | ⚠️ | — | `Commit.prev` field not written; chain rebuild on import unreliable |
+
+## 4. XRPC endpoint coverage (`routes.zig`, `xrpc.zig`)
+
+Implemented (grep-verified against `src/protocols/atproto/routes.zig`):
+
+```
+com.atproto.server.describeServer
+com.atproto.server.createSession        (legacy JWT)
+com.atproto.server.refreshSession
+com.atproto.repo.createRecord
+com.atproto.repo.putRecord              (delegates to createRecord — see AT-X below)
+com.atproto.repo.getRecord
+com.atproto.repo.deleteRecord
+com.atproto.repo.listRecords
+com.atproto.repo.describeRepo
+com.atproto.repo.uploadBlob
+com.atproto.sync.getRepo                (CAR)
+com.atproto.sync.getRecord              (CAR)
+com.atproto.sync.getBlocks              (CAR)
+com.atproto.sync.listRepos
+com.atproto.sync.subscribeRepos         (WS firehose)
+com.atproto.identity.resolveHandle
+/.well-known/atproto-did
+```
+
+**Missing** (verified by grep against `routes.zig` + `plugin.zig`):
+
+| Namespace | Missing |
+|---|---|
+| `com.atproto.server.*` | `createAccount`, `deleteAccount`, `requestPasswordReset`, `resetPassword`, `requestEmailUpdate`, `confirmEmail`, `updateEmail`, `requestEmailConfirmation`, `createAppPassword`, `listAppPasswords`, `revokeAppPassword`, `createInviteCode(s)`, `getAccountInviteCodes`, `checkAccountStatus`, `activateAccount`, `deactivateAccount`, `requestAccountDelete`, `reserveSigningKey`, `getServiceAuth`, `deleteSession`, `getSession` |
+| `com.atproto.repo.*` | `applyWrites`, `importRepo`, `listMissingBlobs` |
+| `com.atproto.sync.*` | `getBlob`, `getLatestCommit`, `listBlobs`, `notifyOfUpdate`, `requestCrawl`, `getRepoStatus` |
+| `com.atproto.identity.*` | `resolveDid`, `resolveIdentity`, `updateHandle`, `getRecommendedDidCredentials`, `signPlcOperation`, `submitPlcOperation`, `requestPlcOperationSignature` |
+| `com.atproto.label.*` | `queryLabels`, `subscribeLabels` |
+| `com.atproto.moderation.*` | `createReport` |
+| `com.atproto.admin.*` | all (~14 endpoints) |
+| `com.atproto.temp.*` | `checkSignupQueue`, optional |
+
+`putRecord` quietly delegates to `createRecord` — same INSERT-OR-REPLACE
+semantics fall out by accident, but `swapRecord` / `swapCommit` CAS
+parameters are not honoured. AT-X.
+
+## 5. Auth
+
+| Mode | Status | Where | Note |
+|---|---|---|---|
+| Legacy JWT (Ed25519 HS-style)            | ✅ | `auth.zig:90-182` | Access (1h) + refresh (90d), JTI tracked |
+| Session refresh                          | ✅ | `routes.zig:116-160` | |
+| Session delete (logout)                  | ❌ | — | No `deleteSession` endpoint |
+| App passwords                            | ❌ | — | Not implemented |
+| OAuth 2.1 metadata endpoints             | ❌ | — | No `/.well-known/oauth-authorization-server` or `/.well-known/oauth-protected-resource` |
+| PAR (Pushed Authorization Requests)      | ❌ | — | |
+| PKCE S256                                 | ❌ | — | |
+| Authorization code flow                   | ❌ | — | |
+| DPoP proof verification (Ed25519)        | ✅ | `oauth_dpop.zig` | Verifier + replay-jti ring |
+| DPoP proof verification (ES256)          | ❌ | `oauth_dpop.zig:13` | Returns `NotImplemented` |
+| `DPoP-Nonce` response header             | ❌ | — | |
+| Service auth (PDS↔relay/AppView JWTs)    | ❌ | — | |
+| Scope enforcement on routes              | ⚠️ | `routes.zig` | JWT verified, but `scope` not gated per endpoint |
+
+OAuth is the **single largest hole** for being a real network
+participant. Today's clients (Bluesky official app, third-party apps)
+all use the OAuth flow; only legacy clients use createSession/JWT.
+
+## 6. Firehose + sync (`firehose.zig`, `sync_firehose.zig`)
+
+| Capability | Status | Where | Note |
+|---|---|---|---|
+| Event persistence (`atp_firehose_events`)  | ✅ | `firehose.zig:1-81` | Append-only with monotonic seq |
+| Cursor (`atp_firehose_cursor`)             | ✅ | `firehose.zig` | |
+| `subscribeRepos` WS handler                | ✅ | `sync_firehose.zig:1-250` | Replay + live phases |
+| `#commit` events                           | ✅ | `sync_firehose.zig:186-191` | dag-cbor frame, correct shape |
+| `#identity` events                         | ❌ | — | Never appended |
+| `#account` events                          | ❌ | — | |
+| `#handle` (deprecated) / `#migrate` / `#tombstone` | ❌ | — | |
+| `#info` (cursor warning)                   | ❌ | — | |
+| In-process local sink                      | ✅ | `firehose.zig:30-40` | Used by relay consumer |
+| External relay subscription (downstream)   | ❌ | — | If we want to consume an upstream relay's firehose, this is not wired |
+
+Without `#identity` / `#account`, AppViews and downstream relays
+cannot maintain a correct identity-to-handle index when a user
+rotates their DID or changes handle.
+
+## 7. Blobs
+
+| Capability | Status | Where | Note |
+|---|---|---|---|
+| `uploadBlob` route                       | ✅ | `routes.zig:799-878` | Stores into `atp_blobs` |
+| `BlobRef` `$type: "blob"` shape          | ✅ | `routes.zig` | |
+| Blob CID is proper CIDv1 raw codec       | ❌ | `routes.zig:832-833` | Currently emits **hex SHA-256** instead of `b<base32>(0x01 0x55 0x12 0x20 ...)`. Interop bug. AT-10 |
+| `sync.getBlob` route                     | ❌ | — | Blobs upload-only; not retrievable. AT-6 |
+| `listBlobs` / `listMissingBlobs`         | ❌ | — | |
+| Inline vs spilled-to-FS                  | ✅ via media plugin | `core.limits.media_inline_threshold_bytes` (16 KiB) | Media plugin handles AP-side spillover; AT side stores inline only |
+| Orphan blob GC                           | ❌ | — | Ref-counted in schema but no sweep |
+
+## 8. DID + identity
+
+| Capability | Status | Where | Note |
+|---|---|---|---|
+| `did:plc` parse                          | ✅ | `did.zig:48-80` | |
+| `did:web` parse                          | ✅ | `did.zig:48-80` | |
+| `did:key` parse + format                 | ⚠️ | `keypair.zig:94-143` | Ed25519 + secp256k1 only; P-256 missing |
+| `did:plc` resolution (HTTP to plc.directory) | ⚠️ | `did_resolver.zig:56-104` | Skeleton; needs HttpFetcher attached at boot |
+| `did:web` resolution                     | ⚠️ | `did_resolver.zig:81-84` | Skeleton; same constraint |
+| Handle → DID (HTTPS well-known)          | ✅ | `did_resolver.zig:95-104`, `routes.zig:316-335` | |
+| Handle → DID (DNS TXT `_atproto.<handle>`) | ❌ | — | No DNS resolver wired |
+| Our own DID document with `verificationMethod` (`#atproto`) + `service` (`#atproto_pds`, `AtprotoPersonalDataServer`) + `alsoKnownAs: at://<handle>` | ❌ | `routes.zig:299-309` | Only the DID **string** at `/.well-known/atproto-did`; no `did.json` document served |
+| PLC ops sign / submit                    | ❌ | — | No key rotation path |
+
+## 9. Lexicon validation
+
+Status: **missing**. `routes.zig:186-194` notes "production would
+lexicon-validate then re-encode canonically." Today:
+
+- No schema parser.
+- No `$type` ↔ NSID consistency check.
+- Records stored as the bytes the client sent — **not** re-encoded
+  to canonical DAG-CBOR. That makes CIDs reproducible by the client
+  but breaks if a client submits non-canonical CBOR.
+- No method-side validation of XRPC input/output objects.
+
+This is a federation hazard: a record we accepted may not round-trip
+through an AppView that *does* enforce canonical CBOR.
+
+## 10. Account + moderation lifecycle
+
+Status: **missing**.
+
+- No `createAccount` → operators must seed users directly via
+  `auth.setPassword` or test fixtures.
+- No `deleteAccount` / `deactivateAccount` / `requestAccountDelete`.
+- No email verification flow.
+- No invite codes / signup queue.
+- No `com.atproto.moderation.createReport` (user-facing report API).
+- No `com.atproto.label.*` (label query + subscription).
+- No `com.atproto.admin.*` (remote management).
+
+## 11. Storage schema
+
+Present (`schema.zig`): `atp_repos`, `atp_records`, `atp_commits`,
+`atp_blobs`, `atp_firehose_events`, `atp_firehose_cursor`, plus the
+AP-side tables and relay tables.
+
+Missing: `atp_mst_blocks` (PUNCHLIST D4), `atp_app_passwords`,
+`atp_invite_codes`, `atp_signup_queue`, `atp_labels`,
+`atp_moderation_reports`, `atp_oauth_clients`, `atp_oauth_sessions`,
+`atp_dpop_nonces`.
 
 ---
 
-## Database Schema Gaps
+# Part III — Cross-cutting
 
-For both protocols to function, the database needs additional tables:
+## 12. Running both protocols on one host
 
-| Table | Purpose | Protocol |
-|-------|---------|----------|
-| `actor_keys` | RSA key pairs per actor (public + encrypted private PEM) | ActivityPub |
-| `remote_actors` | Cached remote actor profiles, inbox URLs, public keys | ActivityPub |
-| `remote_posts` | Federated posts received via inbox | ActivityPub |
-| `delivery_queue` | Persistent federation delivery queue with retry state | ActivityPub |
-| `tombstones` | Deleted object records for 410 Gone responses | ActivityPub |
-| `at_records` | AT Protocol records (repo, collection, rkey, value, cid) | AT Protocol |
-| `at_commits` | Repository commit chain (did, rev, data_cid, sig) | AT Protocol |
-| `at_signing_keys` | Account signing keys for repository commits | AT Protocol |
-| `at_blobs` | Blob metadata (cid, mime_type, size, file_path) | AT Protocol |
-| `at_sessions` | Persistent AT Protocol sessions (replacing in-memory HashMap) | AT Protocol |
+This is the load-bearing user requirement: be a node on each network
+simultaneously, sharing one process. Today:
+
+- ✅ Plugin contract (`core/plugin.zig`) supports both AP and AT
+  plugins loaded into the same `Registry`.
+- ✅ Shared storage handle (`atp_*` and `ap_*` tables coexist in one
+  SQLite file).
+- ✅ Shared HTTP server and TLS termination.
+- ✅ Shared metrics, ring log, shutdown coordinator.
+- ⚠️ No tenant isolation — if we host multiple users on AP *and* the
+  same identities should mirror to AT (or vice versa), the
+  identity-mapping is via the relay's `relay_identity_map`, not a
+  first-class "user X has identity (a) on AP and (b) on AT" table.
+- ⚠️ No unified account creation — creating an account today gives
+  you an AP user (Mastodon API) and *separately* gives you an AT
+  repo. No "one signup, both protocols" path.
+- ❌ NodeInfo advertises only `["activitypub"]` even though atproto
+  is also speaking. Custom metadata should mention atproto so peer
+  servers can discover dual-protocol support.
+
+## 13. Bridge (relay plugin)
+
+Out of scope for this audit — see [`docs/design/translation-matrix.md`](docs/design/translation-matrix.md)
+for the per-activity coverage, and the `A.*` block in
+[`PUNCHLIST.md`](PUNCHLIST.md) for operational items.
 
 ---
 
-## Priority Order
+# How to use this audit
 
-### Phase 1: ActivityPub federation (get real federation working)
-1. Real RSA key generation and storage (AP-C4, AP-C1)
-2. HTTP Signature signing with draft-cavage-12 (AP-C1)
-3. HTTP Signature verification (AP-C2)
-4. Fix timestamp conversion (AP-C8)
-5. Implement incoming activity handlers (AP-C5)
-6. Fix follower inbox resolution from database (AP-C6)
-7. Add Content-Type negotiation (AP-C7)
-8. Add NodeInfo endpoint (AP-H1)
-9. Add outbox, followers, following endpoints (AP-H5, AP-H6)
-10. Add actor extensions: featured, discoverable, manuallyApprovesFollowers (AP-H2-H4)
-
-### Phase 2: ActivityPub hardening
-11. RFC 9421 signature support (AP-C3)
-12. Delete/Tombstone handling (AP-H7)
-13. bto/bcc stripping and recipient deduplication (AP-H8, AP-H9)
-14. Fix Like/Announce object serialization (AP-H10)
-
-### Phase 3: AT Protocol foundation
-15. Fix `/.well-known/atproto-did` to return plain text (AT-C5)
-16. Fix DID document fields (AT-C4)
-17. Persist records in SQLite (AT-C10)
-18. Real credential validation (AT-C9)
-19. Generate proper TIDs and CIDs (AT-C11, AT-C12)
-20. Implement `refreshSession`, `deleteSession`, `getSession` (AT-H2)
-
-### Phase 4: AT Protocol repository
-21. CBOR serialization
-22. MST implementation
-23. Commit signing
-24. CAR export (`getRepo`)
-25. Sync endpoints including `subscribeRepos` firehose
-26. OAuth/DPoP authentication (AT-C3)
+1. Treat each row in the tables above as a fact to verify before
+   relying on it. If a status doesn't match the code today, fix the
+   doc.
+2. New work that closes a gap should reference the corresponding
+   ticket in [`SPEC_PUNCHLIST.md`](SPEC_PUNCHLIST.md) (e.g. "Closes
+   AT-3") in the commit message.
+3. When you ship a feature that adds a new spec surface, add a row
+   here in the same commit. Drift on this doc has burned us before;
+   the 2026-03-17 version pointed at files that didn't exist by May.
+4. The audits behind this rewrite were two parallel Explore-agent
+   passes on 2026-05-19; both reports were sanity-checked against
+   the actual source tree before this document was written.
+   Corrections applied during the rewrite:
+   - AP "no fanout" → corrected to "partial fanout on Create only".
+   - AT "secp256k1 not implemented" → corrected to "implemented in
+     `core/crypto/secp256k1.zig` with low-S; `keypair.zig:75`
+     comment is stale and should be updated".

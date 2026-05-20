@@ -215,6 +215,106 @@ fn skipJsonValueAt(buf: []const u8, start: usize) FedError!usize {
 /// must already have had bto/bcc stripped. `key_id` identifies the
 /// local actor's signing key. `now_ns` is wall-clock nanoseconds; the
 /// next-attempt timestamp is set to *now* (eligible immediately).
+// ──────────────────────────────────────────────────────────────────────
+// AP-2: recipient resolution from `to`/`cc`/(`bto`/`bcc` stripped).
+// ──────────────────────────────────────────────────────────────────────
+
+pub const activity_public = "https://www.w3.org/ns/activitystreams#Public";
+
+pub const ResolveConfig = struct {
+    local_host: []const u8,
+    sender_actor: []const u8,
+    /// Optional follower-expansion callback. When the addressing
+    /// list contains a local `/users/<u>/followers` URL, this maps
+    /// it to concrete follower-inbox URLs. The strings written are
+    /// stored in `url_pool` by the caller.
+    followers_ctx: ?*anyopaque = null,
+    followers_resolver: ?FollowersResolver = null,
+};
+
+pub const FollowersResolver = *const fn (ctx: *anyopaque, collection_url: []const u8, out: []Recipient, url_pool: []u8, pool_used: *usize) usize;
+
+/// Resolve `to`/`cc` into a deduplicated `Recipient` set. Strings
+/// referenced by `Recipient.inbox` are written into `url_pool` so
+/// they outlive the input slices.
+///
+/// Public addressing (`as:Public`) is skipped — it signals "this
+/// activity is world-readable" but doesn't itself name a recipient.
+pub fn resolveRecipients(
+    cfg: ResolveConfig,
+    to: []const []const u8,
+    cc: []const []const u8,
+    out: []Recipient,
+    url_pool: []u8,
+) FedError!u32 {
+    var n: u32 = 0;
+    var pool_used: usize = 0;
+
+    const Helper = struct {
+        fn handleOne(
+            cfg_h: ResolveConfig,
+            addr: []const u8,
+            buf: []Recipient,
+            pool: []u8,
+            used: *usize,
+            count: *u32,
+        ) FedError!void {
+            if (addr.len == 0) return;
+            if (std.mem.eql(u8, addr, activity_public)) return;
+            if (std.mem.eql(u8, addr, cfg_h.sender_actor)) return;
+
+            // Local followers collection → expand via callback.
+            const prefix = "https://";
+            if (std.mem.startsWith(u8, addr, prefix) and
+                addr.len > prefix.len + cfg_h.local_host.len and
+                std.mem.startsWith(u8, addr[prefix.len..], cfg_h.local_host) and
+                std.mem.endsWith(u8, addr, "/followers"))
+            {
+                if (cfg_h.followers_resolver) |fr| {
+                    const ctx = cfg_h.followers_ctx orelse return;
+                    if (count.* >= buf.len) return error.OutboxFull;
+                    const got = fr(ctx, addr, buf[count.*..], pool, used);
+                    count.* += @intCast(got);
+                    return;
+                }
+            }
+
+            // Default: treat as a remote actor URL → `<actor>/inbox`.
+            if (count.* >= buf.len) return error.OutboxFull;
+            const inbox_suffix = "/inbox";
+            const need = addr.len + inbox_suffix.len;
+            if (used.* + need > pool.len) return error.OutboxFull;
+            @memcpy(pool[used.* .. used.* + addr.len], addr);
+            @memcpy(pool[used.* + addr.len .. used.* + need], inbox_suffix);
+            buf[count.*] = .{ .inbox = pool[used.* .. used.* + need] };
+            used.* += need;
+            count.* += 1;
+        }
+    };
+
+    for (to) |addr| try Helper.handleOne(cfg, addr, out, url_pool, &pool_used, &n);
+    for (cc) |addr| try Helper.handleOne(cfg, addr, out, url_pool, &pool_used, &n);
+
+    // Dedup linear scan.
+    var j: u32 = 0;
+    var i: u32 = 0;
+    while (i < n) : (i += 1) {
+        var seen = false;
+        var k: u32 = 0;
+        while (k < j) : (k += 1) {
+            if (std.mem.eql(u8, out[i].inbox, out[k].inbox)) {
+                seen = true;
+                break;
+            }
+        }
+        if (!seen) {
+            if (i != j) out[j] = out[i];
+            j += 1;
+        }
+    }
+    return j;
+}
+
 pub fn enqueueDeliveries(
     db: *c.sqlite3,
     clock: Clock,
@@ -318,6 +418,37 @@ test "stripBcc leaves bto-less activity intact" {
     var out: [256]u8 = undefined;
     const n = try stripBcc(input, &out);
     try testing.expectEqualStrings(input, out[0..n]);
+}
+
+test "AP-2: resolveRecipients dedups + expands to /inbox" {
+    var pool: [1024]u8 = undefined;
+    var out: [8]Recipient = undefined;
+    const to = [_][]const u8{ "https://b/users/bob", activity_public };
+    const cc = [_][]const u8{ "https://b/users/bob", "https://c/users/carol" };
+    const n = try resolveRecipients(.{
+        .local_host = "speedy.example",
+        .sender_actor = "https://speedy.example/users/alice",
+    }, &to, &cc, &out, &pool);
+    try std.testing.expectEqual(@as(u32, 2), n);
+    try std.testing.expectEqualStrings("https://b/users/bob/inbox", out[0].inbox);
+    try std.testing.expectEqualStrings("https://c/users/carol/inbox", out[1].inbox);
+}
+
+test "AP-2: resolveRecipients skips sender + public" {
+    var pool: [256]u8 = undefined;
+    var out: [4]Recipient = undefined;
+    const to = [_][]const u8{
+        "https://speedy.example/users/alice",
+        activity_public,
+        "https://b/users/bob",
+    };
+    const cc = [_][]const u8{};
+    const n = try resolveRecipients(.{
+        .local_host = "speedy.example",
+        .sender_actor = "https://speedy.example/users/alice",
+    }, &to, &cc, &out, &pool);
+    try std.testing.expectEqual(@as(u32, 1), n);
+    try std.testing.expectEqualStrings("https://b/users/bob/inbox", out[0].inbox);
 }
 
 test "enqueueDeliveries inserts one row per recipient" {

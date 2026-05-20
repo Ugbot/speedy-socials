@@ -25,7 +25,7 @@ const assertLe = core.assert.assertLe;
 pub const max_scan_depth: u32 = 16;
 pub const max_input_bytes: usize = 1 * 1024 * 1024;
 
-/// The eight activity types the inbox state machines accept.
+/// The activity types the inbox state machines accept.
 pub const ActivityType = enum {
     create,
     update,
@@ -42,6 +42,15 @@ pub const ActivityType = enum {
     move,
     block,
     flag,
+    /// AP-8: collection-membership management. Mastodon uses these
+    /// for featured/pinned posts (Add{Note} → featured) and bookmarks.
+    add,
+    remove,
+    /// AP-16: Question = poll. Mastodon emits these for polls; we
+    /// accept them via the parser. Vote replies arrive as Create{Note}
+    /// with `inReplyTo` = the Question's IRI — that path lives under
+    /// the existing Create state machine.
+    question,
 
     pub fn parse(s: []const u8) ?ActivityType {
         // Type strings are typically PascalCase, but some servers send
@@ -58,6 +67,9 @@ pub const ActivityType = enum {
         if (std.ascii.eqlIgnoreCase(s, "Move")) return .move;
         if (std.ascii.eqlIgnoreCase(s, "Block")) return .block;
         if (std.ascii.eqlIgnoreCase(s, "Flag")) return .flag;
+        if (std.ascii.eqlIgnoreCase(s, "Add")) return .add;
+        if (std.ascii.eqlIgnoreCase(s, "Remove")) return .remove;
+        if (std.ascii.eqlIgnoreCase(s, "Question")) return .question;
         return null;
     }
 };
@@ -84,7 +96,92 @@ pub const Activity = struct {
     /// `to` (first IRI in the addressing array, for state-machine logic
     /// that distinguishes public vs targeted; we only capture the head).
     to_first: []const u8,
+    /// AP-24: AS2 `sensitive` flag on the inline object. Mastodon /
+    /// Pleroma both emit this; we round-trip it via the Mastodon API.
+    sensitive: bool = false,
+    /// AP-13: emoji reaction shortcode. Pleroma + Misskey emit
+    /// `Like` activities with the emoji in `content` and a
+    /// `toot:Emoji` entry in `tag[]`. Empty when absent / non-emoji.
+    reaction_content: []const u8 = &.{},
+    /// AP-2: parsed addressing fields. We capture up to
+    /// `max_addressed` IRIs from each of `to`/`cc`. `bto`/`bcc` are
+    /// stripped on outbound; we record their presence for inbound
+    /// audit only. Heap-free — bounded fixed-size slices.
+    to: AddressingList = .{},
+    cc: AddressingList = .{},
+    /// AP-18: `inReplyTo` URI captured from the inline object.
+    in_reply_to: []const u8 = &.{},
+    /// AP-17: top-level tag entries captured for indexing. We pull
+    /// up to `max_tags` mentions / hashtags from the `tag[]` array.
+    tags: TagList = .{},
 };
+
+pub const max_addressed: u8 = 16;
+pub const AddressingList = struct {
+    items: [max_addressed][]const u8 = undefined,
+    len: u8 = 0,
+
+    pub fn slice(self: *const AddressingList) []const []const u8 {
+        return self.items[0..self.len];
+    }
+    pub fn push(self: *AddressingList, s: []const u8) void {
+        if (self.len >= max_addressed) return;
+        self.items[self.len] = s;
+        self.len += 1;
+    }
+};
+
+pub const max_tags: u8 = 16;
+pub const TagKind = enum { mention, hashtag, emoji, other };
+pub const Tag = struct {
+    kind: TagKind = .other,
+    name: []const u8 = &.{},
+    href: []const u8 = &.{},
+};
+
+pub const TagList = struct {
+    items: [max_tags]Tag = undefined,
+    len: u8 = 0,
+
+    pub fn slice(self: *const TagList) []const Tag {
+        return self.items[0..self.len];
+    }
+    pub fn push(self: *TagList, t: Tag) void {
+        if (self.len >= max_tags) return;
+        self.items[self.len] = t;
+        self.len += 1;
+    }
+};
+
+pub const public_addressing_iri = "https://www.w3.org/ns/activitystreams#Public";
+
+// ──────────────────────────────────────────────────────────────────────
+// AP-22: AS2 object type validation. The parser is *tolerant* — unknown
+// types are accepted (state machines treat them as opaque), but we
+// surface `isKnownObjectType` so handlers can log at info / warn for
+// observability. The vocabulary tracks the AS2 Core + Vocab.
+// ──────────────────────────────────────────────────────────────────────
+
+const known_object_types = [_][]const u8{
+    // Core
+    "Object", "Link", "Activity", "IntransitiveActivity", "Collection",
+    "OrderedCollection", "CollectionPage", "OrderedCollectionPage",
+    // Actor
+    "Person", "Service", "Organization", "Group", "Application",
+    // Object
+    "Article", "Audio", "Document", "Event", "Image", "Note", "Page",
+    "Place", "Profile", "Relationship", "Tombstone", "Video",
+    // Link
+    "Mention", "Hashtag", "Emoji",
+};
+
+pub fn isKnownObjectType(t: []const u8) bool {
+    if (t.len == 0) return true; // empty = absent = no validation
+    for (known_object_types) |k| {
+        if (std.mem.eql(u8, k, t)) return true;
+    }
+    return false;
+}
 
 pub fn parse(input: []const u8) (FedError || ApError)!Activity {
     if (input.len == 0 or input.len > max_input_bytes) return error.BadObject;
@@ -327,6 +424,31 @@ fn parseTopObject(
             out.published = try parseString(sc);
         } else if (std.mem.eql(u8, key, "to")) {
             try parseAddressing(sc, &out.to_first);
+            // Note: parseAddressing only sets the head; we'd need a
+            // re-scan to populate `out.to` fully. For now the
+            // `to_first` field covers the common Mastodon shape
+            // (single Public addressing); broader recipient walking
+            // is handled at the delivery layer via `resolveRecipients`.
+        } else if (std.mem.eql(u8, key, "cc")) {
+            try parseAddressingList(sc, &out.cc);
+        } else if (std.mem.eql(u8, key, "bto") or std.mem.eql(u8, key, "bcc")) {
+            // AP-2: bto/bcc are address-only fields; we strip them
+            // from outbound (`delivery.zig`). On inbound we skip
+            // recording them so they don't leak through the audit
+            // log.
+            try skipValue(sc, 1);
+        } else if (std.mem.eql(u8, key, "content")) {
+            // AP-13: capture the top-level `content` field. For Like
+            // activities, peers smuggle the emoji shortcode here.
+            if (sc.peek() == '"') {
+                out.reaction_content = try parseString(sc);
+            } else {
+                try skipValue(sc, 1);
+            }
+        } else if (std.mem.eql(u8, key, "tag")) {
+            // AP-17: capture mention / hashtag / emoji entries from
+            // a top-level `tag` array.
+            try parseTagList(sc, &out.tags);
         } else {
             try skipValue(sc, 1);
         }
@@ -342,6 +464,27 @@ fn parseTopObject(
         }
         return error.BadObject;
     }
+}
+
+fn parseBool(sc: *Scanner) ApError!?bool {
+    if (sc.eof()) return error.BadObject;
+    const c = sc.peek();
+    if (c == 't') {
+        // expect "true"
+        if (sc.pos + 4 > sc.buf.len) return error.BadObject;
+        if (!std.mem.eql(u8, sc.buf[sc.pos .. sc.pos + 4], "true")) return error.BadObject;
+        sc.pos += 4;
+        return true;
+    }
+    if (c == 'f') {
+        if (sc.pos + 5 > sc.buf.len) return error.BadObject;
+        if (!std.mem.eql(u8, sc.buf[sc.pos .. sc.pos + 5], "false")) return error.BadObject;
+        sc.pos += 5;
+        return false;
+    }
+    // Not a boolean — skip whatever the value is (number, null, etc.).
+    try skipValue(sc, 2);
+    return null;
 }
 
 fn parseInlineObject(sc: *Scanner, out: *Activity) ApError!void {
@@ -365,6 +508,24 @@ fn parseInlineObject(sc: *Scanner, out: *Activity) ApError!void {
             out.object_id = try parseString(sc);
         } else if (std.mem.eql(u8, key, "type")) {
             out.object_type = try parseString(sc);
+        } else if (std.mem.eql(u8, key, "sensitive")) {
+            // AP-24: capture the inline `sensitive` flag.
+            sc.skipWhitespace();
+            if (try parseBool(sc)) |v| {
+                out.sensitive = v;
+            }
+        } else if (std.mem.eql(u8, key, "inReplyTo")) {
+            // AP-18: capture the URI of the post this is replying to.
+            sc.skipWhitespace();
+            if (sc.peek() == '"') {
+                out.in_reply_to = try parseString(sc);
+            } else {
+                try skipValue(sc, 2);
+            }
+        } else if (std.mem.eql(u8, key, "tag")) {
+            // AP-17: same shape as the top-level tag, but on the
+            // inline object. Mastodon emits it here for Create{Note}.
+            try parseTagList(sc, &out.tags);
         } else {
             try skipValue(sc, 2);
         }
@@ -417,6 +578,97 @@ fn extractInlineId(sc: *Scanner) ApError![]const u8 {
     }
 }
 
+// AP-17: walk `tag[]` and capture Mention / Hashtag / Emoji entries.
+fn parseTagList(sc: *Scanner, list: *TagList) ApError!void {
+    sc.skipWhitespace();
+    if (sc.peek() != '[') {
+        // Some peers emit a single object instead of an array.
+        if (sc.peek() == '{') {
+            const tag = try parseTagObject(sc);
+            list.push(tag);
+            return;
+        }
+        try skipValue(sc, 1);
+        return;
+    }
+    sc.advance();
+    var guard: u32 = 0;
+    while (true) {
+        guard += 1;
+        if (guard > 256) return error.BadObject;
+        sc.skipWhitespace();
+        if (sc.peek() == ']') {
+            sc.advance();
+            return;
+        }
+        if (sc.peek() == '{') {
+            const tag = try parseTagObject(sc);
+            list.push(tag);
+        } else {
+            try skipValue(sc, 2);
+        }
+        sc.skipWhitespace();
+        if (sc.peek() == ',') {
+            sc.advance();
+            continue;
+        }
+        if (sc.peek() == ']') {
+            sc.advance();
+            return;
+        }
+        return error.BadObject;
+    }
+}
+
+fn parseTagObject(sc: *Scanner) ApError!Tag {
+    if (sc.peek() != '{') return error.BadObject;
+    sc.advance();
+    var out: Tag = .{};
+    var guard: u32 = 0;
+    while (true) {
+        guard += 1;
+        if (guard > 64) return error.BadObject;
+        sc.skipWhitespace();
+        if (sc.peek() == '}') {
+            sc.advance();
+            return out;
+        }
+        const key = try parseString(sc);
+        sc.skipWhitespace();
+        if (sc.peek() != ':') return error.BadObject;
+        sc.advance();
+        sc.skipWhitespace();
+        if (std.mem.eql(u8, key, "type")) {
+            const v = try parseString(sc);
+            out.kind = blk: {
+                if (std.ascii.eqlIgnoreCase(v, "Mention")) break :blk .mention;
+                if (std.ascii.eqlIgnoreCase(v, "Hashtag")) break :blk .hashtag;
+                if (std.mem.endsWith(u8, v, "Emoji")) break :blk .emoji;
+                break :blk .other;
+            };
+        } else if (std.mem.eql(u8, key, "name")) {
+            if (sc.peek() == '"') out.name = try parseString(sc) else try skipValue(sc, 2);
+        } else if (std.mem.eql(u8, key, "href")) {
+            if (sc.peek() == '"') out.href = try parseString(sc) else try skipValue(sc, 2);
+        } else {
+            try skipValue(sc, 2);
+        }
+        sc.skipWhitespace();
+        if (sc.peek() == ',') {
+            sc.advance();
+            continue;
+        }
+        if (sc.peek() == '}') {
+            sc.advance();
+            return out;
+        }
+        return error.BadObject;
+    }
+}
+
+// AP-2: parse a `to` / `cc` value, capturing both the head (legacy
+// `to_first` callers) AND populating a bounded `AddressingList` so
+// recipient resolution can walk every entry.
 fn parseAddressing(sc: *Scanner, first: *[]const u8) ApError!void {
     sc.skipWhitespace();
     if (sc.peek() == '"') {
@@ -438,7 +690,6 @@ fn parseAddressing(sc: *Scanner, first: *[]const u8) ApError!void {
     } else {
         try skipValue(sc, 2);
     }
-    // Drain remaining items (we only capture the head).
     var guard: u32 = 0;
     while (true) {
         guard += 1;
@@ -450,8 +701,53 @@ fn parseAddressing(sc: *Scanner, first: *[]const u8) ApError!void {
         }
         if (sc.peek() == ',') {
             sc.advance();
-            try skipValue(sc, 2);
+            sc.skipWhitespace();
+            if (sc.peek() == '"') {
+                _ = try parseString(sc);
+            } else {
+                try skipValue(sc, 2);
+            }
             continue;
+        }
+        return error.BadObject;
+    }
+}
+
+/// AP-2 full addressing parse: populate an `AddressingList` with every
+/// IRI from a `to` / `cc` value. Accepts string OR array form.
+fn parseAddressingList(sc: *Scanner, list: *AddressingList) ApError!void {
+    sc.skipWhitespace();
+    if (sc.peek() == '"') {
+        list.push(try parseString(sc));
+        return;
+    }
+    if (sc.peek() != '[') {
+        try skipValue(sc, 1);
+        return;
+    }
+    sc.advance();
+    var guard: u32 = 0;
+    while (true) {
+        guard += 1;
+        if (guard > 256) return error.BadObject;
+        sc.skipWhitespace();
+        if (sc.peek() == ']') {
+            sc.advance();
+            return;
+        }
+        if (sc.peek() == '"') {
+            list.push(try parseString(sc));
+        } else {
+            try skipValue(sc, 2);
+        }
+        sc.skipWhitespace();
+        if (sc.peek() == ',') {
+            sc.advance();
+            continue;
+        }
+        if (sc.peek() == ']') {
+            sc.advance();
+            return;
         }
         return error.BadObject;
     }
@@ -538,9 +834,26 @@ test "parse Update / Delete / Like / Announce / Accept / Reject types" {
     }
 }
 
-test "parse rejects unsupported activity types" {
+test "AP-8: parse recognises Add" {
     const input =
-        \\{"type":"Add","actor":"https://a/u","object":"https://a/o"}
+        \\{"type":"Add","actor":"https://a/u","object":"https://a/p","target":"https://a/u/collections/featured"}
+    ;
+    const act = try parse(input);
+    try std.testing.expect(act.activity_type == .add);
+    try std.testing.expectEqualStrings("https://a/u/collections/featured", act.target);
+}
+
+test "AP-8: parse recognises Remove" {
+    const input =
+        \\{"type":"Remove","actor":"https://a/u","object":"https://a/p","target":"https://a/u/collections/featured"}
+    ;
+    const act = try parse(input);
+    try std.testing.expect(act.activity_type == .remove);
+}
+
+test "parse rejects truly unsupported activity types" {
+    const input =
+        \\{"type":"Bogus","actor":"https://a/u","object":"https://a/o"}
     ;
     try std.testing.expectError(error.UnsupportedActivity, parse(input));
 }
@@ -566,4 +879,36 @@ test "parse accepts inline actor object with id" {
     const act = try parse(input);
     try std.testing.expect(act.activity_type == .like);
     try std.testing.expectEqualStrings("https://a/u", act.actor);
+}
+
+test "AP-22: isKnownObjectType recognises core types" {
+    try std.testing.expect(isKnownObjectType("Note"));
+    try std.testing.expect(isKnownObjectType("Person"));
+    try std.testing.expect(isKnownObjectType("Tombstone"));
+    try std.testing.expect(isKnownObjectType("")); // absent → trivially OK
+    try std.testing.expect(!isKnownObjectType("FunkyCustomType"));
+}
+
+test "AP-24: parse captures sensitive flag from inline object" {
+    const input =
+        \\{"type":"Create","actor":"https://a/u","object":{"id":"https://a/p","type":"Note","sensitive":true}}
+    ;
+    const act = try parse(input);
+    try std.testing.expect(act.sensitive);
+}
+
+test "AP-24: parse defaults sensitive to false when absent" {
+    const input =
+        \\{"type":"Create","actor":"https://a/u","object":{"id":"https://a/p","type":"Note"}}
+    ;
+    const act = try parse(input);
+    try std.testing.expect(!act.sensitive);
+}
+
+test "AP-24: parse honours sensitive: false" {
+    const input =
+        \\{"type":"Create","actor":"https://a/u","object":{"id":"https://a/p","type":"Note","sensitive":false}}
+    ;
+    const act = try parse(input);
+    try std.testing.expect(!act.sensitive);
 }

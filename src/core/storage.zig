@@ -5,6 +5,9 @@ pub const stmts = @import("storage/stmts.zig");
 pub const channel = @import("storage/channel.zig");
 pub const schema = @import("storage/schema.zig");
 pub const handle = @import("storage/handle.zig");
+pub const backend = @import("storage/backend.zig");
+pub const Backend = backend.Backend;
+pub const SqliteBackend = backend.SqliteBackend;
 
 pub const StmtKey = stmts.StmtKey;
 pub const StmtTable = stmts.StmtTable;
@@ -28,4 +31,5 @@ test {
     _ = channel;
     _ = schema;
     _ = handle;
+    _ = backend;
 }

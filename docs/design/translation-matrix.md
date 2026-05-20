@@ -11,6 +11,11 @@ versa) is one of:
 The matrix is curated by hand. When you add a new translation,
 update this file in the same commit.
 
+**Scope**: this file documents the **bridge** behaviour only. For
+how each protocol behaves as a **native node** (independent of
+bridging), see [`../../PROTOCOL_AUDIT.md`](../../PROTOCOL_AUDIT.md)
+and [`../../SPEC_PUNCHLIST.md`](../../SPEC_PUNCHLIST.md).
+
 _Last updated: 2026-05-19 (post-W6 + B + A1)._
 
 ## AP → AT (inbound AP inbox)

@@ -156,6 +156,118 @@ pub const tombstones_migration: Migration = .{
     .down = "DROP TABLE ap_tombstones;",
 };
 
+// AP-6: track the IRI of the original Follow activity on `ap_follows`
+// so an inbound `Undo{Follow}` referencing that IRI can locate and
+// delete the right row. New column, indexed.
+pub const follows_iri_migration: Migration = .{
+    .id = 1009,
+    .name = "activitypub:follows-iri",
+    .up =
+    \\ALTER TABLE ap_follows ADD COLUMN follow_iri TEXT;
+    \\CREATE INDEX IF NOT EXISTS ap_follows_iri_idx ON ap_follows (follow_iri);
+    ,
+    .down = "DROP INDEX IF EXISTS ap_follows_iri_idx;",
+};
+
+// AP-12: record the deleted object's former AS2 type alongside the
+// tombstone URI so a 410 Gone GET can echo the right `formerType`.
+pub const tombstones_former_type_migration: Migration = .{
+    .id = 1010,
+    .name = "activitypub:tombstones-former-type",
+    .up = "ALTER TABLE ap_tombstones ADD COLUMN former_type TEXT;",
+    .down = "",
+};
+
+// AP-17: hashtag + mention indexes captured from `tag[]`.
+pub const tags_migration: Migration = .{
+    .id = 1012,
+    .name = "activitypub:tags",
+    .up =
+    \\CREATE TABLE IF NOT EXISTS ap_tags (
+    \\    activity_iri TEXT NOT NULL,
+    \\    kind         TEXT NOT NULL,
+    \\    name         TEXT NOT NULL,
+    \\    href         TEXT,
+    \\    PRIMARY KEY (activity_iri, kind, name)
+    \\) STRICT;
+    \\CREATE INDEX IF NOT EXISTS ap_tags_kind_name_idx ON ap_tags (kind, name);
+    ,
+    .down = "DROP TABLE ap_tags;",
+};
+
+// AP-25: block enforcement. Block activities are stored here keyed on
+// (actor, target); subsequent inbound activities from a blocked
+// remote actor are 403'd.
+pub const blocks_migration: Migration = .{
+    .id = 1013,
+    .name = "activitypub:blocks",
+    .up =
+    \\CREATE TABLE IF NOT EXISTS ap_blocks (
+    \\    actor       TEXT NOT NULL,
+    \\    target      TEXT NOT NULL,
+    \\    activity_id TEXT,
+    \\    created_at  INTEGER NOT NULL,
+    \\    PRIMARY KEY (actor, target)
+    \\) STRICT;
+    \\CREATE INDEX IF NOT EXISTS ap_blocks_target_idx ON ap_blocks (target);
+    ,
+    .down = "DROP TABLE ap_blocks;",
+};
+
+// AP-26: actor move (FEP-fb2a). We record the old→new actor pair so
+// downstream lookups can chase the `alsoKnownAs` chain.
+pub const moves_migration: Migration = .{
+    .id = 1014,
+    .name = "activitypub:moves",
+    .up =
+    \\CREATE TABLE IF NOT EXISTS ap_actor_moves (
+    \\    old_actor  TEXT PRIMARY KEY,
+    \\    new_actor  TEXT NOT NULL,
+    \\    moved_at   INTEGER NOT NULL
+    \\) STRICT;
+    ,
+    .down = "DROP TABLE ap_actor_moves;",
+};
+
+// AP-15: per-actor multi-key advertisement (FEP-d36d). The original
+// `ap_actor_keys` row stores the primary key; additional keys land
+// in this side table keyed on (username, key_id).
+pub const multikey_migration: Migration = .{
+    .id = 1015,
+    .name = "activitypub:multikey",
+    .up =
+    \\CREATE TABLE IF NOT EXISTS ap_actor_extra_keys (
+    \\    username    TEXT NOT NULL,
+    \\    key_id      TEXT NOT NULL,
+    \\    key_type    TEXT NOT NULL,
+    \\    public_pem  TEXT NOT NULL,
+    \\    created_at  INTEGER NOT NULL,
+    \\    PRIMARY KEY (username, key_id)
+    \\) STRICT;
+    ,
+    .down = "DROP TABLE ap_actor_extra_keys;",
+};
+
+// AP-8: track collection membership for Add/Remove activities.
+// `collection` is the target collection IRI (e.g.
+// `https://host/users/alice/collections/featured`); `object_iri` is
+// the AP object pinned to it.
+pub const collection_items_migration: Migration = .{
+    .id = 1011,
+    .name = "activitypub:collection-items",
+    .up =
+    \\CREATE TABLE IF NOT EXISTS ap_collection_items (
+    \\    collection TEXT NOT NULL,
+    \\    object_iri TEXT NOT NULL,
+    \\    actor      TEXT NOT NULL,
+    \\    added_at   INTEGER NOT NULL,
+    \\    PRIMARY KEY (collection, object_iri)
+    \\) STRICT;
+    \\CREATE INDEX IF NOT EXISTS ap_collection_items_collection_idx ON ap_collection_items (collection);
+    ,
+    .down = "DROP TABLE ap_collection_items;",
+};
+
 pub const all_migrations = [_]Migration{
     users_migration,
     actor_keys_migration,
@@ -165,6 +277,13 @@ pub const all_migrations = [_]Migration{
     activities_migration,
     follows_migration,
     tombstones_migration,
+    follows_iri_migration,
+    tombstones_former_type_migration,
+    collection_items_migration,
+    tags_migration,
+    blocks_migration,
+    moves_migration,
+    multikey_migration,
 };
 
 /// Plugin entrypoint: push every migration onto the shared schema.
@@ -190,12 +309,31 @@ pub fn applyAllForTests(db: *c.sqlite3) !void {
     if (errmsg != null) c.sqlite3_free(errmsg);
 
     for (all_migrations) |m| {
+        // Skip if already applied — mirrors the production migration
+        // runner. Without this, ALTER TABLE migrations (which have no
+        // IF NOT EXISTS form in SQLite) fail on the second run.
+        var chk: ?*c.sqlite3_stmt = null;
+        _ = c.sqlite3_prepare_v2(db, "SELECT 1 FROM migrations WHERE id = ?", -1, &chk, null);
+        _ = c.sqlite3_bind_int64(chk, 1, @intCast(m.id));
+        const seen = c.sqlite3_step(chk.?) == c.SQLITE_ROW;
+        _ = c.sqlite3_finalize(chk);
+        if (seen) continue;
+
         const sql_z = try std.testing.allocator.dupeZ(u8, m.up);
         defer std.testing.allocator.free(sql_z);
         var em: [*c]u8 = null;
         const rc = c.sqlite3_exec(db, sql_z.ptr, null, null, &em);
         if (em != null) c.sqlite3_free(em);
         if (rc != c.SQLITE_OK) return error.MigrationFailed;
+
+        // Mark applied so a re-run of `applyAllForTests` (some tests
+        // do this to verify idempotency) doesn't re-execute ALTERs.
+        var ins: ?*c.sqlite3_stmt = null;
+        _ = c.sqlite3_prepare_v2(db, "INSERT INTO migrations(id, name, applied_at) VALUES (?, ?, 0)", -1, &ins, null);
+        _ = c.sqlite3_bind_int64(ins, 1, @intCast(m.id));
+        _ = c.sqlite3_bind_text(ins, 2, m.name.ptr, @intCast(m.name.len), c.sqliteTransientAsDestructor());
+        _ = c.sqlite3_step(ins.?);
+        _ = c.sqlite3_finalize(ins);
     }
 }
 

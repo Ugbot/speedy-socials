@@ -32,6 +32,7 @@ const http_client = core.http_client;
 const sig = @import("sig.zig");
 const keys = @import("keys.zig");
 const outbox_worker = @import("outbox_worker.zig");
+const state_mod = @import("state.zig");
 
 pub const max_signature_b64_bytes: usize = 1024;
 pub const max_date_bytes: usize = 64;
@@ -323,6 +324,78 @@ fn deliverInner(
         .ed25519 => "ed25519",
         .rsa_sha256 => "rsa-sha256",
     };
+
+    // AP-9: when the module is configured for RFC 9421 outbound,
+    // also build the alternate signing string + signature over
+    // (`@method`, `@target-uri`, `content-digest`, `host`, `date`).
+    // The RFC 9421 path layers `Signature-Input` + `Signature`
+    // headers + a `Content-Digest` (sf-binary) header alongside the
+    // legacy `Digest` so peers that strictly verify either format
+    // can validate.
+    var content_digest_buf: [max_digest_bytes]u8 = undefined;
+    const content_digest = sig.computeContentDigestHeader(payload, &content_digest_buf) catch return error.SignFailed;
+    const want_rfc9421 = state_mod.outboundSigScheme() == .rfc9421;
+
+    var rfc_sig_input_buf: [256]u8 = undefined;
+    var rfc_sig_buf: [max_signature_header_bytes]u8 = undefined;
+    var rfc_sig_b64_buf: [max_signature_b64_bytes]u8 = undefined;
+    var rfc_sig_input: []const u8 = "";
+    var rfc_sig: []const u8 = "";
+    if (want_rfc9421) {
+        // Build the `Signature-Input` value first — the signing string
+        // needs `signature_params_raw` to embed it.
+        rfc_sig_input = std.fmt.bufPrint(&rfc_sig_input_buf,
+            "sig1=(\"@method\" \"@target-uri\" \"host\" \"date\" \"content-digest\");created={d};keyid=\"{s}\";alg=\"{s}\"",
+            .{ now_unix, key_id, algo_str },
+        ) catch return error.SignFailed;
+        // Strip the `sig1=` label for the `signature_params_raw` field.
+        const eq = std.mem.indexOfScalar(u8, rfc_sig_input, '=') orelse return error.SignFailed;
+        const params_raw = rfc_sig_input[eq + 1 ..];
+
+        var rfc_template: sig.Parsed = .{
+            .scheme = .rfc9421,
+            .key_id = key_id,
+            .algorithm = algo,
+            .signature_b64 = "",
+            .signature_params_raw = params_raw,
+        };
+        rfc_template.component_count = 5;
+        rfc_template.components[0] = sig.Component.fromSlice("@method") catch return error.SignFailed;
+        rfc_template.components[1] = sig.Component.fromSlice("@target-uri") catch return error.SignFailed;
+        rfc_template.components[2] = sig.Component.fromSlice("host") catch return error.SignFailed;
+        rfc_template.components[3] = sig.Component.fromSlice("date") catch return error.SignFailed;
+        rfc_template.components[4] = sig.Component.fromSlice("content-digest") catch return error.SignFailed;
+
+        const rfc_req: sig.RequestView = .{
+            .method = "POST",
+            .path = dest.path,
+            .target_uri = target_inbox,
+            .host = dest.host,
+            .date = date_str,
+            .digest_legacy = "",
+            .content_digest = content_digest,
+        };
+
+        switch (priv.algo) {
+            .ed25519 => {
+                const seed = try extractEd25519Seed(priv.bytes[0..priv.len]);
+                const kp = core.crypto.ed25519.fromSeed(seed) catch return error.SignFailed;
+                const sig_b64 = sig.signEd25519(&rfc_template, &rfc_req, kp.secret_key, &rfc_sig_b64_buf) catch return error.SignFailed;
+                rfc_sig = std.fmt.bufPrint(&rfc_sig_buf, "sig1=:{s}:", .{sig_b64}) catch return error.SignFailed;
+            },
+            .rsa_sha256 => {
+                var signing_string_buf: [4096]u8 = undefined;
+                const signing_string = sig.buildSigningString(&rfc_template, &rfc_req, &signing_string_buf) catch return error.SignFailed;
+                var raw_sig: [512]u8 = undefined;
+                const sig_len = core.crypto.rsa.signPkcs1v15Sha256(priv.bytes[0..priv.len], signing_string, &raw_sig) catch return error.SignFailed;
+                const enc_len = base64.Encoder.calcSize(sig_len);
+                if (enc_len > rfc_sig_b64_buf.len) return error.SignFailed;
+                const encoded = base64.Encoder.encode(rfc_sig_b64_buf[0..enc_len], raw_sig[0..sig_len]);
+                rfc_sig = std.fmt.bufPrint(&rfc_sig_buf, "sig1=:{s}:", .{encoded}) catch return error.SignFailed;
+            },
+        }
+    }
+
     var sig_header_buf: [max_signature_header_bytes]u8 = undefined;
     const sig_header = try buildSignatureHeader(
         key_id,
@@ -332,18 +405,35 @@ fn deliverInner(
         &sig_header_buf,
     );
 
-    const hdrs = [_]http_client.Header{
-        .{ .name = "Date", .value = date_str },
-        .{ .name = "Digest", .value = digest },
-        .{ .name = "Content-Type", .value = "application/activity+json" },
-        .{ .name = "Signature", .value = sig_header },
-    };
+    // Build header set — RFC 9421 path emits additional headers.
+    const max_hdrs: usize = 8;
+    var hdrs_arr: [max_hdrs]http_client.Header = undefined;
+    var n_hdrs: usize = 0;
+    hdrs_arr[n_hdrs] = .{ .name = "Date", .value = date_str };
+    n_hdrs += 1;
+    hdrs_arr[n_hdrs] = .{ .name = "Digest", .value = digest };
+    n_hdrs += 1;
+    hdrs_arr[n_hdrs] = .{ .name = "Content-Type", .value = "application/activity+json" };
+    n_hdrs += 1;
+    hdrs_arr[n_hdrs] = .{ .name = "Signature", .value = sig_header };
+    n_hdrs += 1;
+    if (want_rfc9421) {
+        hdrs_arr[n_hdrs] = .{ .name = "Content-Digest", .value = content_digest };
+        n_hdrs += 1;
+        hdrs_arr[n_hdrs] = .{ .name = "Signature-Input", .value = rfc_sig_input };
+        n_hdrs += 1;
+        // Replace the cavage Signature with the RFC 9421 one. Real
+        // Mastodon currently sends both; we follow suit.
+        hdrs_arr[n_hdrs] = .{ .name = "Signature", .value = rfc_sig };
+        n_hdrs += 1;
+    }
+    const hdrs = hdrs_arr[0..n_hdrs];
 
     var resp: http_client.Response = .{ .status = 0 };
     client.sendSync(.{
         .method = .post,
         .url = target_inbox,
-        .headers = &hdrs,
+        .headers = hdrs,
         .body = payload,
         .timeout_ms = 30_000,
     }, &resp) catch return error.HttpFailed;

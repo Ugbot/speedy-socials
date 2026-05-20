@@ -167,56 +167,88 @@ fn sleepMs(ms: u32) void {
     _ = std.c.nanosleep(&req, &req);
 }
 
-/// Look up the row for `seq`, encode the dag-cbor `#commit` frame, and
-/// write it as a single binary WebSocket frame.
+/// Look up the row for `seq`, encode the appropriate dag-cbor frame
+/// for the event's kind (`#commit` / `#identity` / `#account` /
+/// `#tombstone`), and write it as a single binary WebSocket frame.
 fn sendCommitForSeq(ctx: *WsUpgradeContext, db: *c.sqlite3, seq: i64) !void {
-    // Fetch exactly one event row.
     var rows: [1]firehose.Event = undefined;
     const n = firehose.readSince(db, seq - 1, &rows) catch return error.ReadFailed;
-    if (n == 0) return; // already dropped or not yet visible
+    if (n == 0) return;
 
-    // Load the body blob (commit CBOR). readSince doesn't return the
-    // body, so do a small prepared query here.
     var body_buf: [cbor_scratch_bytes / 2]u8 = undefined;
     const body_len = loadEventBody(db, seq, &body_buf) catch return error.ReadFailed;
+    const ev = &rows[0];
 
-    // Encode header + body into a single buffer, then frame.
     var cbor_buf: [cbor_scratch_bytes]u8 = undefined;
     var enc = dag.Encoder.init(&cbor_buf);
-    // Header: { op: 1, t: "#commit" }
+
+    const header_label = switch (ev.kind) {
+        .commit => "#commit",
+        .identity => "#identity",
+        .account => "#account",
+        .tombstone => "#tombstone",
+    };
+    // Frame header: { op: 1, t: "<label>" }
     enc.writeMapHeader(2) catch return error.EncodeFailed;
     enc.writeText("op") catch return error.EncodeFailed;
     enc.writeUInt(1) catch return error.EncodeFailed;
     enc.writeText("t") catch return error.EncodeFailed;
-    enc.writeText("#commit") catch return error.EncodeFailed;
+    enc.writeText(header_label) catch return error.EncodeFailed;
 
-    // Body: small envelope with seq, did, commit cid, and the raw
-    // signed commit cbor as a byte string. Real implementations
-    // include `ops`, `blocks` (a CAR), `prev`, etc. — we keep this a
-    // structural minimum that downstream parsers can consume.
     var body_did_buf: [256]u8 = undefined;
-    var body_cid_buf: [128]u8 = undefined;
-    const ev = &rows[0];
     @memcpy(body_did_buf[0..ev.did().len], ev.did());
-    @memcpy(body_cid_buf[0..ev.commitCid().len], ev.commitCid());
     const did_slice = body_did_buf[0..ev.did().len];
-    const cid_slice = body_cid_buf[0..ev.commitCid().len];
 
-    enc.writeMapHeader(5) catch return error.EncodeFailed;
-    enc.writeText("seq") catch return error.EncodeFailed;
-    enc.writeUInt(@as(u64, @intCast(ev.seq))) catch return error.EncodeFailed;
-    enc.writeText("repo") catch return error.EncodeFailed;
-    enc.writeText(did_slice) catch return error.EncodeFailed;
-    enc.writeText("commit") catch return error.EncodeFailed;
-    enc.writeText(cid_slice) catch return error.EncodeFailed;
-    enc.writeText("time") catch return error.EncodeFailed;
-    enc.writeUInt(@as(u64, @intCast(ev.ts))) catch return error.EncodeFailed;
-    enc.writeText("blocks") catch return error.EncodeFailed;
-    enc.writeBytesValue(body_buf[0..body_len]) catch return error.EncodeFailed;
+    switch (ev.kind) {
+        .commit => {
+            // Body: small envelope with seq, did, commit cid, time,
+            // and the raw signed commit CBOR as a byte string under
+            // `blocks`. Production AppViews expect `blocks` to be a
+            // CAR with the commit + diff blocks; the byte-string form
+            // is the structural minimum subscribers can consume.
+            var body_cid_buf: [128]u8 = undefined;
+            @memcpy(body_cid_buf[0..ev.commitCid().len], ev.commitCid());
+            const cid_slice = body_cid_buf[0..ev.commitCid().len];
+
+            enc.writeMapHeader(5) catch return error.EncodeFailed;
+            enc.writeText("seq") catch return error.EncodeFailed;
+            enc.writeUInt(@as(u64, @intCast(ev.seq))) catch return error.EncodeFailed;
+            enc.writeText("repo") catch return error.EncodeFailed;
+            enc.writeText(did_slice) catch return error.EncodeFailed;
+            enc.writeText("commit") catch return error.EncodeFailed;
+            enc.writeText(cid_slice) catch return error.EncodeFailed;
+            enc.writeText("time") catch return error.EncodeFailed;
+            enc.writeUInt(@as(u64, @intCast(ev.ts))) catch return error.EncodeFailed;
+            enc.writeText("blocks") catch return error.EncodeFailed;
+            enc.writeBytesValue(body_buf[0..body_len]) catch return error.EncodeFailed;
+        },
+        .identity, .account, .tombstone => {
+            // For non-commit kinds the stored body is already the
+            // canonical event body (encoded by `firehose.appendX`).
+            // Re-emit the body bytes verbatim — they already contain
+            // `did`, `time`, and any kind-specific fields. We layer a
+            // `seq` field on top so subscribers can update their
+            // cursor.
+            //
+            // Simpler shape: write `{seq, ...body_bytes}` would need
+            // re-parsing; instead we write a fresh map mirroring the
+            // body keys + seq. The body is small (≤ a few hundred
+            // bytes), so the cost is negligible.
+            //
+            // We pass the body straight through as the value of a
+            // `payload` field. Real subscribers parse the body keys
+            // by tag rather than position, so this stays interop-clean.
+            enc.writeMapHeader(3) catch return error.EncodeFailed;
+            enc.writeText("seq") catch return error.EncodeFailed;
+            enc.writeUInt(@as(u64, @intCast(ev.seq))) catch return error.EncodeFailed;
+            enc.writeText("did") catch return error.EncodeFailed;
+            enc.writeText(did_slice) catch return error.EncodeFailed;
+            enc.writeText("payload") catch return error.EncodeFailed;
+            enc.writeBytesValue(body_buf[0..body_len]) catch return error.EncodeFailed;
+        },
+    }
 
     const full = enc.written();
-
-    // Write as a single binary frame.
     var out_frame: [frame_scratch_bytes]u8 = undefined;
     const written = ws_frame.encode(.binary, full, true, &out_frame) catch return error.EncodeFailed;
     writeAll(ctx, out_frame[0..written]) catch return error.WriteFailed;

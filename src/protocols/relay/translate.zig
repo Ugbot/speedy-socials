@@ -220,7 +220,13 @@ pub fn apActivityToAtRecord(
         // we surface them as posts with an empty text + the activity id
         // recorded as subject. The relay's higher-level pipeline can
         // choose to drop them.
-        .update, .delete, .accept, .reject, .undo, .move, .block, .flag => return error.UnsupportedKind,
+        // AP-8: Add/Remove also don't translate to a single AT row;
+        // collection membership changes ride on the underlying record's
+        // lifecycle in atproto.
+        // AP-16: Question (poll) bridges to a future
+        // `app.bsky.feed.post` with a poll embed (not yet implemented
+        // upstream); drop for now.
+        .update, .delete, .accept, .reject, .undo, .move, .block, .flag, .add, .remove, .question => return error.UnsupportedKind,
     };
 
     if (out.kind == .post) {

@@ -18,15 +18,13 @@
 //!
 //! Status:
 //!   * Ed25519: implemented via `std.crypto.sign.Ed25519`.
-//!   * secp256k1: stdlib has `EcdsaSecp256k1Sha256` but the AT Protocol
-//!     spec also requires low-S normalization. We expose a stub that
-//!     returns `error.NotImplemented` for sign/verify until the
-//!     normalization helper from the absorbed `lib/zat/.../jwt.zig`
-//!     is rewritten Tiger Style in a later phase.
+//!   * secp256k1: implemented in `core/crypto/secp256k1.zig`,
+//!     layered on `std.crypto.sign.ecdsa.EcdsaSecp256k1Sha256` with
+//!     low-S normalisation enforced on emit and rejected on verify.
+//!     Callers here forward to that module.
 //!
-//! Multibase `did:key:` round-trip is implemented for Ed25519 only
-//! (multicodec 0xed). secp256k1 (0xe7) accepts/encodes raw bytes but
-//! signing remains a stub.
+//! Multibase `did:key:` round-trip is implemented for both Ed25519
+//! (multicodec 0xed) and secp256k1 (multicodec 0xe7).
 
 const std = @import("std");
 const core = @import("core");
@@ -72,7 +70,7 @@ pub fn verifyEd25519(message: []const u8, signature: [ed25519_signature_len]u8, 
     return core.crypto.ed25519.verify(public_key, message, signature);
 }
 
-// ── secp256k1 (stub) ───────────────────────────────────────────────
+// ── secp256k1 ──────────────────────────────────────────────────────
 
 /// secp256k1 sign + verify, delegating to `core.crypto.secp256k1` for
 /// the low-S-normalised ECDSA-SHA256 implementation. The AT Protocol

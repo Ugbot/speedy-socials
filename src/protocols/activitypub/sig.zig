@@ -497,6 +497,198 @@ pub fn computeContentDigestHeader(body: []const u8, out: []u8) FedError![]const 
 }
 
 // ──────────────────────────────────────────────────────────────────────
+// AP-4: Inbound digest verification.
+//
+// `Digest` (cavage / RFC 3230) header is `SHA-256=<base64>`. RFC 9421
+// uses `Content-Digest: sha-256=:<base64>:`. Both encode SHA-256 of the
+// request body. We accept either; if `expected` does not contain a
+// `sha-256` (case-insensitive) entry, we treat it as malformed.
+// ──────────────────────────────────────────────────────────────────────
+
+/// Verify the supplied legacy `Digest` header against `body`.
+/// Empty header → returns success (caller decides whether absence is allowed).
+pub fn verifyLegacyDigest(header_value: []const u8, body: []const u8) FedError!void {
+    if (header_value.len == 0) return; // no-op when header absent
+    // The header may carry multiple algorithms separated by commas. Find
+    // a `SHA-256=` (case-insensitive) entry.
+    var rem = header_value;
+    var guard: u32 = 0;
+    while (rem.len > 0) {
+        guard += 1;
+        if (guard > 8) return error.SignatureMalformed;
+        // Skip leading whitespace/comma.
+        rem = std.mem.trimStart(u8, rem, " ,\t");
+        if (rem.len == 0) break;
+        const eq = std.mem.indexOfScalar(u8, rem, '=') orelse return error.SignatureMalformed;
+        const alg = rem[0..eq];
+        // Find end of this entry's value (until comma or eol). Note: the
+        // value is base64 + '=' padding; the comma is the separator
+        // between entries, not within a value.
+        var end: usize = eq + 1;
+        while (end < rem.len and rem[end] != ',') : (end += 1) {}
+        const value = rem[eq + 1 .. end];
+        rem = if (end < rem.len) rem[end + 1 ..] else &.{};
+        if (std.ascii.eqlIgnoreCase(alg, "SHA-256")) {
+            return compareSha256Base64(value, body);
+        }
+    }
+    return error.SignatureInvalid;
+}
+
+/// Verify the supplied RFC 9421 `Content-Digest` header against `body`.
+/// Empty header → returns success.
+pub fn verifyContentDigest(header_value: []const u8, body: []const u8) FedError!void {
+    if (header_value.len == 0) return;
+    // RFC 9530 syntax: `sha-256=:<base64>:` possibly multiple separated
+    // by commas. Each value is wrapped in `:` delimiters (sf-binary).
+    var rem = header_value;
+    var guard: u32 = 0;
+    while (rem.len > 0) {
+        guard += 1;
+        if (guard > 8) return error.SignatureMalformed;
+        rem = std.mem.trimStart(u8, rem, " ,\t");
+        if (rem.len == 0) break;
+        const eq = std.mem.indexOfScalar(u8, rem, '=') orelse return error.SignatureMalformed;
+        const alg = rem[0..eq];
+        rem = rem[eq + 1 ..];
+        if (rem.len < 2 or rem[0] != ':') return error.SignatureMalformed;
+        rem = rem[1..];
+        const close = std.mem.indexOfScalar(u8, rem, ':') orelse return error.SignatureMalformed;
+        const value = rem[0..close];
+        rem = if (close + 1 < rem.len) rem[close + 1 ..] else &.{};
+        if (std.ascii.eqlIgnoreCase(alg, "sha-256")) {
+            return compareSha256Base64(value, body);
+        }
+        // skip trailing comma
+        rem = std.mem.trimStart(u8, rem, " ,\t");
+    }
+    return error.SignatureInvalid;
+}
+
+fn compareSha256Base64(b64: []const u8, body: []const u8) FedError!void {
+    var hash: [32]u8 = undefined;
+    Sha256.hash(body, &hash, .{});
+
+    var decoded: [33]u8 = undefined;
+    const dec_len = base64.Decoder.calcSizeForSlice(b64) catch return error.SignatureMalformed;
+    if (dec_len != 32 or dec_len > decoded.len) return error.SignatureInvalid;
+    base64.Decoder.decode(decoded[0..dec_len], b64) catch return error.SignatureMalformed;
+    // Constant-time compare to avoid timing leaks (though digest is
+    // public, defence in depth).
+    var diff: u8 = 0;
+    var i: usize = 0;
+    while (i < 32) : (i += 1) diff |= decoded[i] ^ hash[i];
+    if (diff != 0) return error.SignatureInvalid;
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// AP-5: Signature freshness / expiry check.
+//
+// Reject when:
+//   * `expires` is set and < now (signature already expired)
+//   * `created` is set and > now + skew_seconds (clock too far ahead —
+//     either a misconfigured peer or a replay-prep attempt)
+//   * `created` is set and < now - max_age_seconds (too old)
+//
+// All checks are gated by the field being present in the signature
+// params; absent fields don't fail the check.
+// ──────────────────────────────────────────────────────────────────────
+
+pub const FreshnessPolicy = struct {
+    /// Maximum allowed clock skew between peers (seconds either side).
+    /// Default 300 s tracks Mastodon practice.
+    skew_seconds: i64 = 300,
+    /// Maximum age (seconds) for a signature whose `created` is set.
+    /// Default 12 h; longer windows enable replay if `expires` is absent.
+    max_age_seconds: i64 = 12 * 60 * 60,
+};
+
+pub fn checkFreshness(parsed: *const Parsed, now_unix: i64, policy: FreshnessPolicy) FedError!void {
+    if (parsed.expires_unix) |exp| {
+        if (exp < now_unix - policy.skew_seconds) return error.SignatureInvalid;
+    }
+    if (parsed.created_unix) |created| {
+        if (created > now_unix + policy.skew_seconds) return error.SignatureInvalid;
+        if (created < now_unix - policy.max_age_seconds) return error.SignatureInvalid;
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// AP-20: Replay-window nonce cache.
+//
+// Bounded fixed-size cache of recently-accepted `(keyId, signature)`
+// pairs. We keep entries for `window_seconds` (default 600 s — wider
+// than the AP-5 freshness window so a replay launched between freshness
+// boundaries still hits the cache). Eviction is oldest-on-insert.
+//
+// Inserted via `seen` from the inbox handler *after* signature verify
+// succeeds; consulted by `seenBefore` at the start of the same path.
+// Constant-time on the happy path (linear scan of a small ring).
+// ──────────────────────────────────────────────────────────────────────
+
+pub const ReplayCache = struct {
+    pub const capacity: usize = 256;
+    pub const max_keyid_bytes: usize = 256;
+    pub const max_sig_bytes: usize = 96; // base64(64-byte sig) + slack
+
+    const Entry = struct {
+        ts: i64 = 0,
+        keyid_buf: [max_keyid_bytes]u8 = undefined,
+        keyid_len: u16 = 0,
+        sig_buf: [max_sig_bytes]u8 = undefined,
+        sig_len: u8 = 0,
+
+        fn keyid(self: *const Entry) []const u8 {
+            return self.keyid_buf[0..self.keyid_len];
+        }
+        fn sig(self: *const Entry) []const u8 {
+            return self.sig_buf[0..self.sig_len];
+        }
+    };
+
+    entries: [capacity]Entry = .{Entry{}} ** capacity,
+    /// Where the next insert writes — wraps around.
+    head: u16 = 0,
+    /// Configurable replay window in seconds.
+    window_seconds: i64 = 600,
+
+    pub fn init() ReplayCache {
+        return .{};
+    }
+
+    pub fn seenBefore(self: *const ReplayCache, key_id: []const u8, signature_b64: []const u8, now_unix: i64) bool {
+        var i: usize = 0;
+        while (i < capacity) : (i += 1) {
+            const e = &self.entries[i];
+            if (e.keyid_len == 0) continue;
+            if (now_unix - e.ts > self.window_seconds) continue;
+            if (e.keyid_len != key_id.len or e.sig_len != signature_b64.len) continue;
+            if (!std.mem.eql(u8, e.keyid(), key_id)) continue;
+            if (!std.mem.eql(u8, e.sig(), signature_b64)) continue;
+            return true;
+        }
+        return false;
+    }
+
+    pub fn record(self: *ReplayCache, key_id: []const u8, signature_b64: []const u8, now_unix: i64) void {
+        if (key_id.len == 0 or key_id.len > max_keyid_bytes) return;
+        if (signature_b64.len == 0 or signature_b64.len > max_sig_bytes) return;
+        const idx = self.head;
+        self.head = @intCast((@as(usize, self.head) + 1) % capacity);
+        var e: Entry = .{ .ts = now_unix };
+        @memcpy(e.keyid_buf[0..key_id.len], key_id);
+        e.keyid_len = @intCast(key_id.len);
+        @memcpy(e.sig_buf[0..signature_b64.len], signature_b64);
+        e.sig_len = @intCast(signature_b64.len);
+        self.entries[idx] = e;
+    }
+
+    pub fn reset(self: *ReplayCache) void {
+        self.* = .{};
+    }
+};
+
+// ──────────────────────────────────────────────────────────────────────
 // Tests
 // ──────────────────────────────────────────────────────────────────────
 
@@ -540,6 +732,130 @@ test "buildSigningString cavage produces RFC-correct format" {
         "date: Thu, 19 Mar 2026 12:00:00 GMT\n" ++
         "digest: SHA-256=abc==";
     try std.testing.expectEqualStrings(expected, sstr);
+}
+
+test "AP-4: verifyLegacyDigest accepts matching SHA-256 body" {
+    const body = "{\"hello\":\"world\"}";
+    var hash: [32]u8 = undefined;
+    Sha256.hash(body, &hash, .{});
+    var b64_buf: [64]u8 = undefined;
+    const b64 = base64.Encoder.encode(b64_buf[0..base64.Encoder.calcSize(32)], &hash);
+    var hdr_buf: [128]u8 = undefined;
+    const hdr = try std.fmt.bufPrint(&hdr_buf, "SHA-256={s}", .{b64});
+    try verifyLegacyDigest(hdr, body);
+}
+
+test "AP-4: verifyLegacyDigest rejects digest of different body" {
+    const body = "{\"hello\":\"world\"}";
+    var hash: [32]u8 = undefined;
+    Sha256.hash("other body", &hash, .{});
+    var b64_buf: [64]u8 = undefined;
+    const b64 = base64.Encoder.encode(b64_buf[0..base64.Encoder.calcSize(32)], &hash);
+    var hdr_buf: [128]u8 = undefined;
+    const hdr = try std.fmt.bufPrint(&hdr_buf, "SHA-256={s}", .{b64});
+    try std.testing.expectError(error.SignatureInvalid, verifyLegacyDigest(hdr, body));
+}
+
+test "AP-4: verifyLegacyDigest empty header is no-op" {
+    try verifyLegacyDigest("", "body");
+}
+
+test "AP-4: verifyContentDigest accepts matching sha-256 body" {
+    const body = "abc";
+    var out: [128]u8 = undefined;
+    const hdr = try computeContentDigestHeader(body, &out);
+    try verifyContentDigest(hdr, body);
+}
+
+test "AP-4: verifyContentDigest rejects mismatched body" {
+    const body = "abc";
+    var out: [128]u8 = undefined;
+    const hdr = try computeContentDigestHeader(body, &out);
+    try std.testing.expectError(error.SignatureInvalid, verifyContentDigest(hdr, "abd"));
+}
+
+test "AP-5: checkFreshness accepts unset created/expires" {
+    const p: Parsed = .{
+        .scheme = .cavage,
+        .key_id = "k",
+        .algorithm = .ed25519,
+        .signature_b64 = "s",
+    };
+    try checkFreshness(&p, 1_000_000, .{});
+}
+
+test "AP-5: checkFreshness rejects expired signature" {
+    var p: Parsed = .{
+        .scheme = .rfc9421,
+        .key_id = "k",
+        .algorithm = .ed25519,
+        .signature_b64 = "s",
+    };
+    p.expires_unix = 100;
+    try std.testing.expectError(
+        error.SignatureInvalid,
+        checkFreshness(&p, 100_000, .{ .skew_seconds = 60 }),
+    );
+}
+
+test "AP-5: checkFreshness rejects far-future created" {
+    var p: Parsed = .{
+        .scheme = .rfc9421,
+        .key_id = "k",
+        .algorithm = .ed25519,
+        .signature_b64 = "s",
+    };
+    p.created_unix = 1_000_000;
+    try std.testing.expectError(
+        error.SignatureInvalid,
+        checkFreshness(&p, 1_000, .{ .skew_seconds = 60 }),
+    );
+}
+
+test "AP-5: checkFreshness rejects too-old created" {
+    var p: Parsed = .{
+        .scheme = .rfc9421,
+        .key_id = "k",
+        .algorithm = .ed25519,
+        .signature_b64 = "s",
+    };
+    p.created_unix = 1_000;
+    try std.testing.expectError(
+        error.SignatureInvalid,
+        checkFreshness(&p, 1_000_000, .{ .max_age_seconds = 60 * 60 }),
+    );
+}
+
+test "AP-20: ReplayCache rejects duplicate signature within window" {
+    var cache = ReplayCache.init();
+    try std.testing.expect(!cache.seenBefore("key1", "sigAAA", 100));
+    cache.record("key1", "sigAAA", 100);
+    try std.testing.expect(cache.seenBefore("key1", "sigAAA", 200));
+}
+
+test "AP-20: ReplayCache lets duplicates through after window expires" {
+    var cache = ReplayCache.init();
+    cache.window_seconds = 60;
+    cache.record("key1", "sigAAA", 100);
+    try std.testing.expect(cache.seenBefore("key1", "sigAAA", 150));
+    try std.testing.expect(!cache.seenBefore("key1", "sigAAA", 200));
+}
+
+test "AP-20: ReplayCache distinguishes by keyId" {
+    var cache = ReplayCache.init();
+    cache.record("key1", "sigAAA", 100);
+    try std.testing.expect(!cache.seenBefore("key2", "sigAAA", 100));
+}
+
+test "AP-5: checkFreshness accepts created within skew" {
+    var p: Parsed = .{
+        .scheme = .rfc9421,
+        .key_id = "k",
+        .algorithm = .ed25519,
+        .signature_b64 = "s",
+    };
+    p.created_unix = 100_010; // 10 s in the future
+    try checkFreshness(&p, 100_000, .{ .skew_seconds = 300, .max_age_seconds = 12 * 60 * 60 });
 }
 
 test "parseRfc9421 extracts components + keyid + signature bytes" {

@@ -26,6 +26,12 @@ pub const http_client = @import("http_client.zig");
 pub const audit = @import("audit.zig");
 pub const rate_limit = @import("rate_limit.zig");
 pub const config = @import("config.zig");
+pub const email = @import("email.zig");
+pub const blob = @import("blob.zig");
+pub const secrets = @import("secrets.zig");
+pub const account = @import("account.zig");
+pub const dns = @import("dns.zig");
+pub const dual_identity = @import("dual_identity.zig");
 
 /// W4: vendored TigerBeetle stdx primitives — `BoundedArrayType`,
 /// `RingBufferType`, `IOPSType`, `BitSetType`, plus the local
@@ -39,6 +45,7 @@ pub const crypto = struct {
     pub const multicodec = @import("crypto/multicodec.zig");
     pub const rsa = @import("crypto/rsa.zig");
     pub const secp256k1 = @import("crypto/secp256k1.zig");
+    pub const p256 = @import("crypto/p256.zig");
     pub const argon2id = @import("crypto/argon2id.zig");
     /// OpenSSL / BoringSSL / LibreSSL C-ABI wrapper. Single place in
     /// the tree that names the `c.EVP_*` / `c.SSL_*` symbols. See
@@ -101,11 +108,18 @@ test {
     _ = audit;
     _ = rate_limit;
     _ = config;
+    _ = email;
+    _ = blob;
+    _ = secrets;
+    _ = account;
+    _ = dns;
+    _ = dual_identity;
     _ = crypto.ed25519;
     _ = crypto.multibase;
     _ = crypto.multicodec;
     _ = crypto.rsa;
     _ = crypto.secp256k1;
+    _ = crypto.p256;
     _ = crypto.argon2id;
     _ = crypto.openssl;
     _ = tls_boring;

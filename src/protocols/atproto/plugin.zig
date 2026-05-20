@@ -114,6 +114,12 @@ test {
     _ = car;
     _ = sync_firehose;
     _ = @import("routes.zig");
+    _ = @import("account_routes.zig");
+    _ = @import("admin_routes.zig");
+    _ = @import("oauth_routes.zig");
+    _ = @import("plc_routes.zig");
+    _ = @import("lexicon.zig");
+    _ = @import("blob_gc.zig");
 }
 
 test "atproto plugin registers" {

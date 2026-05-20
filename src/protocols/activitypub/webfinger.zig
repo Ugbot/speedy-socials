@@ -18,14 +18,39 @@ pub const Config = struct {
 };
 
 pub fn parseResourceParam(resource: []const u8) WriteError!struct { username: []const u8, host: []const u8 } {
-    // Expect `acct:user@host`.
-    if (!std.mem.startsWith(u8, resource, "acct:")) return error.BadResource;
-    const rest = resource[5..];
-    const at = std.mem.indexOfScalar(u8, rest, '@') orelse return error.BadResource;
-    const user = rest[0..at];
-    const host = rest[at + 1 ..];
-    if (user.len == 0 or host.len == 0) return error.BadResource;
-    return .{ .username = user, .host = host };
+    // AP-28: accept both `acct:user@host` and direct `https://host/users/name`
+    // (or `https://host/@name`) form. The Mastodon API + Pleroma + some
+    // crawlers send the URL form to dodge the `acct:` parser.
+    if (std.mem.startsWith(u8, resource, "acct:")) {
+        const rest = resource[5..];
+        const at = std.mem.indexOfScalar(u8, rest, '@') orelse return error.BadResource;
+        const user = rest[0..at];
+        const host = rest[at + 1 ..];
+        if (user.len == 0 or host.len == 0) return error.BadResource;
+        return .{ .username = user, .host = host };
+    }
+    if (std.mem.startsWith(u8, resource, "https://")) {
+        const after = resource[8..];
+        const slash = std.mem.indexOfScalar(u8, after, '/') orelse return error.BadResource;
+        const host = after[0..slash];
+        const path = after[slash + 1 ..];
+        // Accept both `/users/<name>` and `/@<name>`.
+        if (std.mem.startsWith(u8, path, "users/")) {
+            const user = path[6..];
+            if (user.len == 0 or host.len == 0) return error.BadResource;
+            // Trim any trailing `/` or `?...` fragment.
+            const trim_end = std.mem.indexOfAny(u8, user, "/?#") orelse user.len;
+            return .{ .username = user[0..trim_end], .host = host };
+        }
+        if (std.mem.startsWith(u8, path, "@")) {
+            const user = path[1..];
+            if (user.len == 0 or host.len == 0) return error.BadResource;
+            const trim_end = std.mem.indexOfAny(u8, user, "/?#") orelse user.len;
+            return .{ .username = user[0..trim_end], .host = host };
+        }
+        return error.BadResource;
+    }
+    return error.BadResource;
 }
 
 pub fn writeJrd(cfg: Config, out: []u8) WriteError![]const u8 {
@@ -80,4 +105,26 @@ test "writeJrd emits all required fields" {
 test "writeJrd fails on too-small buffer" {
     var tiny: [16]u8 = undefined;
     try testing.expectError(error.BufferTooSmall, writeJrd(.{ .hostname = "x", .username = "y" }, &tiny));
+}
+
+test "AP-28: parseResourceParam accepts https URL form (/users/<name>)" {
+    const r = try parseResourceParam("https://example.com/users/alice");
+    try testing.expectEqualStrings("alice", r.username);
+    try testing.expectEqualStrings("example.com", r.host);
+}
+
+test "AP-28: parseResourceParam accepts https URL form (/@<name>)" {
+    const r = try parseResourceParam("https://example.com/@bob");
+    try testing.expectEqualStrings("bob", r.username);
+    try testing.expectEqualStrings("example.com", r.host);
+}
+
+test "AP-28: parseResourceParam trims trailing fragment from URL form" {
+    const r = try parseResourceParam("https://example.com/@bob?foo=bar");
+    try testing.expectEqualStrings("bob", r.username);
+}
+
+test "AP-28: parseResourceParam still rejects total garbage" {
+    try testing.expectError(error.BadResource, parseResourceParam("ftp://x/y"));
+    try testing.expectError(error.BadResource, parseResourceParam("https://example.com/random/path"));
 }

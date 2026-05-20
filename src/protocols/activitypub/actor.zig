@@ -13,6 +13,37 @@ const std = @import("std");
 
 pub const WriteError = error{BufferTooSmall};
 
+/// AP-10: actor type. AS2 allows Person / Service / Organization /
+/// Group / Application. Mastodon honours Service ("bot") + Group +
+/// Application; group fanout (FEP-1b12) is a future ticket — this
+/// just controls the emitted `type` field.
+pub const ActorType = enum {
+    person,
+    service,
+    organization,
+    group,
+    application,
+
+    pub fn asString(self: ActorType) []const u8 {
+        return switch (self) {
+            .person => "Person",
+            .service => "Service",
+            .organization => "Organization",
+            .group => "Group",
+            .application => "Application",
+        };
+    }
+
+    pub fn parse(s: []const u8) ?ActorType {
+        if (std.ascii.eqlIgnoreCase(s, "person")) return .person;
+        if (std.ascii.eqlIgnoreCase(s, "service")) return .service;
+        if (std.ascii.eqlIgnoreCase(s, "organization")) return .organization;
+        if (std.ascii.eqlIgnoreCase(s, "group")) return .group;
+        if (std.ascii.eqlIgnoreCase(s, "application")) return .application;
+        return null;
+    }
+};
+
 pub const Config = struct {
     hostname: []const u8,
     username: []const u8,
@@ -23,6 +54,8 @@ pub const Config = struct {
     manually_approves_followers: bool = false,
     discoverable: bool = true,
     indexable: bool = true,
+    /// AP-10: per-actor type. Default `Person`.
+    actor_type: ActorType = .person,
 };
 
 pub fn writePerson(cfg: Config, out: []u8) WriteError![]const u8 {
@@ -37,7 +70,7 @@ pub fn writePerson(cfg: Config, out: []u8) WriteError![]const u8 {
         "\"featured\":{\"@id\":\"toot:featured\",\"@type\":\"@id\"}," ++
         "\"manuallyApprovesFollowers\":\"as:manuallyApprovesFollowers\"}],");
     w += try fmtInto(out[w..], "\"id\":\"https://{s}/users/{s}\",", .{ cfg.hostname, cfg.username });
-    w += try copy(out[w..], "\"type\":\"Person\",");
+    w += try fmtInto(out[w..], "\"type\":\"{s}\",", .{cfg.actor_type.asString()});
     w += try fmtInto(out[w..], "\"preferredUsername\":\"{s}\",", .{cfg.username});
     if (cfg.display_name.len > 0) {
         w += try fmtInto(out[w..], "\"name\":\"{s}\",", .{cfg.display_name});
@@ -51,8 +84,10 @@ pub fn writePerson(cfg: Config, out: []u8) WriteError![]const u8 {
         "\"followers\":\"https://{s}/users/{s}/followers\"," ++
         "\"following\":\"https://{s}/users/{s}/following\"," ++
         "\"featured\":\"https://{s}/users/{s}/collections/featured\"," ++
+        "\"liked\":\"https://{s}/users/{s}/liked\"," ++ // AP-14
         "\"endpoints\":{{\"sharedInbox\":\"https://{s}/inbox\"}},",
         .{
+            cfg.hostname, cfg.username,
             cfg.hostname, cfg.username,
             cfg.hostname, cfg.username,
             cfg.hostname, cfg.username,

@@ -113,6 +113,44 @@ pub fn isStrictHttpSig() bool {
     return strict_http_sig;
 }
 
+// AP-27: NodeInfo should declare atproto when the AT plugin is also
+// loaded into this Registry. The composition root flips this on after
+// the AT plugin's `register` runs; older deployments that don't bring
+// up the AT plugin leave it false and the NodeInfo metadata stays
+// AP-only.
+var advertise_atproto: bool = false;
+
+pub fn setAdvertiseAtproto(enabled: bool) void {
+    advertise_atproto = enabled;
+}
+
+pub fn advertiseAtproto() bool {
+    return advertise_atproto;
+}
+
+// AP-20: process-wide replay-window nonce cache. The inbox handler
+// records every successfully verified (keyId, signature) here and
+// rejects subsequent matches within `replay_cache.window_seconds`.
+var replay_cache: @import("sig.zig").ReplayCache = .{};
+
+pub fn replayCache() *@import("sig.zig").ReplayCache {
+    return &replay_cache;
+}
+
+// AP-9: outbound signature scheme. `cavage` by default (matches the
+// current fediverse majority); operators can flip to `rfc9421` via
+// the `AP_OUTBOUND_SIG` env at boot.
+pub const OutboundSigScheme = enum { cavage, rfc9421 };
+var outbound_sig_scheme: OutboundSigScheme = .cavage;
+
+pub fn setOutboundSigScheme(scheme: OutboundSigScheme) void {
+    outbound_sig_scheme = scheme;
+}
+
+pub fn outboundSigScheme() OutboundSigScheme {
+    return outbound_sig_scheme;
+}
+
 test "State get/reset cycle" {
     reset();
     const s = get();

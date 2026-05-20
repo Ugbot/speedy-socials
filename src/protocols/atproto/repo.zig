@@ -254,26 +254,60 @@ pub fn commit(
     _ = c.sqlite3_bind_blob(mst_stmt, 3, mst_scratch[0..root.bytes_written].ptr, @intCast(root.bytes_written), c.sqliteTransientAsDestructor());
     if (c.sqlite3_step(mst_stmt.?) != c.SQLITE_DONE) return error.StepFailed;
 
-    // Build commit object CBOR.
-    var commit_buf: [4096]u8 = undefined;
-    var enc = dag.Encoder.init(&commit_buf);
-    try enc.writeMapHeader(5);
-    try enc.writeText("did");
-    try enc.writeText(did);
-    try enc.writeText("version");
-    try enc.writeUInt(commit_version);
-    try enc.writeText("data");
-    try enc.writeCidLink(root.cid.raw());
-    try enc.writeText("rev");
-    try enc.writeText(rev.str());
-    try enc.writeText("prev");
-    try enc.writeNull();
+    // AT-5: Build the **unsigned** commit CBOR. Per spec, the commit
+    // CID is computed over the unsigned form `{did, version, data,
+    // rev, prev}` (5 fields, canonical DAG-CBOR map key order). The
+    // signed form layers a 6th field `sig` on top; that's what
+    // subscribers receive on the firehose and what gets persisted as
+    // the canonical commit body so peers can re-verify.
+    //
+    // Canonical key order is length-then-lexicographic. Lengths:
+    //   "did" (3) < "rev" (3) < "data" (4) < "prev" (4) < "sig" (3)
+    // Wait — DAG-CBOR canonical ordering: shorter first, then byte-lex.
+    //   3-byte keys lex: "did", "rev", "sig"  (ordered: did, rev, sig)
+    //   4-byte keys lex: "data", "prev"       (ordered: data, prev)
+    //   7-byte keys lex: "version"
+    // So canonical order is: did, rev, sig, data, prev, version.
+    var unsigned_buf: [4096]u8 = undefined;
+    var u = dag.Encoder.init(&unsigned_buf);
+    try u.writeMapHeader(5);
+    try u.writeText("did");
+    try u.writeText(did);
+    try u.writeText("rev");
+    try u.writeText(rev.str());
+    try u.writeText("data");
+    try u.writeCidLink(root.cid.raw());
+    try u.writeText("prev");
+    try u.writeNull();
+    try u.writeText("version");
+    try u.writeUInt(commit_version);
+    const unsigned_bytes = u.written();
 
-    const commit_cid = cid_mod.computeDagCbor(enc.written());
+    const commit_cid = cid_mod.computeDagCbor(unsigned_bytes);
     var commit_cid_str: [cid_mod.string_cid_len]u8 = undefined;
     const commit_cid_s = try cid_mod.encodeString(commit_cid, &commit_cid_str);
 
-    const sig = signing_kp.sign(enc.written());
+    const sig = signing_kp.sign(unsigned_bytes);
+
+    // Re-encode with the `sig` byte string included. Same field order
+    // as above, plus `sig` slotted between `rev` and `data` (3-byte
+    // keys come first; "did" < "rev" < "sig" lex).
+    var signed_buf: [4096]u8 = undefined;
+    var s = dag.Encoder.init(&signed_buf);
+    try s.writeMapHeader(6);
+    try s.writeText("did");
+    try s.writeText(did);
+    try s.writeText("rev");
+    try s.writeText(rev.str());
+    try s.writeText("sig");
+    try s.writeBytesValue(&sig);
+    try s.writeText("data");
+    try s.writeCidLink(root.cid.raw());
+    try s.writeText("prev");
+    try s.writeNull();
+    try s.writeText("version");
+    try s.writeUInt(commit_version);
+    const signed_bytes = s.written();
 
     // Persist commit row.
     const commit_sql = "INSERT INTO atp_commits (cid, did, rev, prev_cid, data_cid, signature, committed_at) VALUES (?,?,?,?,?,?,?)";
@@ -299,9 +333,10 @@ pub fn commit(
     _ = c.sqlite3_bind_text(upd_stmt, 3, did.ptr, @intCast(did.len), c.sqliteTransientAsDestructor());
     if (c.sqlite3_step(upd_stmt.?) != c.SQLITE_DONE) return error.StepFailed;
 
-    // Emit firehose event. Body = commit CBOR (signed). Subscribers
-    // reconstruct individual records by reading atp_records.
-    const new_seq = firehose.append(db, did, commit_cid_s, enc.written(), committed_at) catch |e| switch (e) {
+    // Emit firehose event. Body = signed commit CBOR so subscribers
+    // can verify the signature against the published DID's
+    // verification method.
+    const new_seq = firehose.append(db, did, commit_cid_s, signed_bytes, committed_at) catch |e| switch (e) {
         else => return e,
     };
 
@@ -552,4 +587,49 @@ test "repo: commit emits firehose event" {
     const n = try firehose.readSince(db, 0, &events);
     try testing.expect(n >= 1);
     try testing.expectEqualStrings("did:plc:e", events[0].did());
+}
+
+test "AT-5: firehose commit body carries all 6 spec fields" {
+    const db = try setupDb();
+    defer core.storage.sqlite.closeDb(db);
+    const kp = makeKey();
+    try ensureRepo(db, "did:plc:shape", "did:key:z", 1);
+
+    var tree: mst.Tree(mst.max_keys) = .{};
+    var rng = core.rng.Rng.init(0x55);
+    var ts = tid_mod.State.init(&rng);
+    var sc = core.clock.SimClock.init(2);
+    const rev = ts.next(sc.clock());
+
+    var cb: [16]u8 = undefined;
+    var enc = dag.Encoder.init(&cb);
+    try enc.writeMapHeader(0);
+    const ops = [_]Operation{.{ .collection = "n.s.r", .rkey = "k1", .value_cbor = enc.written() }};
+    _ = try commit(db, "did:plc:shape", kp, rev, &tree, &ops, 2, null);
+
+    // Pull the raw body out of atp_firehose_events.
+    var stmt: ?*c.sqlite3_stmt = null;
+    _ = c.sqlite3_prepare_v2(db, "SELECT body FROM atp_firehose_events ORDER BY seq DESC LIMIT 1", -1, &stmt, null);
+    defer _ = c.sqlite3_finalize(stmt);
+    try testing.expect(c.sqlite3_step(stmt) == c.SQLITE_ROW);
+    const body_ptr: [*]const u8 = @ptrCast(c.sqlite3_column_blob(stmt, 0));
+    const body_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 0));
+    const body = body_ptr[0..body_len];
+
+    // CBOR map of length 6 → 0xA6 (major type 5, length 6).
+    try testing.expect(body.len > 0);
+    try testing.expectEqual(@as(u8, 0xA6), body[0]);
+
+    // Scan for each known key as a 3- or 4- or 7-byte text-string. The
+    // map is small enough that linear search by raw bytes is fine.
+    const keys = [_][]const u8{ "did", "rev", "sig", "data", "prev", "version" };
+    var seen_count: u8 = 0;
+    for (keys) |k| {
+        // Build the CBOR text-string head (0x60 + len) for the key.
+        var pat: [16]u8 = undefined;
+        pat[0] = 0x60 + @as(u8, @intCast(k.len));
+        @memcpy(pat[1 .. 1 + k.len], k);
+        if (std.mem.indexOf(u8, body, pat[0 .. 1 + k.len]) != null) seen_count += 1;
+    }
+    try testing.expectEqual(@as(u8, 6), seen_count);
 }

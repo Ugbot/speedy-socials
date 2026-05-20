@@ -39,15 +39,44 @@ pub fn currentLocalSink() ?LocalSink {
     return local_sink;
 }
 
-/// Append a firehose event row. Returns the assigned sequence number.
-pub fn append(
+/// AT-3: kinds of events the firehose can carry. Subscribers need
+/// each kind so AppViews / relays can keep their identity caches in
+/// sync as accounts mutate.
+pub const EventKind = enum {
+    commit,
+    identity,
+    account,
+    tombstone,
+
+    pub fn columnString(self: EventKind) []const u8 {
+        return switch (self) {
+            .commit => "commit",
+            .identity => "identity",
+            .account => "account",
+            .tombstone => "tombstone",
+        };
+    }
+
+    pub fn fromColumn(s: []const u8) EventKind {
+        if (std.mem.eql(u8, s, "identity")) return .identity;
+        if (std.mem.eql(u8, s, "account")) return .account;
+        if (std.mem.eql(u8, s, "tombstone")) return .tombstone;
+        return .commit;
+    }
+};
+
+/// Append a firehose event row of the given kind. Returns the assigned
+/// sequence number. `commit_cid` is the empty string for non-commit
+/// events; `body` is the type-appropriate payload (CBOR).
+pub fn appendKind(
     db: *c.sqlite3,
+    kind: EventKind,
     did: []const u8,
     commit_cid: []const u8,
     body: []const u8,
     ts: i64,
 ) StorageError!i64 {
-    const sql = "INSERT INTO atp_firehose_events (did, commit_cid, body, ts) VALUES (?,?,?,?)";
+    const sql = "INSERT INTO atp_firehose_events (did, commit_cid, body, ts, event_kind) VALUES (?,?,?,?,?)";
     var stmt: ?*c.sqlite3_stmt = null;
     const rc = c.sqlite3_prepare_v2(db, sql, -1, &stmt, null);
     if (rc != c.SQLITE_OK or stmt == null) return error.PrepareFailed;
@@ -57,12 +86,13 @@ pub fn append(
     _ = c.sqlite3_bind_text(stmt, 2, commit_cid.ptr, @intCast(commit_cid.len), c.sqliteTransientAsDestructor());
     _ = c.sqlite3_bind_blob(stmt, 3, body.ptr, @intCast(body.len), c.sqliteTransientAsDestructor());
     _ = c.sqlite3_bind_int64(stmt, 4, ts);
+    const kind_str = kind.columnString();
+    _ = c.sqlite3_bind_text(stmt, 5, kind_str.ptr, @intCast(kind_str.len), c.sqliteTransientAsDestructor());
 
     const step_rc = c.sqlite3_step(stmt.?);
     if (step_rc != c.SQLITE_DONE) return error.StepFailed;
     const seq = c.sqlite3_last_insert_rowid(db);
 
-    // Update cursor.
     const upd_sql = "UPDATE atp_firehose_cursor SET seq = ? WHERE id = 1";
     var ustmt: ?*c.sqlite3_stmt = null;
     if (c.sqlite3_prepare_v2(db, upd_sql, -1, &ustmt, null) == c.SQLITE_OK) {
@@ -71,13 +101,112 @@ pub fn append(
         _ = c.sqlite3_step(ustmt.?);
     }
 
-    // W5.1: notify the in-process local sink (the relay's consumer).
-    // Synchronous on the caller's thread — the sink must enqueue + return
-    // quickly. A panicking sink takes down the whole append path; this
-    // is by design (Tiger Style: loud failures over hidden retries).
     if (local_sink) |sink| sink(seq, did, commit_cid, body, ts);
-
     return seq;
+}
+
+/// Append a `#commit` event. Kept as a thin alias on appendKind so
+/// existing callers don't need to thread the kind enum through.
+pub fn append(
+    db: *c.sqlite3,
+    did: []const u8,
+    commit_cid: []const u8,
+    body: []const u8,
+    ts: i64,
+) StorageError!i64 {
+    return appendKind(db, .commit, did, commit_cid, body, ts);
+}
+
+/// AT-3: emit an `#identity` event so subscribers refresh their
+/// handle-to-DID cache. `handle` may be empty when the change is
+/// purely a key rotation; in that case the body just signals "go
+/// re-resolve this DID."
+pub fn appendIdentity(
+    db: *c.sqlite3,
+    did: []const u8,
+    handle: []const u8,
+    ts: i64,
+) StorageError!i64 {
+    // Body: `{did, time, handle?}` as canonical CBOR. The seq is added
+    // by sync_firehose when it frames the event for the wire.
+    var buf: [512]u8 = undefined;
+    const body = encodeIdentityBody(did, handle, &buf) catch return error.StepFailed;
+    return appendKind(db, .identity, did, "", body, ts);
+}
+
+/// AT-3: emit an `#account` event. `active` reflects whether the
+/// account is usable; `status` is one of "takendown" / "suspended" /
+/// "deactivated" / "deleted" and is omitted when `active` is true.
+pub fn appendAccount(
+    db: *c.sqlite3,
+    did: []const u8,
+    active: bool,
+    status: []const u8,
+    ts: i64,
+) StorageError!i64 {
+    var buf: [256]u8 = undefined;
+    const body = encodeAccountBody(did, active, status, &buf) catch return error.StepFailed;
+    return appendKind(db, .account, did, "", body, ts);
+}
+
+/// AT-3: emit a `#tombstone` event (deprecated in newer atproto but
+/// still consumed by older AppViews). Marks the entire repo as
+/// permanently gone.
+pub fn appendTombstone(
+    db: *c.sqlite3,
+    did: []const u8,
+    ts: i64,
+) StorageError!i64 {
+    var buf: [128]u8 = undefined;
+    const body = encodeTombstoneBody(did, &buf) catch return error.StepFailed;
+    return appendKind(db, .tombstone, did, "", body, ts);
+}
+
+const dag = @import("dag_cbor.zig");
+
+fn encodeIdentityBody(did: []const u8, handle: []const u8, out: []u8) !([]const u8) {
+    var enc = dag.Encoder.init(out);
+    const have_handle = handle.len > 0;
+    // Canonical key order (length-then-lex): "did" (3) < "time" (4) — and
+    // optionally "handle" (6).
+    try enc.writeMapHeader(if (have_handle) 3 else 2);
+    try enc.writeText("did");
+    try enc.writeText(did);
+    try enc.writeText("time");
+    try enc.writeText("");
+    if (have_handle) {
+        try enc.writeText("handle");
+        try enc.writeText(handle);
+    }
+    return enc.written();
+}
+
+fn encodeAccountBody(did: []const u8, active: bool, status: []const u8, out: []u8) !([]const u8) {
+    var enc = dag.Encoder.init(out);
+    const have_status = status.len > 0;
+    // Keys (length-then-lex): "did" (3) < "time" (4) < "active" (6) < "status" (6 — same len; "active" < "status" lex).
+    try enc.writeMapHeader(if (have_status) 4 else 3);
+    try enc.writeText("did");
+    try enc.writeText(did);
+    try enc.writeText("time");
+    try enc.writeText("");
+    try enc.writeText("active");
+    try enc.writeBool(active);
+    if (have_status) {
+        try enc.writeText("status");
+        try enc.writeText(status);
+    }
+    return enc.written();
+}
+
+fn encodeTombstoneBody(did: []const u8, out: []u8) !([]const u8) {
+    var enc = dag.Encoder.init(out);
+    try enc.writeMapHeader(2);
+    try enc.writeText("did");
+    try enc.writeText(did);
+    try enc.writeText("time");
+    try enc.writeText("");
+    return enc.written();
 }
 
 pub const Event = struct {
@@ -87,6 +216,7 @@ pub const Event = struct {
     commit_cid_buf: [128]u8 = undefined,
     commit_cid_len: u16 = 0,
     ts: i64 = 0,
+    kind: EventKind = .commit,
 
     pub fn did(self: *const Event) []const u8 {
         return self.did_buf[0..self.did_len];
@@ -103,7 +233,7 @@ pub fn readSince(
     cursor: i64,
     out: []Event,
 ) StorageError!u32 {
-    const sql = "SELECT seq, did, commit_cid, ts FROM atp_firehose_events WHERE seq > ? ORDER BY seq ASC LIMIT ?";
+    const sql = "SELECT seq, did, commit_cid, ts, event_kind FROM atp_firehose_events WHERE seq > ? ORDER BY seq ASC LIMIT ?";
     var stmt: ?*c.sqlite3_stmt = null;
     const rc = c.sqlite3_prepare_v2(db, sql, -1, &stmt, null);
     if (rc != c.SQLITE_OK or stmt == null) return error.PrepareFailed;
@@ -134,6 +264,13 @@ pub fn readSince(
             ev.commit_cid_len = @intCast(cap);
         }
         ev.ts = c.sqlite3_column_int64(stmt, 3);
+
+        const kind_ptr = c.sqlite3_column_text(stmt, 4);
+        const kind_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 4));
+        if (kind_len > 0 and kind_ptr != null) {
+            ev.kind = EventKind.fromColumn(kind_ptr[0..kind_len]);
+        }
+
         out[n] = ev;
         n += 1;
     }
@@ -200,4 +337,62 @@ test "firehose: empty readSince" {
     var out: [4]Event = undefined;
     const n = try readSince(db, 0, &out);
     try testing.expectEqual(@as(u32, 0), n);
+}
+
+test "AT-3: append commit defaults event_kind to commit" {
+    const db = try setupDb();
+    defer core.storage.sqlite.closeDb(db);
+    _ = try append(db, "did:plc:x", "bafy1", "body", 1);
+    var out: [4]Event = undefined;
+    const n = try readSince(db, 0, &out);
+    try testing.expectEqual(@as(u32, 1), n);
+    try testing.expectEqual(EventKind.commit, out[0].kind);
+}
+
+test "AT-3: appendIdentity writes #identity row" {
+    const db = try setupDb();
+    defer core.storage.sqlite.closeDb(db);
+    _ = try appendIdentity(db, "did:plc:rename", "newalias.example", 99);
+    var out: [4]Event = undefined;
+    const n = try readSince(db, 0, &out);
+    try testing.expectEqual(@as(u32, 1), n);
+    try testing.expectEqual(EventKind.identity, out[0].kind);
+    try testing.expectEqualStrings("did:plc:rename", out[0].did());
+}
+
+test "AT-3: appendAccount with status emits #account row" {
+    const db = try setupDb();
+    defer core.storage.sqlite.closeDb(db);
+    _ = try appendAccount(db, "did:plc:gone", false, "takendown", 100);
+    var out: [4]Event = undefined;
+    const n = try readSince(db, 0, &out);
+    try testing.expectEqual(@as(u32, 1), n);
+    try testing.expectEqual(EventKind.account, out[0].kind);
+}
+
+test "AT-3: appendTombstone emits #tombstone row" {
+    const db = try setupDb();
+    defer core.storage.sqlite.closeDb(db);
+    _ = try appendTombstone(db, "did:plc:dead", 200);
+    var out: [4]Event = undefined;
+    const n = try readSince(db, 0, &out);
+    try testing.expectEqual(@as(u32, 1), n);
+    try testing.expectEqual(EventKind.tombstone, out[0].kind);
+}
+
+test "AT-3: encodeIdentityBody includes handle when supplied" {
+    var buf: [256]u8 = undefined;
+    const body = try encodeIdentityBody("did:plc:a", "alice.example", &buf);
+    // Map of length 3 → 0xA3
+    try testing.expectEqual(@as(u8, 0xA3), body[0]);
+    try testing.expect(std.mem.indexOf(u8, body, "handle") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "alice.example") != null);
+}
+
+test "AT-3: encodeIdentityBody omits handle when empty" {
+    var buf: [256]u8 = undefined;
+    const body = try encodeIdentityBody("did:plc:b", "", &buf);
+    // Map of length 2 → 0xA2
+    try testing.expectEqual(@as(u8, 0xA2), body[0]);
+    try testing.expect(std.mem.indexOf(u8, body, "handle") == null);
 }

@@ -287,6 +287,11 @@ pub fn main() !void {
     _ = try registry.register(atproto.plugin);
     _ = try registry.register(activitypub.plugin);
     _ = try registry.register(mastodon.plugin);
+    // AP-27: advertise atproto in NodeInfo metadata so peers discover
+    // the dual-protocol surface. Set after both plugins are registered
+    // (order matters only conceptually; the AP NodeInfo handler reads
+    // this on each request).
+    activitypub.state.setAdvertiseAtproto(true);
     // Relay registers AFTER its siblings — its `init` calls
     // `Registry.find` for "atproto" and "activitypub" (the sole
     // sibling-lookup carve-out; see src/protocols/relay/plugin.zig).
@@ -297,6 +302,40 @@ pub fn main() !void {
     // sibling lookup during `initAll`.
     relay.attachRegistry(&registry);
 
+    // INFRA-1/2/3/5: wire pluggable backends with safe defaults.
+    // Operators swap these out via env at boot.
+    //   * Account store: in-memory by default; SQLite-backed impl
+    //     lands in a follow-up tranche. The in-memory shape supports
+    //     full AT-8..AT-11 lifecycles for dev / test deployments.
+    //   * Email sender: LogSink by default; flip to webhook when
+    //     `EMAIL_WEBHOOK_URL` is set.
+    //   * Blob store: FsStore rooted at `MEDIA_ROOT` (existing var).
+    //   * Secrets: FileStore rooted at `SECRETS_DIR` if set.
+    var account_backend_mem = core.account.MemoryBackend.init();
+    core.account.setGlobal(account_backend_mem.backend());
+    defer core.account.resetGlobal();
+
+    var email_log = core.email.LogSink.init();
+    core.email.setGlobal(email_log.sender());
+    defer core.email.resetGlobal();
+
+    // Blob backend wires up later in the boot sequence (after the
+    // media plugin computes its MEDIA_ROOT). See `media.setMediaRoot`
+    // below — the FsStore picks up the same root via `setBlobBackend`.
+    defer core.blob.resetGlobal();
+
+    if (std.c.getenv("SECRETS_DIR")) |sd_ptr| {
+        const sd = std.mem.sliceTo(sd_ptr, 0);
+        if (sd.len > 0) {
+            const secrets_static = struct {
+                var store: core.secrets.FileStore = undefined;
+            };
+            secrets_static.store = core.secrets.FileStore.init(sd);
+            core.secrets.setGlobal(secrets_static.store.store());
+        }
+    }
+    defer core.secrets.resetGlobal();
+
     try registry.initAll(&ctx);
     defer registry.deinitAll(&ctx);
 
@@ -304,6 +343,9 @@ pub fn main() !void {
     var schema = core.storage.Schema.init();
     try schema.register(core.storage.bootstrap_migration);
     try schema.register(core.audit.audit_migration);
+    // DUAL-1: cross-protocol identity-map schema lives at core so
+    // both AP and AT plugins can read/write it.
+    try schema.register(core.dual_identity.migration);
     try registry.registerAllSchemas(&ctx, &schema);
     try schema.applyAll(db);
 
@@ -512,6 +554,12 @@ pub fn main() !void {
         break :blk media_root_buf_static.buf[0..default_path.len];
     };
     media.setMediaRoot(media_root);
+    // INFRA-3: wire the blob store now that MEDIA_ROOT is resolved.
+    const blob_fs_static = struct {
+        var store: core.blob.FsStore = undefined;
+    };
+    blob_fs_static.store = core.blob.FsStore.init(media_root);
+    core.blob.setGlobal(blob_fs_static.store.store());
     // Best-effort mkdir so the spillover path has somewhere to land.
     // EEXIST is fine; other errors log a warning + leave the inline
     // path working.

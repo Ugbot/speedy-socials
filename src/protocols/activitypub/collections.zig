@@ -23,6 +23,9 @@ pub const CollectionKind = enum {
     followers,
     following,
     featured,
+    /// AP-14: collection of Like activities the actor produced
+    /// (FEP-c648).
+    liked,
 
     pub fn collectionId(self: CollectionKind) []const u8 {
         return switch (self) {
@@ -30,6 +33,7 @@ pub const CollectionKind = enum {
             .followers => "followers",
             .following => "following",
             .featured => "collections/featured",
+            .liked => "liked",
         };
     }
 };
@@ -92,6 +96,10 @@ pub fn writeIndex(cfg: Config, out: []u8) WriteError![]const u8 {
 /// Write a single page. Pulls up to `max_page_items` items from `iter`,
 /// each one a JSON fragment (an IRI string or an inlined object).
 /// `page_n` controls the `id` URL and the `next` pointer (1-indexed).
+///
+/// AP-7: emits `next` (when `iter` had more than `max_page_items`)
+/// and `prev` (when `page_n > 1`) so peers can walk large
+/// collections end-to-end.
 pub fn writePage(
     cfg: Config,
     page_n: u32,
@@ -114,16 +122,29 @@ pub fn writePage(
     while (i < max_page_items) : (i += 1) {
         const got = iter(iter_state, &scratch) orelse break;
         if (wrote_one) try w.writeAll(",");
-        // Each `got` slice is either a quoted IRI like "\"https://...\""
-        // or an inline JSON object. We write it verbatim.
         try w.writeAll(got);
         wrote_one = true;
     }
-    // If the iterator handed us more than max_page_items items, the next
-    // call after the loop body would set up the *next* page; we just
-    // close this page and the caller computes pagination from the count
-    // returned by writeIndex.
-    try w.writeAll("]}");
+    try w.writeAll("]");
+
+    // AP-7: did the iterator have more? Probe by asking once more.
+    var more_scratch: [1024]u8 = undefined;
+    const has_more = iter(iter_state, &more_scratch) != null;
+
+    if (has_more) {
+        try w.writeAll(",\"next\":\"https://");
+        try w.writeAll(cfg.hostname);
+        try w.print("/users/{s}/{s}?page={d}", .{ cfg.actor_username, cfg.kind.collectionId(), page_n + 1 });
+        try w.writeAll("\"");
+    }
+    if (page_n > 1) {
+        try w.writeAll(",\"prev\":\"https://");
+        try w.writeAll(cfg.hostname);
+        try w.print("/users/{s}/{s}?page={d}", .{ cfg.actor_username, cfg.kind.collectionId(), page_n - 1 });
+        try w.writeAll("\"");
+    }
+
+    try w.writeAll("}");
     return w.slice();
 }
 
@@ -159,6 +180,47 @@ test "writeIndex shape" {
     try std.testing.expect(std.mem.indexOf(u8, out, "\"OrderedCollection\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"totalItems\":7") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "https://example.com/users/alice/outbox") != null);
+}
+
+test "AP-7: writePage emits next when iterator has more items" {
+    const Big = struct {
+        const Self = @This();
+        cursor: u32 = 0,
+        cap: u32,
+        fn next(state: ?*anyopaque, out: []u8) ?[]const u8 {
+            const self: *Self = @ptrCast(@alignCast(state.?));
+            if (self.cursor >= self.cap) return null;
+            self.cursor += 1;
+            const s = "https://x/y";
+            if (out.len < s.len + 2) return null;
+            out[0] = '"';
+            @memcpy(out[1 .. 1 + s.len], s);
+            out[1 + s.len] = '"';
+            return out[0 .. s.len + 2];
+        }
+    };
+    var big = Big{ .cap = max_page_items + 5 };
+    var buf: [4096]u8 = undefined;
+    const out = try writePage(.{
+        .hostname = "example.com",
+        .actor_username = "alice",
+        .kind = .followers,
+        .total_items = max_page_items + 5,
+    }, 1, @ptrCast(&big), Big.next, &buf);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"next\":\"https://example.com/users/alice/followers?page=2\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"prev\"") == null);
+}
+
+test "AP-7: writePage emits prev when page_n > 1" {
+    var it = TestIter{ .items = .{ "https://a/1", "https://a/2", "https://a/3" } };
+    var buf: [2048]u8 = undefined;
+    const out = try writePage(.{
+        .hostname = "example.com",
+        .actor_username = "alice",
+        .kind = .following,
+        .total_items = 3,
+    }, 3, @ptrCast(&it), TestIter.next, &buf);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"prev\":\"https://example.com/users/alice/following?page=2\"") != null);
 }
 
 test "writePage emits orderedItems from iterator" {
