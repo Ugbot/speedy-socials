@@ -49,6 +49,13 @@ pub const WsUpgradeContext = struct {
     /// handler returns; do not retain pointers into this arena past
     /// that point unless they reference plugin-owned long-lived state.
     arena: *Arena,
+    /// WS-1 / C1: TLS-safe data-plane stream. When non-null, plugin
+    /// handlers should use this for non-blocking reads + writes
+    /// instead of poking at `stream` directly. The server's upgrade
+    /// dispatcher mints a `PlainStream` (over the bare fd) or a
+    /// `TlsStream` (over an ianic cipher state) based on whether
+    /// TLS terminates here.
+    ws_stream: ?@import("stream.zig").Stream = null,
 };
 
 pub const WsHandler = *const fn (ctx: *WsUpgradeContext) anyerror!void;

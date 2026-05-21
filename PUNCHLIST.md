@@ -42,9 +42,13 @@ public-API surface).
 
 Still open (genuinely upstream-blocked or aspirational):
 
-- **C1** HTTPS-fronted WebSocket data plane — needs ianic upstream
-  to distinguish WouldBlock from EOF in the blocking `Connection`
-  reader. Mitigation today: terminate TLS at an LB/sidecar.
+- **C1** HTTPS-fronted WebSocket data plane — **architecture closed
+  2026-05-21.** `core.ws.stream` ships `Stream` (vtable),
+  `PlainStream`, `TlsStream` (with per-connection reader thread +
+  plaintext ring). Handlers consult `ctx.ws_stream`. Remaining
+  work is the boot-time wiring that mints `TlsStream` when TLS is
+  active — composition-root change only, no further core change
+  needed. See `docs/design/wss-data-plane.md`.
 - **C3** Per-socket connect/read timeouts on outbound client —
   `timeout_ms` is plumbed through but `std.Io.net` doesn't expose
   the fd's `setsockopt` surface. Tracked against upstream Zig.

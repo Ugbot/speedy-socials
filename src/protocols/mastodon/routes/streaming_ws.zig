@@ -390,6 +390,10 @@ fn writeTextFrame(ctx: *WsUpgradeContext, payload: []const u8) !void {
 }
 
 fn writeAll(ctx: *WsUpgradeContext, payload: []const u8) !void {
+    if (ctx.ws_stream) |s| {
+        s.writeAll(payload) catch return error.WriteFailed;
+        return;
+    }
     var scratch: [4096]u8 = undefined;
     var writer = std.Io.net.Stream.Writer.init(ctx.stream, ctx.io, &scratch);
     writer.interface.writeAll(payload) catch return error.WriteFailed;
@@ -398,7 +402,13 @@ fn writeAll(ctx: *WsUpgradeContext, payload: []const u8) !void {
 
 fn pumpInbound(ctx: *WsUpgradeContext) !bool {
     var read_buf: [512]u8 = undefined;
-    const got = readNonblocking(ctx.stream.socket.handle, &read_buf) catch return true;
+    const got = blk: {
+        if (ctx.ws_stream) |s| {
+            const n = s.readNonblocking(&read_buf) catch return true;
+            break :blk n;
+        }
+        break :blk readNonblocking(ctx.stream.socket.handle, &read_buf) catch return true;
+    };
     if (got == 0) return false;
     var consumed: usize = 0;
     var iters: u32 = 0;

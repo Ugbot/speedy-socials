@@ -83,6 +83,7 @@ pub const ws = struct {
     pub const event_ring = @import("ws/event_ring.zig");
     pub const registry = @import("ws/registry.zig");
     pub const upgrade_router = @import("ws/upgrade_router.zig");
+    pub const stream = @import("ws/stream.zig");
 };
 
 test {
@@ -143,4 +144,5 @@ test {
     _ = ws.event_ring;
     _ = ws.registry;
     _ = ws.upgrade_router;
+    _ = ws.stream;
 }

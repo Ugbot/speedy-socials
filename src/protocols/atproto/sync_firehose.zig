@@ -278,7 +278,15 @@ fn loadEventBody(db: *c.sqlite3, seq: i64, out: []u8) !usize {
 /// client sent a close, or the socket failed (caller exits the loop).
 fn pumpInbound(ctx: *WsUpgradeContext) !bool {
     var read_buf: [512]u8 = undefined;
-    const got = readNonblocking(ctx.stream.socket.handle, &read_buf) catch return true;
+    // C1: route reads through `ws_stream` when present so TLS
+    // sessions see decrypted plaintext.
+    const got = blk: {
+        if (ctx.ws_stream) |s| {
+            const n = s.readNonblocking(&read_buf) catch return true;
+            break :blk n;
+        }
+        break :blk readNonblocking(ctx.stream.socket.handle, &read_buf) catch return true;
+    };
     if (got == 0) return false;
     var consumed: usize = 0;
     var iters: u32 = 0;
@@ -322,6 +330,13 @@ fn writeCloseInternal(ctx: *WsUpgradeContext) !void {
 }
 
 fn writeAll(ctx: *WsUpgradeContext, payload: []const u8) !void {
+    // C1: prefer the unified `ws_stream` when the server set it
+    // (TLS-safe). Fall back to the legacy direct-fd writer for
+    // plain HTTP boot configurations.
+    if (ctx.ws_stream) |s| {
+        s.writeAll(payload) catch return error.WriteFailed;
+        return;
+    }
     var scratch: [4096]u8 = undefined;
     var writer = std.Io.net.Stream.Writer.init(ctx.stream, ctx.io, &scratch);
     writer.interface.writeAll(payload) catch return error.WriteFailed;
