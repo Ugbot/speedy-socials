@@ -5,3 +5,8 @@ zig-pkg/
 .claude/worktrees/
 bench/.echo_bench_results.json
 bench/results.json
+
+# SQLite runtime database files (not source)
+*.db
+*.db-wal
+*.db-shm
