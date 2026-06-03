@@ -3,3 +3,8 @@ zig-out/
 zig-pkg/
 *.o
 .claude/worktrees/
+
+# SQLite runtime database files (not source)
+*.db
+*.db-wal
+*.db-shm
