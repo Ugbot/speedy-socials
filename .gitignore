@@ -1,3 +1,8 @@
 .zig-cache/
 zig-out/
 *.o
+
+# SQLite runtime database files (not source)
+*.db
+*.db-wal
+*.db-shm
