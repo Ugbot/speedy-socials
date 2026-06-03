@@ -59,6 +59,17 @@ pub const State = struct {
     /// transient_failure) when it is null.
     http_client: ?*core.http_client.Client = null,
 
+    /// Optional log handle. When wired, the inbox emits decline records
+    /// here on strict-mode signature rejection. May be null in tests.
+    log: ?*core.log.Log = null,
+
+    /// W3.2 ── strict HTTP-signature verification mode. When true
+    /// (default), inbound activities without a verifiable signature are
+    /// rejected with 401. Soft-accept can be re-enabled at boot via
+    /// `AP_SOFT_ACCEPT=1` in the environment, which flips this flag to
+    /// `false`. Tests toggle it directly via `setStrictMode`.
+    strict_mode: bool = true,
+
     pub fn hostname(self: *const State) []const u8 {
         if (self.hostname_len == 0) return "speedy-socials.local";
         return self.hostname_buf[0..self.hostname_len];
@@ -90,6 +101,24 @@ pub fn attachHttpClient(client: *core.http_client.Client) void {
 pub fn setClockAndRng(clock: Clock, rng: *Rng) void {
     instance.clock = clock;
     instance.rng = rng;
+}
+
+pub fn attachLog(log: *core.log.Log) void {
+    instance.log = log;
+}
+
+pub fn setStrictMode(strict: bool) void {
+    instance.strict_mode = strict;
+}
+
+/// Read `AP_SOFT_ACCEPT=1` once at boot. When present and equal to "1",
+/// drops the strict-mode flag so staging deployments can accept
+/// unverifiable signatures (with a logged decline).
+pub fn configureFromEnv() void {
+    const val = std.posix.getenv("AP_SOFT_ACCEPT") orelse return;
+    if (std.mem.eql(u8, val, "1")) {
+        instance.strict_mode = false;
+    }
 }
 
 pub fn setHostname(name: []const u8) void {

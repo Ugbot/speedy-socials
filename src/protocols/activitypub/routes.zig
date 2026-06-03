@@ -367,11 +367,77 @@ fn handleSharedInbox(hc: *HandlerContext) anyerror!void {
     try dispatchInbox(hc, st, db, "");
 }
 
+/// Outcome of the signature-verification pre-check.
+const SigOutcome = enum { verified, declined_missing, declined_malformed, declined_key_fetch, declined_bad_sig };
+
+fn logDecline(st: *state_mod.State, outcome: SigOutcome, key_id: []const u8, path: []const u8) void {
+    const log_ptr = st.log orelse return;
+    const reason = switch (outcome) {
+        .declined_missing => "missing-signature",
+        .declined_malformed => "malformed-signature",
+        .declined_key_fetch => "key-fetch-failed",
+        .declined_bad_sig => "bad-signature",
+        .verified => return,
+    };
+    log_ptr.record(.warn, "ap.inbox", "signature declined", &.{
+        .{ .k = "reason", .v = reason },
+        .{ .k = "key_id", .v = key_id },
+        .{ .k = "path", .v = path },
+    });
+}
+
+/// W3.2 ── strict signature verification path. Returns one of the
+/// `SigOutcome` variants. The caller maps `verified` → continue inbox
+/// dispatch; anything else → 401 + decline log when in strict mode,
+/// soft-accept when `strict_mode=false`.
+fn verifyInboundSignature(hc: *HandlerContext, st: *state_mod.State) SigOutcome {
+    const sig_input = hc.request.header("Signature-Input");
+    const sig_hdr_opt = hc.request.header("Signature");
+
+    if (sig_hdr_opt == null and sig_input == null) return .declined_missing;
+
+    var parsed_opt: ?sig.Parsed = null;
+    if (sig_input) |si| {
+        if (sig_hdr_opt) |sh| {
+            parsed_opt = sig.parseRfc9421(si, sh) catch null;
+        }
+    }
+    if (parsed_opt == null) {
+        if (sig_hdr_opt) |sh| {
+            parsed_opt = sig.parseCavage(sh) catch null;
+        }
+    }
+    const parsed = parsed_opt orelse return .declined_malformed;
+
+    // Cache fast path: lookup before touching the worker pool. This lets
+    // pre-warmed keys (tests, recently-fetched actors) verify even when
+    // workers aren't wired.
+    const now_ns = st.clock.wallNs();
+    const pk = if (st.keys.tryGet(parsed.key_id, now_ns)) |hit| hit else blk: {
+        const pool = st.workers orelse return .declined_key_fetch;
+        const fetched = key_cache.resolve(&st.keys, pool, st.clock, parsed.key_id) catch return .declined_key_fetch;
+        break :blk fetched;
+    };
+
+    const pq = hc.request.pathAndQuery();
+    var target_uri_buf: [512]u8 = undefined;
+    const host = hc.request.header("Host") orelse st.hostname();
+    const target_uri = std.fmt.bufPrint(&target_uri_buf, "https://{s}{s}", .{ host, pq.path }) catch "";
+    const req_view: sig.RequestView = .{
+        .method = hc.request.method_raw,
+        .path = pq.path,
+        .target_uri = target_uri,
+        .host = host,
+        .date = hc.request.header("Date") orelse "",
+        .digest_legacy = hc.request.header("Digest") orelse "",
+        .content_digest = hc.request.header("Content-Digest") orelse "",
+        .content_type = hc.request.header("Content-Type") orelse "",
+    };
+    sig.verify(&parsed, &req_view, &pk) catch return .declined_bad_sig;
+    return .verified;
+}
+
 fn dispatchInbox(hc: *HandlerContext, st: *state_mod.State, db: *c.sqlite3, _: []const u8) !void {
-    // Parse the activity body. Signature verification is deferred unless
-    // a key is resolvable; in production the key is fetched via the
-    // worker pool, but the route accepts a 202 outcome either way to
-    // signal "received, will process".
     const body = hc.request.body;
     if (body.len == 0) return writeJson(hc, .bad_request, "{\"error\":\"empty body\"}");
 
@@ -379,29 +445,25 @@ fn dispatchInbox(hc: *HandlerContext, st: *state_mod.State, db: *c.sqlite3, _: [
         return writeJson(hc, .bad_request, "{\"error\":\"bad activity\"}");
     };
 
-    // Optional signature verify: best effort. If we have a key cache +
-    // workers + a signature header, try to verify; if not, the activity
-    // is still accepted into the inbox but not fanned out (Tiger Style
-    // soft acceptance — see PROTOCOL_AUDIT AP-C2 for the strict mode
-    // that will land alongside the key-fetch HTTPS client).
-    var verified = false;
-    if (hc.request.header("Signature")) |sig_hdr| sig_block: {
-        const pool = st.workers orelse break :sig_block;
-        const parsed = sig.parseCavage(sig_hdr) catch break :sig_block;
-        const pk = key_cache.resolve(&st.keys, pool, st.clock, parsed.key_id) catch break :sig_block;
-        const pq = hc.request.pathAndQuery();
-        const target_uri_buf: [256]u8 = undefined;
-        _ = target_uri_buf;
-        const req_view: sig.RequestView = .{
-            .method = hc.request.method_raw,
-            .path = pq.path,
-            .target_uri = "",
-            .host = hc.request.header("Host") orelse st.hostname(),
-            .date = hc.request.header("Date") orelse "",
-            .digest_legacy = hc.request.header("Digest") orelse "",
-        };
-        sig.verify(&parsed, &req_view, &pk) catch break :sig_block;
-        verified = true;
+    // W3.2 ── strict signature verification. Decline-log every rejection
+    // and (when strict_mode=true) refuse with 401. Soft-accept retains
+    // the W2.x behaviour for staging environments that set
+    // `AP_SOFT_ACCEPT=1`.
+    const outcome = verifyInboundSignature(hc, st);
+    const verified = outcome == .verified;
+    if (!verified) {
+        const key_id_for_log: []const u8 = if (hc.request.header("Signature")) |s| s else "";
+        logDecline(st, outcome, key_id_for_log, hc.request.pathAndQuery().path);
+        if (st.strict_mode) {
+            const msg = switch (outcome) {
+                .declined_missing => "{\"error\":\"missing or malformed signature\"}",
+                .declined_malformed => "{\"error\":\"missing or malformed signature\"}",
+                .declined_key_fetch => "{\"error\":\"unknown signing key\"}",
+                .declined_bad_sig => "{\"error\":\"signature verification failed\"}",
+                .verified => unreachable,
+            };
+            return writeJson(hc, .unauthorized, msg);
+        }
     }
 
     // Run the state machine. Side-effects are drained inline.
@@ -411,7 +473,7 @@ fn dispatchInbox(hc: *HandlerContext, st: *state_mod.State, db: *c.sqlite3, _: [
     var eff: inbox.SideEffectBuffer = .{};
     var env: inbox.Envelope = .{
         .activity = act,
-        .verified_actor = .{ .iri = act.actor, .is_known_to_us = false },
+        .verified_actor = .{ .iri = act.actor, .is_known_to_us = verified },
         .clock = st.clock,
         .rng = &rng,
     };
@@ -423,8 +485,7 @@ fn dispatchInbox(hc: *HandlerContext, st: *state_mod.State, db: *c.sqlite3, _: [
 
     drainSideEffects(db, st, body, eff.slice()) catch {};
 
-    const status: Status = if (verified) .ok else .ok;
-    try writeJson(hc, status, "{\"status\":\"accepted\"}");
+    try writeJson(hc, .ok, "{\"status\":\"accepted\"}");
 }
 
 fn drainSideEffects(db: *c.sqlite3, st: *state_mod.State, raw_body: []const u8, effects: []const inbox.SideEffect) !void {
@@ -630,6 +691,213 @@ test "isTombstoned reports true after insert" {
     if (em != null) c.sqlite3_free(em);
     try testing.expect(isTombstoned(db, "https://x/y"));
     try testing.expect(!isTombstoned(db, "https://other"));
+}
+
+// ── W3.2: strict sig-verify tests ────────────────────────────────
+
+const request_mod = core.http.request;
+const router_mod = core.http.router;
+const response_mod = core.http.response;
+
+const test_activity_body =
+    "{\"@context\":\"https://www.w3.org/ns/activitystreams\"," ++
+    "\"id\":\"https://remote.example/activities/1\"," ++
+    "\"type\":\"Create\"," ++
+    "\"actor\":\"https://remote.example/users/bob\"," ++
+    "\"object\":{\"id\":\"https://remote.example/notes/1\",\"type\":\"Note\"}}";
+
+const InboxTestKit = struct {
+    db: *c.sqlite3,
+    sc: core.clock.SimClock,
+    rng: core.rng.Rng,
+    write_buf: [4096]u8 = undefined,
+
+    fn init(self: *InboxTestKit) !void {
+        const sqlite_mod = core.storage.sqlite;
+        self.db = try sqlite_mod.openWriter(":memory:");
+        try @import("schema.zig").applyAllForTests(self.db);
+        var em: [*c]u8 = null;
+        _ = c.sqlite3_exec(self.db,
+            "INSERT INTO ap_users(username, display_name, bio, is_locked, discoverable, indexable, created_at) " ++
+            "VALUES ('alice','Alice','hi',0,1,1,0)",
+            null, null, &em);
+        if (em != null) c.sqlite3_free(em);
+
+        self.sc = core.clock.SimClock.init(1_700_000_000_000_000_000);
+        self.rng = core.rng.Rng.init(0xdeadbeef);
+
+        state_mod.reset();
+        const st = state_mod.get();
+        st.db = self.db;
+        st.clock = self.sc.clock();
+        st.rng = &self.rng;
+        state_mod.setHostname("speedy.test");
+        state_mod.setStrictMode(true);
+    }
+
+    fn deinit(self: *InboxTestKit) void {
+        core.storage.sqlite.closeDb(self.db);
+        state_mod.reset();
+    }
+
+    fn dispatch(self: *InboxTestKit, headers: []const request_mod.Header) !struct { status_line: []const u8, body: []const u8 } {
+        const req = request_mod.Request{
+            .method = .post,
+            .method_raw = "POST",
+            .target = "/users/alice/inbox",
+            .version = "HTTP/1.1",
+            .headers = headers,
+            .body = test_activity_body,
+        };
+        var ctx: core.plugin.Context = .{ .clock = self.sc.clock(), .rng = &self.rng };
+        var rb = response_mod.Builder.init(&self.write_buf);
+        var params = router_mod.PathParams{};
+        params.keys[0] = "u";
+        params.values[0] = "alice";
+        params.count = 1;
+        var hc = router_mod.HandlerContext{
+            .plugin_ctx = &ctx,
+            .request = &req,
+            .response = &rb,
+            .params = params,
+        };
+        try handleUserInbox(&hc);
+        const full = rb.bytes();
+        const eol = std.mem.indexOf(u8, full, "\r\n") orelse return error.BadResponse;
+        const body_start = (std.mem.indexOf(u8, full, "\r\n\r\n") orelse return error.BadResponse) + 4;
+        return .{ .status_line = full[0..eol], .body = full[body_start..] };
+    }
+};
+
+fn buildCavageSignedRequest(
+    arena: []u8,
+    key_id: []const u8,
+    sk_bytes: [64]u8,
+) !struct { headers: [4]request_mod.Header, used: usize } {
+    // Build the cavage Signature header by signing a known cover set.
+    var p = try sig.parseCavage(
+        "keyId=\"k\",algorithm=\"ed25519\",headers=\"(request-target) host date\",signature=\"AAAA\"",
+    );
+    p.algorithm = .ed25519;
+    var sig_b64_buf: [128]u8 = undefined;
+    const req_view: sig.RequestView = .{
+        .method = "POST",
+        .path = "/users/alice/inbox",
+        .target_uri = "",
+        .host = "speedy.test",
+        .date = "Sat, 16 May 2026 12:00:00 GMT",
+    };
+    const sig_b64 = try sig.signEd25519(&p, &req_view, sk_bytes, &sig_b64_buf);
+    // Compose the Signature header value (cavage form).
+    const hdr_str = try std.fmt.bufPrint(arena,
+        "keyId=\"{s}\",algorithm=\"ed25519\",headers=\"(request-target) host date\",signature=\"{s}\"",
+        .{ key_id, sig_b64 });
+    const used = hdr_str.len;
+    const headers: [4]request_mod.Header = .{
+        .{ .name = "Host", .value = "speedy.test" },
+        .{ .name = "Date", .value = "Sat, 16 May 2026 12:00:00 GMT" },
+        .{ .name = "Content-Type", .value = "application/activity+json" },
+        .{ .name = "Signature", .value = hdr_str },
+    };
+    return .{ .headers = headers, .used = used };
+}
+
+test "inbox strict: valid Ed25519 cavage signature → 200" {
+    var kit: InboxTestKit = undefined; try kit.init();
+    defer kit.deinit();
+
+    // Generate a key, cache it under its keyId, then sign + dispatch.
+    const kid_str = "https://remote.example/users/bob#main-key";
+    const kid = try keys.KeyId.fromSlice(kid_str);
+    const pair = try keys.generateEd25519FromSeed(kid, keys.testSeed(1));
+    state_mod.get().keys.put(pair.public, kit.sc.clock().wallNs());
+
+    var hdr_arena: [512]u8 = undefined;
+    const built = try buildCavageSignedRequest(&hdr_arena, kid_str, pair.private.ed25519SecretBytes());
+    _ = built.used;
+
+    const r = try kit.dispatch(&built.headers);
+    try testing.expect(std.mem.startsWith(u8, r.status_line, "HTTP/1.1 200"));
+    try testing.expect(std.mem.indexOf(u8, r.body, "accepted") != null);
+}
+
+test "inbox strict: missing Signature header → 401" {
+    var kit: InboxTestKit = undefined; try kit.init();
+    defer kit.deinit();
+    const headers = [_]request_mod.Header{
+        .{ .name = "Host", .value = "speedy.test" },
+        .{ .name = "Date", .value = "Sat, 16 May 2026 12:00:00 GMT" },
+        .{ .name = "Content-Type", .value = "application/activity+json" },
+    };
+    const r = try kit.dispatch(&headers);
+    try testing.expect(std.mem.startsWith(u8, r.status_line, "HTTP/1.1 401"));
+    try testing.expect(std.mem.indexOf(u8, r.body, "missing or malformed signature") != null);
+}
+
+test "inbox strict: malformed Signature header → 401" {
+    var kit: InboxTestKit = undefined; try kit.init();
+    defer kit.deinit();
+    const headers = [_]request_mod.Header{
+        .{ .name = "Host", .value = "speedy.test" },
+        .{ .name = "Date", .value = "Sat, 16 May 2026 12:00:00 GMT" },
+        .{ .name = "Content-Type", .value = "application/activity+json" },
+        .{ .name = "Signature", .value = "this is not a valid signature header" },
+    };
+    const r = try kit.dispatch(&headers);
+    try testing.expect(std.mem.startsWith(u8, r.status_line, "HTTP/1.1 401"));
+}
+
+test "inbox strict: unknown signing key (cache miss, no workers) → 401" {
+    var kit: InboxTestKit = undefined; try kit.init();
+    defer kit.deinit();
+    // Note: we DO NOT insert the key into the cache.
+    const headers = [_]request_mod.Header{
+        .{ .name = "Host", .value = "speedy.test" },
+        .{ .name = "Date", .value = "Sat, 16 May 2026 12:00:00 GMT" },
+        .{ .name = "Content-Type", .value = "application/activity+json" },
+        .{ .name = "Signature", .value = "keyId=\"https://unknown.example/k\",algorithm=\"ed25519\",headers=\"(request-target) host date\",signature=\"AAAA\"" },
+    };
+    const r = try kit.dispatch(&headers);
+    try testing.expect(std.mem.startsWith(u8, r.status_line, "HTTP/1.1 401"));
+}
+
+test "inbox strict: bad signature bytes → 401" {
+    var kit: InboxTestKit = undefined; try kit.init();
+    defer kit.deinit();
+    const kid_str = "https://remote.example/users/bob#main-key";
+    const kid = try keys.KeyId.fromSlice(kid_str);
+    const pair = try keys.generateEd25519FromSeed(kid, keys.testSeed(2));
+    state_mod.get().keys.put(pair.public, kit.sc.clock().wallNs());
+
+    // 64-byte zero signature, base64-encoded.
+    const zero_sig_b64 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==";
+    var hdr_buf: [512]u8 = undefined;
+    const hdr = try std.fmt.bufPrint(&hdr_buf,
+        "keyId=\"{s}\",algorithm=\"ed25519\",headers=\"(request-target) host date\",signature=\"{s}\"",
+        .{ kid_str, zero_sig_b64 });
+    const headers = [_]request_mod.Header{
+        .{ .name = "Host", .value = "speedy.test" },
+        .{ .name = "Date", .value = "Sat, 16 May 2026 12:00:00 GMT" },
+        .{ .name = "Content-Type", .value = "application/activity+json" },
+        .{ .name = "Signature", .value = hdr },
+    };
+    const r = try kit.dispatch(&headers);
+    try testing.expect(std.mem.startsWith(u8, r.status_line, "HTTP/1.1 401"));
+}
+
+test "inbox soft-accept: missing Signature still yields 200 when strict_mode=false" {
+    var kit: InboxTestKit = undefined; try kit.init();
+    defer kit.deinit();
+    state_mod.setStrictMode(false);
+
+    const headers = [_]request_mod.Header{
+        .{ .name = "Host", .value = "speedy.test" },
+        .{ .name = "Date", .value = "Sat, 16 May 2026 12:00:00 GMT" },
+        .{ .name = "Content-Type", .value = "application/activity+json" },
+    };
+    const r = try kit.dispatch(&headers);
+    try testing.expect(std.mem.startsWith(u8, r.status_line, "HTTP/1.1 200"));
+    try testing.expect(std.mem.indexOf(u8, r.body, "accepted") != null);
 }
 
 test "recordFollow upserts state correctly" {

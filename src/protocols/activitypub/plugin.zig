@@ -74,6 +74,21 @@ pub fn attachHttpClient(client: *core.http_client.Client) void {
     state.attachHttpClient(client);
 }
 
+/// W3.2 ── strict-mode signature verification is on by default. Boot
+/// reads `AP_SOFT_ACCEPT=1` via `configureStrictModeFromEnv()` to flip
+/// to the legacy soft-accept path; tests use `setStrictMode` directly.
+pub fn setStrictMode(strict: bool) void {
+    state.setStrictMode(strict);
+}
+
+pub fn configureStrictModeFromEnv() void {
+    state.configureFromEnv();
+}
+
+pub fn attachLog(log: *core.log.Log) void {
+    state.attachLog(log);
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // Plugin contract hooks
 // ──────────────────────────────────────────────────────────────────────

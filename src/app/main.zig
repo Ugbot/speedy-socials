@@ -221,6 +221,11 @@ pub fn main() !void {
     activitypub.attachDb(db);
     activitypub.attachWorkers(ap_workers);
     activitypub.setHostname("speedy-socials.local");
+    activitypub.attachLog(log_ptr);
+    // W3.2: strict signature verification is the default. Set
+    // `AP_SOFT_ACCEPT=1` in the environment to flip back to the legacy
+    // best-effort path (staging only).
+    activitypub.configureStrictModeFromEnv();
 
     // Wire the RSA verify hook so ActivityPub HTTP signatures with
     // `alg=rsa-sha256` actually verify (Mastodon's default).

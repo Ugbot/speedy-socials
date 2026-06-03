@@ -32,19 +32,22 @@ const dag = @import("dag_cbor.zig");
 const mst = @import("mst.zig");
 const cid_mod = @import("cid.zig");
 const car = @import("car.zig");
+const syntax = @import("syntax.zig");
+const did_resolver = @import("did_resolver.zig");
 
 // W2.3: caps for the sync endpoints. listRecords pagination follows
-// the AT spec defaults (50/100). CAR responses are bounded by the
-// connection write buffer (16 KiB), so we cap the upload-blob route
-// + getRepo at a few KiB of CAR payload — adequate for test repos and
-// the early production scale this PDS targets. Full chunked streaming
-// requires server-side response_stream wiring (W2.1's territory).
+// the AT spec defaults (50/100). W3.2: CAR responses are now framed
+// straight into the per-connection 16 KiB write buffer as HTTP/1.1
+// chunked transfer encoding via `car.ChunkedWriter` — no intermediate
+// scratch, no double-copy. Block count is still capped by
+// `max_blocks_per_request` to keep one request from monopolising the
+// connection; the encoded body is capped by the response buffer
+// remaining after the chunked head.
 const list_records_default: u32 = 50;
 const list_records_max: u32 = 100;
 const list_repos_default: u32 = 50;
 const list_repos_max: u32 = 200;
 const max_blocks_per_request: u32 = 1024;
-const car_scratch_bytes: usize = 12 * 1024;
 
 // ── describeServer ────────────────────────────────────────────────
 
@@ -313,6 +316,63 @@ fn notImplemented(hc: *HandlerContext) anyerror!void {
     try xrpc.writeError(hc, .not_implemented, "NotImplemented", "endpoint not yet wired");
 }
 
+// W3.2 ── com.atproto.identity.resolveHandle ─────────────────────
+//
+// Process-wide resolver instance: the LRU cache + plc.directory hostname
+// live here so back-to-back resolutions share state. The HTTP fetcher
+// is the one wired by `did_resolver.setFetcher` (production: TLS-backed
+// HTTP client; tests: a stub).
+var resolve_handle_resolver: ?did_resolver.Resolver = null;
+
+fn handleResolverInstance() ?*did_resolver.Resolver {
+    const fetcher = did_resolver.getFetcher() orelse return null;
+    if (resolve_handle_resolver == null) {
+        resolve_handle_resolver = did_resolver.Resolver.init(fetcher);
+    } else {
+        // Keep the fetcher fresh — main.zig may rewire on hot reload.
+        resolve_handle_resolver.?.fetcher = fetcher;
+    }
+    return &resolve_handle_resolver.?;
+}
+
+/// Test-only: reset the cached resolver instance (used by route tests
+/// that stub the fetcher and want a clean LRU state).
+pub fn resetResolverForTests() void {
+    resolve_handle_resolver = null;
+}
+
+fn identityResolveHandle(hc: *HandlerContext) anyerror!void {
+    const q = hc.request.pathAndQuery().query;
+    const handle = xrpc.queryParam(q, "handle") orelse {
+        return xrpc.writeError(hc, .bad_request, "InvalidRequest", "missing handle");
+    };
+    if (handle.len == 0 or handle.len > syntax.max_handle_bytes) {
+        return xrpc.writeError(hc, .bad_request, "InvalidRequest", "malformed handle");
+    }
+    _ = syntax.Handle.parse(handle) catch {
+        return xrpc.writeError(hc, .bad_request, "InvalidRequest", "malformed handle");
+    };
+
+    const resolver = handleResolverInstance() orelse {
+        return xrpc.writeError(hc, .service_unavailable, "ServiceUnavailable", "resolver not wired");
+    };
+
+    var out: [did_resolver.max_did_bytes]u8 = undefined;
+    const did_str = resolver.resolveHandle(handle, &out) catch |err| switch (err) {
+        error.NotFound => return xrpc.writeError(hc, .not_found, "ResolutionFailed", "handle did not resolve"),
+        error.BufferTooSmall => return xrpc.writeError(hc, .internal, "InternalError", "did too large"),
+        else => return xrpc.writeError(hc, .internal, "InternalError", "resolver failure"),
+    };
+    if (did_str.len == 0) {
+        return xrpc.writeError(hc, .not_found, "ResolutionFailed", "empty DID");
+    }
+
+    var body_buf: [did_resolver.max_did_bytes + 32]u8 = undefined;
+    const body = std.fmt.bufPrint(&body_buf, "{{\"did\":\"{s}\"}}", .{did_str}) catch
+        return xrpc.writeError(hc, .internal, "InternalError", "fmt");
+    try xrpc.writeJsonBody(hc, .ok, body);
+}
+
 // W2.1: HTTP fallback for `subscribeRepos`. Real clients send an
 // Upgrade: websocket request which the server's upgrade router catches
 // before this handler ever runs. A plain GET ends up here and gets a
@@ -410,14 +470,11 @@ fn listRecords(hc: *HandlerContext) anyerror!void {
     try xrpc.writeJsonBody(hc, .ok, bw[0..pos]);
 }
 
-// W2.3 ── helpers for CAR responses ───────────────────────────────
-fn writeCarResponse(hc: *HandlerContext, payload: []const u8) !void {
-    try hc.response.startStatus(.ok);
-    try hc.response.header("Content-Type", "application/vnd.ipld.car");
-    try hc.response.headerFmt("Content-Length", "{d}", .{payload.len});
-    try hc.response.header("Connection", "close");
-    try hc.response.finishHeaders();
-    try hc.response.body(payload);
+// W3.2 ── helper to spin up a CAR chunked writer on the response.
+fn beginCarStream(hc: *HandlerContext, ring: *car.ChunkRingT) !car.ChunkedWriter {
+    var cw = car.ChunkedWriter.init(ring, hc.response);
+    try cw.writeHttpHead("application/vnd.ipld.car");
+    return cw;
 }
 
 fn lookupBlock(db: *c.sqlite3, cid_str: []const u8, out: []u8) !?usize {
@@ -478,21 +535,21 @@ fn syncGetRecord(hc: *HandlerContext) anyerror!void {
         return xrpc.writeError(hc, .internal, "InternalError", "bad record cid");
     };
 
-    var scratch: [car_scratch_bytes]u8 = undefined;
-    var pos: usize = 0;
+    var ring = car.ChunkRingT.init();
+    var cw = beginCarStream(hc, &ring) catch {
+        return xrpc.writeError(hc, .internal, "InternalError", "car head");
+    };
     const roots = [_]cid_mod.Cid{record_cid_bin};
-    pos += car.writeHeader(&roots, scratch[pos..]) catch
+    cw.writeHeaderChunk(&roots) catch {
         return xrpc.writeError(hc, .internal, "InternalError", "car header");
-    pos += car.writeBlock(record_cid_bin, row.value(), scratch[pos..]) catch
+    };
+    cw.writeBlock(record_cid_bin, row.value()) catch {
         return xrpc.writeError(hc, .internal, "InternalError", "car block");
+    };
 
-    // MST proof block (best-effort — include the current data root).
+    // MST proof blocks (best-effort — include MST blocks for the DID
+    // until the response buffer fills).
     if (meta.head_cid_len > 0) {
-        var data_cid_str: [cid_mod.string_cid_len]u8 = undefined;
-        const dcs_len = @min(meta.head_cid_len, data_cid_str.len);
-        @memcpy(data_cid_str[0..dcs_len], meta.head_cid_buf[0..dcs_len]);
-        // We can't infer data_cid directly from head; fall back to walking
-        // mst_blocks for this DID and include them all (bounded).
         const sql = "SELECT cid, data FROM atp_mst_blocks WHERE did = ? LIMIT ?";
         var stmt: ?*c.sqlite3_stmt = null;
         if (c.sqlite3_prepare_v2(db, sql, -1, &stmt, null) == c.SQLITE_OK) {
@@ -514,13 +571,14 @@ fn syncGetRecord(hc: *HandlerContext) anyerror!void {
                 @memcpy(cs[0..cid_len], cid_ptr[0..cid_len]);
                 const block_cid = cid_mod.parseString(cs[0..cid_len]) catch continue;
                 const dp: [*]const u8 = @ptrCast(data_ptr);
-                if (pos + cid_mod.raw_cid_len + data_len + 10 > scratch.len) break;
-                pos += car.writeBlock(block_cid, dp[0..data_len], scratch[pos..]) catch break;
+                cw.writeBlock(block_cid, dp[0..data_len]) catch break;
             }
         }
     }
 
-    try writeCarResponse(hc, scratch[0..pos]);
+    cw.finish() catch {
+        return xrpc.writeError(hc, .internal, "InternalError", "car end");
+    };
 }
 
 // W2.3 ── com.atproto.sync.getBlocks ──────────────────────────────
@@ -534,13 +592,16 @@ fn syncGetBlocks(hc: *HandlerContext) anyerror!void {
         return xrpc.writeError(hc, .bad_request, "InvalidRequest", "missing cids");
     };
 
-    var scratch: [car_scratch_bytes]u8 = undefined;
-    var pos: usize = 0;
+    var ring = car.ChunkRingT.init();
+    var cw = beginCarStream(hc, &ring) catch {
+        return xrpc.writeError(hc, .internal, "InternalError", "car head");
+    };
 
     // Header with no roots — getBlocks doesn't have one.
     const roots: [0]cid_mod.Cid = .{};
-    pos += car.writeHeader(&roots, scratch[pos..]) catch
+    cw.writeHeaderChunk(&roots) catch {
         return xrpc.writeError(hc, .internal, "InternalError", "car header");
+    };
 
     var it = std.mem.splitScalar(u8, cids_param, ',');
     var processed: u32 = 0;
@@ -552,14 +613,15 @@ fn syncGetBlocks(hc: *HandlerContext) anyerror!void {
         const got_opt = lookupBlock(db, cid_s, &block_buf) catch null;
         if (got_opt) |n| {
             if (n > 0) {
-                if (pos + cid_mod.raw_cid_len + n + 10 > scratch.len) break;
-                pos += car.writeBlock(cid_bin, block_buf[0..n], scratch[pos..]) catch break;
+                cw.writeBlock(cid_bin, block_buf[0..n]) catch break;
             }
         }
         processed += 1;
     }
 
-    try writeCarResponse(hc, scratch[0..pos]);
+    cw.finish() catch {
+        return xrpc.writeError(hc, .internal, "InternalError", "car end");
+    };
 }
 
 // W2.3 ── com.atproto.sync.listRepos ──────────────────────────────
@@ -652,8 +714,10 @@ fn syncGetRepo(hc: *HandlerContext) anyerror!void {
     };
     if (!found) return xrpc.writeError(hc, .not_found, "RepoNotFound", "no such repo");
 
-    var scratch: [car_scratch_bytes]u8 = undefined;
-    var pos: usize = 0;
+    var ring = car.ChunkRingT.init();
+    var cw = beginCarStream(hc, &ring) catch {
+        return xrpc.writeError(hc, .internal, "InternalError", "car head");
+    };
 
     // Roots = head commit CID.
     const head_cid_bin = if (meta.head_cid_len > 0)
@@ -662,12 +726,14 @@ fn syncGetRepo(hc: *HandlerContext) anyerror!void {
         null;
     if (head_cid_bin) |hb| {
         const roots = [_]cid_mod.Cid{hb};
-        pos += car.writeHeader(&roots, scratch[pos..]) catch
+        cw.writeHeaderChunk(&roots) catch {
             return xrpc.writeError(hc, .internal, "InternalError", "car header");
+        };
     } else {
         const empty: [0]cid_mod.Cid = .{};
-        pos += car.writeHeader(&empty, scratch[pos..]) catch
+        cw.writeHeaderChunk(&empty) catch {
             return xrpc.writeError(hc, .internal, "InternalError", "car header");
+        };
     }
 
     // Commit blocks (rev > since).
@@ -701,8 +767,7 @@ fn syncGetRepo(hc: *HandlerContext) anyerror!void {
                 const data_cid_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 1));
                 enc.writeText("data") catch break;
                 enc.writeText(data_cid_ptr[0..data_cid_len]) catch break;
-                if (pos + cid_mod.raw_cid_len + enc.written().len + 10 > scratch.len) break;
-                pos += car.writeBlock(block_cid, enc.written(), scratch[pos..]) catch break;
+                cw.writeBlock(block_cid, enc.written()) catch break;
             }
         }
     }
@@ -730,8 +795,7 @@ fn syncGetRepo(hc: *HandlerContext) anyerror!void {
                 @memcpy(cs[0..cid_len], cid_ptr[0..cid_len]);
                 const block_cid = cid_mod.parseString(cs[0..cid_len]) catch continue;
                 const dp: [*]const u8 = @ptrCast(data_ptr);
-                if (pos + cid_mod.raw_cid_len + data_len + 10 > scratch.len) break;
-                pos += car.writeBlock(block_cid, dp[0..data_len], scratch[pos..]) catch break;
+                cw.writeBlock(block_cid, dp[0..data_len]) catch break;
             }
         }
     }
@@ -759,13 +823,14 @@ fn syncGetRepo(hc: *HandlerContext) anyerror!void {
                 @memcpy(cs[0..cid_len], cid_ptr[0..cid_len]);
                 const block_cid = cid_mod.parseString(cs[0..cid_len]) catch continue;
                 const vp: [*]const u8 = @ptrCast(val_ptr);
-                if (pos + cid_mod.raw_cid_len + val_len + 10 > scratch.len) break;
-                pos += car.writeBlock(block_cid, vp[0..val_len], scratch[pos..]) catch break;
+                cw.writeBlock(block_cid, vp[0..val_len]) catch break;
             }
         }
     }
 
-    try writeCarResponse(hc, scratch[0..pos]);
+    cw.finish() catch {
+        return xrpc.writeError(hc, .internal, "InternalError", "car end");
+    };
 }
 
 // W2.3 ── com.atproto.repo.uploadBlob ─────────────────────────────
@@ -876,7 +941,9 @@ pub fn register(router: *Router, plugin_index: u16) !void {
     // upgrade router before this handler runs.
     try router.register(.get, "/xrpc/com.atproto.sync.subscribeRepos", subscribeReposHttp, plugin_index);
 
-    try router.register(.get, "/xrpc/com.atproto.identity.resolveHandle", notImplemented, plugin_index);
+    // W3.2: real handler using the W2.2 HTTP fetcher + the resolver's
+    // bounded LRU.
+    try router.register(.get, "/xrpc/com.atproto.identity.resolveHandle", identityResolveHandle, plugin_index);
 
     try router.register(.get, "/.well-known/atproto-did", wellKnownAtprotoDid, plugin_index);
 }
@@ -937,4 +1004,126 @@ test "routes: lookupBlock returns null on miss" {
 test "routes: listRecords + syncListRepos defaults" {
     try testing.expect(list_records_default == 50);
     try testing.expect(list_repos_default == 50);
+}
+
+// ── W3.2: identity.resolveHandle tests ────────────────────────────
+
+const request_mod = core.http.request;
+const router_mod = core.http.router;
+
+const ResolveStub = struct {
+    var response_body: [256]u8 = undefined;
+    var response_len: usize = 0;
+    var should_fail: bool = false;
+    var captured_url: [512]u8 = undefined;
+    var captured_url_len: usize = 0;
+    var calls: u32 = 0;
+
+    fn reset() void {
+        response_len = 0;
+        should_fail = false;
+        captured_url_len = 0;
+        calls = 0;
+    }
+    fn setResponse(body: []const u8) void {
+        const n = @min(body.len, response_body.len);
+        @memcpy(response_body[0..n], body[0..n]);
+        response_len = n;
+    }
+    fn fetch(url: []const u8, out: []u8) core.errors.AtpError!usize {
+        calls += 1;
+        const ul = @min(url.len, captured_url.len);
+        @memcpy(captured_url[0..ul], url[0..ul]);
+        captured_url_len = ul;
+        if (should_fail) return error.NotImplemented;
+        const n = @min(response_len, out.len);
+        @memcpy(out[0..n], response_body[0..n]);
+        return n;
+    }
+};
+
+fn invokeResolveHandle(query: []const u8, write_buf: []u8) !struct { status_line: []const u8, body: []const u8, full: []const u8 } {
+    var target_buf: [256]u8 = undefined;
+    const target = try std.fmt.bufPrint(&target_buf, "/xrpc/com.atproto.identity.resolveHandle?{s}", .{query});
+    const headers = [_]request_mod.Header{};
+    var req = request_mod.Request{
+        .method = .get,
+        .method_raw = "GET",
+        .target = target,
+        .version = "HTTP/1.1",
+        .headers = &headers,
+        .body = "",
+    };
+    var rng = core.rng.Rng.init(0);
+    var sc = core.clock.SimClock.init(0);
+    var ctx: core.plugin.Context = .{ .clock = sc.clock(), .rng = &rng };
+    var rb = core.http.response.Builder.init(write_buf);
+    var hc = router_mod.HandlerContext{
+        .plugin_ctx = &ctx,
+        .request = &req,
+        .response = &rb,
+        .params = .{},
+    };
+    try identityResolveHandle(&hc);
+    const full = rb.bytes();
+    const eol = std.mem.indexOf(u8, full, "\r\n") orelse return error.BadResponse;
+    const body_start = (std.mem.indexOf(u8, full, "\r\n\r\n") orelse return error.BadResponse) + 4;
+    return .{ .status_line = full[0..eol], .body = full[body_start..], .full = full };
+}
+
+test "resolveHandle: 200 OK with DID body via stub fetcher" {
+    resetResolverForTests();
+    ResolveStub.reset();
+    ResolveStub.setResponse("did:plc:alice123\n");
+    did_resolver.setFetcher(ResolveStub.fetch);
+    defer did_resolver.setFetcher(null);
+
+    var buf: [2048]u8 = undefined;
+    const r = try invokeResolveHandle("handle=alice.example.com", &buf);
+    try testing.expect(std.mem.startsWith(u8, r.status_line, "HTTP/1.1 200"));
+    try testing.expect(std.mem.indexOf(u8, r.body, "\"did\":\"did:plc:alice123\"") != null);
+    // The fetcher must have been hit on the .well-known/atproto-did path.
+    try testing.expect(std.mem.indexOf(u8, ResolveStub.captured_url[0..ResolveStub.captured_url_len], "/.well-known/atproto-did") != null);
+    try testing.expectEqual(@as(u32, 1), ResolveStub.calls);
+}
+
+test "resolveHandle: 400 on missing handle param" {
+    resetResolverForTests();
+    ResolveStub.reset();
+    did_resolver.setFetcher(ResolveStub.fetch);
+    defer did_resolver.setFetcher(null);
+    var buf: [1024]u8 = undefined;
+    const r = try invokeResolveHandle("other=x", &buf);
+    try testing.expect(std.mem.startsWith(u8, r.status_line, "HTTP/1.1 400"));
+    try testing.expectEqual(@as(u32, 0), ResolveStub.calls);
+}
+
+test "resolveHandle: 400 on syntactically invalid handle" {
+    resetResolverForTests();
+    ResolveStub.reset();
+    did_resolver.setFetcher(ResolveStub.fetch);
+    defer did_resolver.setFetcher(null);
+    var buf: [1024]u8 = undefined;
+    const r = try invokeResolveHandle("handle=-bad.example.com", &buf);
+    try testing.expect(std.mem.startsWith(u8, r.status_line, "HTTP/1.1 400"));
+    try testing.expectEqual(@as(u32, 0), ResolveStub.calls);
+}
+
+test "resolveHandle: 404 when upstream returns empty body" {
+    resetResolverForTests();
+    ResolveStub.reset();
+    ResolveStub.setResponse("");
+    did_resolver.setFetcher(ResolveStub.fetch);
+    defer did_resolver.setFetcher(null);
+    var buf: [1024]u8 = undefined;
+    const r = try invokeResolveHandle("handle=ghost.example.com", &buf);
+    try testing.expect(std.mem.startsWith(u8, r.status_line, "HTTP/1.1 404"));
+}
+
+test "resolveHandle: 503 when no fetcher wired" {
+    resetResolverForTests();
+    did_resolver.setFetcher(null);
+    var buf: [1024]u8 = undefined;
+    const r = try invokeResolveHandle("handle=alice.example.com", &buf);
+    try testing.expect(std.mem.startsWith(u8, r.status_line, "HTTP/1.1 503"));
 }
