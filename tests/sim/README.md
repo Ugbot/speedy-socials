@@ -1,17 +1,38 @@
 # Simulation scenarios
 
-These tests exercise speedy-socials end-to-end against deterministic time
-and a flaky simulated network, using the vendored TigerBeetle simulation
-primitives in `src/third_party/tigerbeetle/testing/`.
+These tests exercise speedy-socials end-to-end. Two flavours:
 
-Run all simulation scenarios:
+| step              | transport                                       | use case                                                   |
+| ----------------- | ----------------------------------------------- | ---------------------------------------------------------- |
+| `zig build sim`   | simulated network (TigerBeetle `PacketSimulator`) | deterministic replay, network chaos (loss, partition, drift) |
+| `zig build sim-real` | real loopback TCP/HTTP between two `core.server`s | proves the production W2.2 outbound wiring is bytes-correct |
 
-```
-zig build sim
-```
+The simulated scenarios use the vendored TigerBeetle primitives in
+`src/third_party/tigerbeetle/testing/`. The real-loopback scenario uses
+real kernel sockets on `127.0.0.1:0` (ephemeral ports) — no DNS, no TLS,
+no external services.
 
-Each scenario also runs as a regular `zig build test` block under
-`std.testing.allocator`, so it participates in the normal CI suite.
+Each scenario also runs as a regular `zig build test` block, so it
+participates in the normal CI suite.
+
+## Differences at a glance
+
+The `federate_with_mastodon` scenario tests *the worker's behaviour under
+network chaos*: it bypasses the HTTP client entirely, submitting packets
+straight into `PacketSimulator` and letting an out-of-band ACK mark
+outbox rows done. This is the right harness for fuzzing partition
+windows, loss rates, jitter, drift, and dead-letter triggers — none of
+which the kernel TCP stack lets you script reproducibly.
+
+The `federate_real_transport` scenario tests *the actual wire output*:
+it stands up two `core.server.Server`s on real ephemeral ports, drives
+one through the production `outbox_worker` + `http_delivery` +
+`http_client` path, and watches bytes arrive on the other end, complete
+with HTTP signature parsing + ed25519 key fetch round-trip. This is the
+right harness for confirming W2.2's outbound HTTP wiring is correct
+end-to-end and that the receiver's `sig.verify` reconstructs the same
+signing string the sender built. It does not exercise chaos — TCP either
+works or it doesn't.
 
 ## Scenarios
 
@@ -63,6 +84,69 @@ dropped_loss=5 dropped_partition=0 dropped_capacity=0 duplicates=0
 (105 attempts for 100 activities ≈ 5 retries triggered by 5% packet
 loss — the partition window is dodged because most first-attempt packets
 deliver in <100ms before t=10s.)
+
+### `federate_real_transport.zig` — full bytes-on-the-wire AP federation
+
+Companion to the synthetic scenario above. Stands up:
+
+* **Instance A** (sender): `:memory:` SQLite + AP schema, alice's
+  Ed25519 keypair provisioned in `ap_users` + `ap_actor_keys`. The
+  module-level `activitypub.state` singleton is bound to db_a +
+  http_client_a. The outbox worker is driven inline via direct
+  `tickOnce` calls (a background thread would race the inbox route on
+  the SQLite handle, which is opened with `SQLITE_OPEN_NOMUTEX`). A
+  `core.server.Server` on `127.0.0.1:0` serves a custom
+  `/users/alice` route that publishes alice's `publicKeyPem` —
+  registered as a test-local handler, *not* the full AP routes plugin,
+  so the accept thread never touches db_a.
+
+* **Instance B** (receiver): `:memory:` SQLite, bob's Ed25519 keypair,
+  its own `http_client`, and a `core.server.Server` on `127.0.0.1:0`
+  serving:
+  - `GET  /users/bob` — bob's actor doc (for the bonus Accept reply)
+  - `POST /users/bob/inbox` — parses the HTTP signature, fetches
+    alice's PEM from A via the round-trip GET on its own
+    `http_client`, calls `sig.verify` (the production verifier),
+    persists the activity into `ap_activities`, then sends an `Accept`
+    back to A's `/users/alice/inbox` over the same wire path.
+
+Transport: plain HTTP (no TLS). When the W3.1 inbound BoringSSL TLS
+backend lands the scenario can be re-targeted at `https://` by
+swapping the bind config.
+
+What's exercised:
+
+- The production `outbox_worker.tickOnce` polling + state machine
+- `http_delivery.deliver` — signing string + Date + Digest + draft-cavage
+  Signature header construction
+- `core.http_client.Client.sendSync` — plaintext outbound HTTP
+- `key_fetcher_http.httpFetch` — round-trip fetch + JSON unescape of
+  `publicKeyPem`
+- `sig.parseCavage` + `sig.verify` (production paths) on the receiver
+- The full kernel TCP socket lifecycle (`accept` → `read` → `write` → `close`)
+  on both ends
+
+Assertions:
+
+- Within 5 wall-clock seconds: B's `ap_activities` contains the
+  delivered Create(Note) row.
+- B's `sig.verify` was actually invoked (counter check — proves we
+  didn't accidentally fall through to a soft-accept code path).
+- A's `ap_federation_outbox` row for the delivery transitioned to
+  `state='done'`.
+- Bonus: B's reply-Accept POST got a `2xx` from A (two-way federation).
+
+Typical recorded output:
+
+```
+ok: real-loopback fed E2E  wall=87.2ms  verify_calls=1  outbox_done=1  two_way=YES
+```
+
+Note: server boot dominates total process wall-time on most machines
+(StaticPool allocation is ~384 MiB per instance for
+`limits.max_connections=4096` × 96 KiB per Connection slot). The 5-second
+deadline applies to the federation work *after* both servers are bound
+and threaded — booting takes a separate ~1-3 seconds depending on host.
 
 ### `firehose_subscriber.zig` — AT Protocol firehose under WS partition
 

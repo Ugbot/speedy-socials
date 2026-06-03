@@ -308,6 +308,25 @@ pub fn build(b: *std.Build) void {
     sim_step.dependOn(&run_sim_fed.step);
     sim_step.dependOn(&run_sim_fh.step);
 
+    // ── W3.3: real-transport federation E2E ─────────────────────────
+    // `zig build sim-real` runs a separate scenario that drives the same
+    // production outbox_worker over real loopback HTTP between two
+    // `core.server.Server` instances. Kept on a distinct step so the
+    // standard `sim` step stays hermetic (no kernel sockets); CI can
+    // schedule them in parallel.
+    const sim_real_exe = b.addExecutable(.{
+        .name = "sim-federate-real-transport",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/sim/federate_real_transport.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &sim_imports,
+        }),
+    });
+    const run_sim_real = b.addRunArtifact(sim_real_exe);
+    const sim_real_step = b.step("sim-real", "Run real-transport federation E2E scenario");
+    sim_real_step.dependOn(&run_sim_real.step);
+
     // The simulation scenarios also run as regular `zig build test` tests.
     const sim_fed_tests = b.addTest(.{
         .root_module = b.createModule(.{
@@ -325,8 +344,17 @@ pub fn build(b: *std.Build) void {
             .imports = &sim_imports,
         }),
     });
+    const sim_real_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/sim/federate_real_transport.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &sim_imports,
+        }),
+    });
     test_step.dependOn(&b.addRunArtifact(sim_fed_tests).step);
     test_step.dependOn(&b.addRunArtifact(sim_fh_tests).step);
+    test_step.dependOn(&b.addRunArtifact(sim_real_tests).step);
 
     // ── benchmarks (continued) ─────────────────────────────────────
     const echo_bench = b.addExecutable(.{
