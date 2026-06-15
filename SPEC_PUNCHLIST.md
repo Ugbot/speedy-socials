@@ -808,7 +808,7 @@ seams.
       both an AP `attachment` URL and an AT `BlobRef` (CIDv1)
       referencing the same on-disk bytes.
 
-- [~] **DUAL-4. Cross-protocol identity discovery.**
+- [x] **DUAL-4. Cross-protocol identity discovery.**
       **Effort: M.** *Depends: DUAL-1.*
       Acceptance: WebFinger for `acct:u@host` includes a link
       `rel="https://atproto.com/spec/at-uri"` to the user's

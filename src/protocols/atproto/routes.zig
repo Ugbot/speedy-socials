@@ -380,6 +380,48 @@ fn wellKnownDidJson(hc: *HandlerContext) anyerror!void {
     try hc.response.body(body);
 }
 
+// DUAL-4 (reverse): per-account DID document at `/users/:u/did.json`.
+// Its `alsoKnownAs` lists BOTH the at:// handle and the AP actor IRI, so
+// an AT-side resolver discovering the account crosses to its AP identity
+// (the mirror of the WebFinger at-uri link + AP actor `alsoKnownAs`).
+fn renderAccountDidDocument(handle: []const u8, out: []u8) ![]const u8 {
+    const st = State.get();
+    var didkey_buf: [128]u8 = undefined;
+    const didkey = try keypair.formatDidKeyEd25519(st.jwt_key.public_key, &didkey_buf);
+    const prefix = "did:key:";
+    if (!std.mem.startsWith(u8, didkey, prefix)) return error.MalformedDidKey;
+    const multibase = didkey[prefix.len..];
+    return std.fmt.bufPrint(out,
+        "{{" ++
+            "\"@context\":[\"https://www.w3.org/ns/did/v1\",\"https://w3id.org/security/multikey/v1\"]," ++
+            "\"id\":\"did:web:{s}\"," ++
+            "\"alsoKnownAs\":[\"at://{s}\",\"https://{s}/users/{s}\"]," ++
+            "\"verificationMethod\":[{{" ++
+                "\"id\":\"did:web:{s}#atproto\",\"type\":\"Multikey\"," ++
+                "\"controller\":\"did:web:{s}\",\"publicKeyMultibase\":\"{s}\"" ++
+            "}}]," ++
+            "\"service\":[{{\"id\":\"#atproto_pds\",\"type\":\"AtprotoPersonalDataServer\"," ++
+                "\"serviceEndpoint\":\"https://{s}\"}}]" ++
+        "}}",
+        .{ handle, handle, st.host, handle, handle, handle, multibase, st.host },
+    );
+}
+
+fn accountDidJson(hc: *HandlerContext) anyerror!void {
+    const handle = hc.params.get("u") orelse
+        return xrpc.writeError(hc, .bad_request, "InvalidRequest", "missing user");
+    var body_buf: [2048]u8 = undefined;
+    const body = renderAccountDidDocument(handle, &body_buf) catch {
+        return xrpc.writeError(hc, .internal, "InternalError", "did doc render");
+    };
+    try hc.response.startStatus(.ok);
+    try hc.response.header("Content-Type", "application/did+json");
+    try hc.response.headerFmt("Content-Length", "{d}", .{body.len});
+    try hc.response.header("Connection", "close");
+    try hc.response.finishHeaders();
+    try hc.response.body(body);
+}
+
 // AT-14: `com.atproto.identity.resolveDid`. If the requested DID is
 // the PDS's own did:web identity, return the inlined DID document. For
 // any other DID, defer to the module-level resolver (HTTP fetch
@@ -1623,6 +1665,7 @@ pub fn register(router: *Router, plugin_index: u16) !void {
 
     try router.register(.get, "/.well-known/atproto-did", wellKnownAtprotoDid, plugin_index);
     try router.register(.get, "/.well-known/did.json", wellKnownDidJson, plugin_index); // AT-13
+    try router.register(.get, "/users/:u/did.json", accountDidJson, plugin_index); // DUAL-4 reverse
 
     // AT-8 / AT-9 / AT-10 / AT-11 (account lifecycle + email + app pw + invites).
     try account_routes.register(router, plugin_index);
@@ -1894,4 +1937,15 @@ test "AT-23: importRepo decodes a CAR and persists blocks" {
     _ = c.sqlite3_bind_text(sel, 1, did.ptr, @intCast(did.len), c.sqliteTransientAsDestructor());
     try testing.expect(c.sqlite3_step(sel.?) == c.SQLITE_ROW);
     try testing.expectEqual(@as(i64, 2), c.sqlite3_column_int64(sel, 0));
+}
+
+test "DUAL-4 reverse: per-account DID doc lists at:// + AP actor in alsoKnownAs" {
+    var rng = core.rng.Rng.init(0x7);
+    var sc = core.clock.SimClock.init(0);
+    State.init(sc.clock(), &rng, "pds.example");
+    var buf: [2048]u8 = undefined;
+    const doc = try renderAccountDidDocument("alice.example", &buf);
+    try testing.expect(std.mem.indexOf(u8, doc, "\"at://alice.example\"") != null);
+    try testing.expect(std.mem.indexOf(u8, doc, "https://pds.example/users/alice.example") != null);
+    try testing.expect(std.mem.indexOf(u8, doc, "\"Multikey\"") != null);
 }
