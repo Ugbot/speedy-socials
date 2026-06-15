@@ -521,7 +521,7 @@ seams.
       Multikey entries; signature verification tries each key in
       turn. Today one key per actor.
 
-- [ ] **AP-16. Question / Poll objects.**
+- [x] **AP-16. Question / Poll objects.**
       **Effort: S.** *Touches: `activity.zig` (parse), inbox
       state machine, Mastodon API serialiser.*
       Acceptance: parser recognises Question; vote `Note` with

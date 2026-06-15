@@ -112,6 +112,9 @@ pub const SideEffect = union(enum) {
     record_move: struct { old_actor: []const u8, new_actor: []const u8 },
     /// AP-17: tag from `tag[]` — a Mention / Hashtag / Emoji entry.
     record_tag: struct { activity_iri: []const u8, kind: []const u8, name: []const u8, href: []const u8 },
+    /// AP-16: a poll vote — a Create{Note} with `name` (option) +
+    /// `inReplyTo` (the Question IRI).
+    record_poll_vote: struct { activity_iri: []const u8, question_iri: []const u8, actor: []const u8, option_name: []const u8 },
     /// Returned only when the state machine wants to drop the activity
     /// with no other effect (e.g., duplicate Like). Caller logs.
     drop_silently: struct { reason: []const u8 },
@@ -244,6 +247,17 @@ fn runCreate(env: *const Envelope, eff: *SideEffectBuffer) ApError!void {
                     .kind = env.activity.object_type,
                     .actor = env.activity.actor,
                 } });
+                // AP-16: a Note carrying both `name` (option) and
+                // `inReplyTo` (the Question IRI) is a poll vote — record
+                // it keyed to the question it replies to.
+                if (env.activity.object_name.len > 0 and env.activity.in_reply_to.len > 0) {
+                    try eff.push(.{ .record_poll_vote = .{
+                        .activity_iri = env.activity.id,
+                        .question_iri = env.activity.in_reply_to,
+                        .actor = env.activity.actor,
+                        .option_name = env.activity.object_name,
+                    } });
+                }
                 s = .persist_activity;
             },
             .persist_activity => {
@@ -739,6 +753,29 @@ test "Create emits store_object + store_activity + delivery + counter" {
         .enqueue_delivery => |d| try std.testing.expectEqualStrings("https://w3.org/Public", d.target),
         else => return error.TestExpectedDelivery,
     }
+}
+
+test "AP-16: Create{Note} with name + inReplyTo records a poll vote" {
+    var rng = Rng.init(2);
+    var sc = SimClock.init(0);
+    const act = try activity.parse(
+        \\{"id":"https://a/x/2","type":"Create","actor":"https://a/voter",
+        \\ "object":{"id":"https://a/n/2","type":"Note","name":"Option B","inReplyTo":"https://q/poll/1"}}
+    );
+    var env = buildEnvelope(act, false, sc.clock(), &rng);
+    var eff: SideEffectBuffer = .{};
+    try dispatch(&env, &eff);
+    var found = false;
+    for (eff.slice()) |e| switch (e) {
+        .record_poll_vote => |v| {
+            try std.testing.expectEqualStrings("https://q/poll/1", v.question_iri);
+            try std.testing.expectEqualStrings("Option B", v.option_name);
+            try std.testing.expectEqualStrings("https://a/voter", v.actor);
+            found = true;
+        },
+        else => {},
+    };
+    try std.testing.expect(found);
 }
 
 test "Update with object_id emits update_object" {

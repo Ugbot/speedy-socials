@@ -111,6 +111,10 @@ pub const Activity = struct {
     cc: AddressingList = .{},
     /// AP-18: `inReplyTo` URI captured from the inline object.
     in_reply_to: []const u8 = &.{},
+    /// AP-16: the inner object's `name`. For a poll vote this is the
+    /// chosen option's text (a vote is a Note with `name` + `inReplyTo`
+    /// = the Question's IRI). Empty when absent.
+    object_name: []const u8 = &.{},
     /// AP-17: top-level tag entries captured for indexing. We pull
     /// up to `max_tags` mentions / hashtags from the `tag[]` array.
     tags: TagList = .{},
@@ -519,6 +523,14 @@ fn parseInlineObject(sc: *Scanner, out: *Activity) ApError!void {
             sc.skipWhitespace();
             if (sc.peek() == '"') {
                 out.in_reply_to = try parseString(sc);
+            } else {
+                try skipValue(sc, 2);
+            }
+        } else if (std.mem.eql(u8, key, "name")) {
+            // AP-16: a poll vote carries the chosen option in `name`.
+            sc.skipWhitespace();
+            if (sc.peek() == '"') {
+                out.object_name = try parseString(sc);
             } else {
                 try skipValue(sc, 2);
             }

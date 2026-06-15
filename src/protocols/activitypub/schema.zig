@@ -276,9 +276,29 @@ pub const actor_type_migration: Migration = .{
     .down = null,
 };
 
+// AP-16: poll votes — a Create{Note} with `name` (the option) +
+// `inReplyTo` (the Question IRI) is recorded as a vote.
+pub const poll_votes_migration: Migration = .{
+    .id = 1017,
+    .name = "activitypub:poll-votes",
+    .up =
+    \\CREATE TABLE IF NOT EXISTS ap_poll_votes (
+    \\    activity_iri TEXT NOT NULL,
+    \\    question_iri TEXT NOT NULL,
+    \\    actor        TEXT NOT NULL,
+    \\    option_name  TEXT NOT NULL,
+    \\    created_at   INTEGER NOT NULL,
+    \\    PRIMARY KEY (question_iri, actor, option_name)
+    \\) STRICT;
+    \\CREATE INDEX IF NOT EXISTS ap_poll_votes_q_idx ON ap_poll_votes (question_iri);
+    ,
+    .down = "DROP TABLE ap_poll_votes;",
+};
+
 pub const all_migrations = [_]Migration{
     users_migration,
     actor_type_migration,
+    poll_votes_migration,
     actor_keys_migration,
     remote_actors_migration,
     federation_outbox_migration,

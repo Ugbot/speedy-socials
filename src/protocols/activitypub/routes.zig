@@ -609,9 +609,26 @@ fn drainSideEffects(db: *c.sqlite3, st: *state_mod.State, raw_body: []const u8, 
             .record_tag => |t| {
                 _ = recordTag(db, t.activity_iri, t.kind, t.name, t.href) catch {};
             },
+            .record_poll_vote => |v| {
+                _ = recordPollVote(db, st.clock, v.activity_iri, v.question_iri, v.actor, v.option_name) catch {};
+            },
             else => {},
         }
     }
+}
+
+// AP-16: record a poll vote (idempotent on (question, actor, option)).
+fn recordPollVote(db: *c.sqlite3, clock: core.clock.Clock, activity_iri: []const u8, question_iri: []const u8, actor: []const u8, option_name: []const u8) !void {
+    var stmt: ?*c.sqlite3_stmt = null;
+    const sql = "INSERT OR IGNORE INTO ap_poll_votes (activity_iri, question_iri, actor, option_name, created_at) VALUES (?,?,?,?,?)";
+    if (c.sqlite3_prepare_v2(db, sql, -1, &stmt, null) != c.SQLITE_OK) return;
+    defer _ = c.sqlite3_finalize(stmt);
+    _ = c.sqlite3_bind_text(stmt, 1, activity_iri.ptr, @intCast(activity_iri.len), c.sqliteTransientAsDestructor());
+    _ = c.sqlite3_bind_text(stmt, 2, question_iri.ptr, @intCast(question_iri.len), c.sqliteTransientAsDestructor());
+    _ = c.sqlite3_bind_text(stmt, 3, actor.ptr, @intCast(actor.len), c.sqliteTransientAsDestructor());
+    _ = c.sqlite3_bind_text(stmt, 4, option_name.ptr, @intCast(option_name.len), c.sqliteTransientAsDestructor());
+    _ = c.sqlite3_bind_int64(stmt, 5, clock.wallUnix());
+    _ = c.sqlite3_step(stmt.?);
 }
 
 // AP-25: check whether any local actor has blocked `actor`. Used by
