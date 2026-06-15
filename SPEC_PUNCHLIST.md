@@ -738,7 +738,7 @@ seams.
       Acceptance: POST a CAR file; persist all blocks + records;
       replay missing commits. Mostly useful for migrations.
 
-- [ ] **AT-24. Blob GC sweeper.**
+- [x] **AT-24. Blob GC sweeper.**
       **Effort: XS.** *Depends: INFRA-3.*
       Acceptance: `atp_blobs.ref_count == 0` rows older than 24 h
       are deleted from disk + db. Surface as a periodic worker.

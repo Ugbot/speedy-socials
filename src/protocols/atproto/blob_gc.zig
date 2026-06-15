@@ -98,6 +98,48 @@ pub fn sweepOnce(db: *c.sqlite3, now_unix: i64, min_age_seconds: i64) SweepResul
     return result;
 }
 
+fn sleepSeconds(s: i64) void {
+    var req: std.c.timespec = .{ .sec = @intCast(s), .nsec = 0 };
+    _ = std.c.nanosleep(&req, &req);
+}
+
+/// AT-24: periodic GC worker. Owns a dedicated thread that runs
+/// `sweepOnce` every `interval_seconds`. The caller owns the `*sqlite3`
+/// handle (sqlite is opened NOMUTEX, so this must be a connection NOT
+/// shared with other threads). Started/stopped from the composition root.
+pub const Worker = struct {
+    db: *c.sqlite3,
+    clock: core.clock.Clock,
+    interval_seconds: i64,
+    min_age_seconds: i64 = default_min_age_seconds,
+    stop_flag: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    thread: ?std.Thread = null,
+
+    pub fn start(self: *Worker) !void {
+        self.thread = try std.Thread.spawn(.{}, run, .{self});
+    }
+
+    fn run(self: *Worker) void {
+        while (!self.stop_flag.load(.acquire)) {
+            // Sleep in 1s slices so stop() is responsive.
+            var slept: i64 = 0;
+            while (slept < self.interval_seconds and !self.stop_flag.load(.acquire)) : (slept += 1) {
+                sleepSeconds(1);
+            }
+            if (self.stop_flag.load(.acquire)) break;
+            _ = sweepOnce(self.db, self.clock.wallUnix(), self.min_age_seconds);
+        }
+    }
+
+    pub fn stop(self: *Worker) void {
+        self.stop_flag.store(true, .release);
+        if (self.thread) |t| {
+            t.join();
+            self.thread = null;
+        }
+    }
+};
+
 // ──────────────────────────────────────────────────────────────────────
 // Tests
 // ──────────────────────────────────────────────────────────────────────

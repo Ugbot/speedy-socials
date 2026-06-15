@@ -561,6 +561,31 @@ pub fn main() !void {
     atproto.attachDb(db);
     atproto.attachWorkers(&atp_workers);
 
+    // AT-24: optional periodic blob-GC worker. Off unless
+    // BLOB_GC_INTERVAL_SECS is set. Uses its own sqlite handle (NOMUTEX
+    // → one handle per long-lived thread), same pattern as the firehose
+    // consumer above.
+    var blob_gc_worker: ?*atproto.blob_gc.Worker = null;
+    if (std.c.getenv("BLOB_GC_INTERVAL_SECS")) |envp| {
+        const s = std.mem.sliceTo(envp, 0);
+        if (std.fmt.parseInt(i64, s, 10)) |interval| {
+            if (interval > 0) {
+                if (core.storage.sqlite.openWriter(db_path)) |gdb| {
+                    const w = allocator.create(atproto.blob_gc.Worker) catch unreachable;
+                    w.* = .{ .db = gdb, .clock = real_clock.clock(), .interval_seconds = interval };
+                    w.start() catch {};
+                    blob_gc_worker = w;
+                    log_ptr.info("boot", "blob GC worker started");
+                } else |_| {}
+            }
+        } else |_| {}
+    }
+    defer if (blob_gc_worker) |w| {
+        w.stop();
+        core.storage.sqlite.closeDb(w.db);
+        allocator.destroy(w);
+    };
+
     // DUAL-1: unified signup. When the AT plugin's `createAccount` mints
     // a local account it also provisions the matching AP actor (user row
     // + Ed25519 key) via this hook, and binds the two in the

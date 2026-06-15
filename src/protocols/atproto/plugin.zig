@@ -37,6 +37,7 @@ pub const firehose = @import("firehose.zig");
 pub const routes = @import("routes.zig");
 pub const xrpc = @import("xrpc.zig");
 pub const did_resolver = @import("did_resolver.zig");
+pub const blob_gc = @import("blob_gc.zig");
 pub const oauth_dpop = @import("oauth_dpop.zig");
 pub const car = @import("car.zig");
 pub const sync_firehose = @import("sync_firehose.zig");
