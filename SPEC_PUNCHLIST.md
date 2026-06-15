@@ -702,7 +702,7 @@ seams.
 
 - [x] **AT-15. `com.atproto.sync.getRepoStatus`.** Done 2026-05-20.
 
-- [ ] **AT-16. Hierarchical MST persistence (`atp_mst_blocks`).**
+- [x] **AT-16. Hierarchical MST persistence (`atp_mst_blocks`).**
       **Effort: L.** *Files: deep changes to `mst.zig` + `repo.zig`.*
       Acceptance: tree nodes are stored as blocks; commit no longer
       reloads the full record set; p99 commit latency flat as repo

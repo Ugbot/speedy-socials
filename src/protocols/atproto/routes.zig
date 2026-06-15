@@ -218,13 +218,16 @@ fn createRecord(hc: *HandlerContext) anyerror!void {
         return xrpc.writeError(hc, .internal, "InternalError", "ensureRepo");
     };
 
-    var tree: mst.Tree(mst.max_keys) = .{};
-    repo_mod.loadTree(db, repo_did, &tree) catch {};
+    // AT-16: acquire the MST tree (cached + reused when AT_MST_CACHE is
+    // on; freshly loaded into the stack tree otherwise).
+    var stack_tree: mst.Tree(mst.max_keys) = .{};
+    const tree = repo_mod.acquireTree(db, repo_did, &stack_tree);
+    defer repo_mod.releaseTree();
 
     const ops = [_]repo_mod.Operation{
         .{ .collection = collection, .rkey = "", .value_cbor = record_cbor },
     };
-    const commit = repo_mod.commit(db, repo_did, st.jwt_key, rev, &tree, &ops, st.clock.wallUnix(), rkey) catch {
+    const commit = repo_mod.commit(db, repo_did, st.jwt_key, rev, tree, &ops, st.clock.wallUnix(), rkey) catch {
         return xrpc.writeError(hc, .internal, "InternalError", "commit");
     };
 
@@ -283,6 +286,9 @@ fn deleteRecord(hc: *HandlerContext) anyerror!void {
     _ = repo_mod.deleteRecord(db, repo_did, collection, rkey) catch {
         return xrpc.writeError(hc, .internal, "InternalError", "delete");
     };
+    // AT-16: deleteRecord mutates atp_records out-of-band, so drop any
+    // cached MST tree for this repo to avoid staleness on the next commit.
+    repo_mod.invalidateTree(repo_did);
     try xrpc.writeJsonBody(hc, .ok, "{}");
 }
 
@@ -1267,10 +1273,12 @@ fn applyWrites(hc: *HandlerContext) anyerror!void {
     }
     if (n_ops == 0) return xrpc.writeError(hc, .bad_request, "InvalidRequest", "empty writes");
 
-    var tree: mst.Tree(mst.max_keys) = .{};
-    repo_mod.loadTree(db, repo_did, &tree) catch {};
+    // AT-16: cached tree acquisition (see createRecord).
+    var stack_tree: mst.Tree(mst.max_keys) = .{};
+    const tree = repo_mod.acquireTree(db, repo_did, &stack_tree);
+    defer repo_mod.releaseTree();
 
-    _ = repo_mod.commit(db, repo_did, st.jwt_key, rev, &tree, ops_buf[0..n_ops], st.clock.wallUnix(), null) catch {
+    _ = repo_mod.commit(db, repo_did, st.jwt_key, rev, tree, ops_buf[0..n_ops], st.clock.wallUnix(), null) catch {
         return xrpc.writeError(hc, .internal, "InternalError", "commit");
     };
 

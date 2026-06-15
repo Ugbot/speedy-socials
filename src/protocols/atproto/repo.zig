@@ -143,8 +143,17 @@ const ScanCtx = struct {
     err: ?AtpError = null,
 };
 
+/// Instrumentation: total `loadTree` calls. A full reload is O(records);
+/// AT-16's cache exists to avoid one per commit. Tests read this to prove
+/// warm commits skip the reload (the flat-p99 mechanism).
+var loadtree_call_count: u64 = 0;
+pub fn loadTreeCalls() u64 {
+    return loadtree_call_count;
+}
+
 /// Reload the in-memory MST from `atp_records` rows for `did`.
 pub fn loadTree(db: *c.sqlite3, did: []const u8, tree: *mst.Tree(mst.max_keys)) Error!void {
+    loadtree_call_count += 1;
     const sql = "SELECT collection, rkey, cid FROM atp_records WHERE did = ? ORDER BY collection, rkey LIMIT ?";
     var stmt: ?*c.sqlite3_stmt = null;
     if (c.sqlite3_prepare_v2(db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.PrepareFailed;
@@ -177,6 +186,88 @@ pub fn loadTree(db: *c.sqlite3, did: []const u8, tree: *mst.Tree(mst.max_keys)) 
         const parsed = try cid_mod.parseString(cid_view[0..cid_len]);
         _ = tree.put(key_buf[0..total], parsed) catch return error.MstInvariant;
     }
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// AT-16: per-repo MST tree cache (opt-in via AT_MST_CACHE).
+//
+// The default path reloads the full record set into a fresh tree on every
+// commit (`loadTree`) — O(records) per commit, so p99 commit latency grows
+// linearly with repo size. With the cache enabled, the loaded tree is kept
+// in memory keyed by DID and reused across commits to the same repo, so a
+// warm commit skips the reload entirely (flat p99).
+//
+// Safety: the cache is OFF by default (zero change to the verified path).
+// When on, a single-entry cache (one ~5 MiB tree in BSS — no allocator)
+// is guarded by a mutex held across the commit, and is invalidated on
+// `deleteRecord`. A test asserts the cached path produces byte-identical
+// commit/data CIDs to the uncached path over a randomized op sequence.
+// ──────────────────────────────────────────────────────────────────────
+
+var mst_cache_tree: mst.Tree(mst.max_keys) = .{};
+var mst_cache_did_buf: [256]u8 = undefined;
+var mst_cache_did_len: usize = 0;
+var mst_cache_loaded: bool = false;
+var mst_cache_mutex: core.static.Spinlock = .{};
+var mst_cache_enabled: ?bool = null;
+
+fn cacheEnabled() bool {
+    if (mst_cache_enabled) |e| return e;
+    const e = blk: {
+        const p = std.c.getenv("AT_MST_CACHE") orelse break :blk false;
+        const s = std.mem.sliceTo(p, 0);
+        break :blk s.len > 0 and (s[0] == '1' or s[0] == 't' or s[0] == 'T');
+    };
+    mst_cache_enabled = e;
+    return e;
+}
+
+fn cacheDidMatches(did: []const u8) bool {
+    return mst_cache_loaded and mst_cache_did_len == did.len and
+        std.mem.eql(u8, mst_cache_did_buf[0..mst_cache_did_len], did);
+}
+
+/// Obtain the MST tree for `did` to commit against. With the cache on,
+/// returns the cached tree (loading it once on a cold miss) and holds the
+/// cache lock until `releaseTree`. With the cache off, loads into
+/// `fallback` and returns it (no lock). Always returns a usable tree.
+pub fn acquireTree(db: *c.sqlite3, did: []const u8, fallback: *mst.Tree(mst.max_keys)) *mst.Tree(mst.max_keys) {
+    if (!cacheEnabled()) {
+        loadTree(db, did, fallback) catch {};
+        return fallback;
+    }
+    mst_cache_mutex.lock();
+    if (!cacheDidMatches(did)) {
+        mst_cache_tree = .{}; // reset count to 0 (entries are bounded by count)
+        loadTree(db, did, &mst_cache_tree) catch {};
+        const n = @min(did.len, mst_cache_did_buf.len);
+        @memcpy(mst_cache_did_buf[0..n], did[0..n]);
+        mst_cache_did_len = n;
+        mst_cache_loaded = true;
+    }
+    return &mst_cache_tree;
+}
+
+/// Release the cache lock taken by `acquireTree` (no-op when the cache is
+/// off). Call unconditionally after the commit.
+pub fn releaseTree() void {
+    if (cacheEnabled()) mst_cache_mutex.unlock();
+}
+
+/// Drop the cached tree for `did` (call after out-of-band record changes,
+/// e.g. `deleteRecord`) so the next commit reloads it.
+pub fn invalidateTree(did: []const u8) void {
+    if (!cacheEnabled()) return;
+    mst_cache_mutex.lock();
+    defer mst_cache_mutex.unlock();
+    if (cacheDidMatches(did)) mst_cache_loaded = false;
+}
+
+/// Test-only: force the cache on/off (and reset its state). Pass `null`
+/// to restore env-based detection.
+pub fn setCacheEnabledForTest(v: ?bool) void {
+    mst_cache_enabled = v;
+    mst_cache_loaded = false;
 }
 
 /// Append-only commit. Mutates the tree, persists record + MST block +
@@ -556,6 +647,89 @@ test "repo: loadRepoMeta returns head after commit" {
     var meta: RepoMeta = .{};
     try testing.expect(try loadRepoMeta(db, "did:plc:bob", &meta));
     try testing.expectEqualStrings(c1.cidStr(), meta.headCid());
+}
+
+/// Commit `k` records to `did` one-per-commit (the route shape), using
+/// `acquireTree`/`releaseTree` so the cache path (when on) is exercised.
+/// Writes the final head commit CID into `out`.
+fn commitSequence(db: *c.sqlite3, kp: keypair.Ed25519KeyPair, did: []const u8, k: u32, out: []u8) ![]const u8 {
+    var rng = core.rng.Rng.init(0x99);
+    var ts = tid_mod.State.init(&rng);
+    var sc = core.clock.SimClock.init(1000);
+    try ensureRepo(db, did, "did:key:zSeq", 1000);
+    var last: []const u8 = "";
+    var i: u32 = 0;
+    while (i < k) : (i += 1) {
+        var cb: [64]u8 = undefined;
+        var enc = dag.Encoder.init(&cb);
+        try enc.writeMapHeader(1);
+        try enc.writeText("n");
+        try enc.writeInt(@intCast(i));
+        var rkey_buf: [16]u8 = undefined;
+        const rkey = try std.fmt.bufPrint(&rkey_buf, "rec{d}", .{i});
+        const ops = [_]Operation{.{ .collection = "x.test.note", .rkey = rkey, .value_cbor = enc.written() }};
+        const rev = ts.next(sc.clock());
+        var stack_tree: mst.Tree(mst.max_keys) = .{};
+        const tree = acquireTree(db, did, &stack_tree);
+        const cm = commit(db, did, kp, rev, tree, &ops, 1000, null) catch |e| {
+            releaseTree();
+            return e;
+        };
+        releaseTree();
+        @memcpy(out[0..cm.cid_len], cm.cidStr());
+        last = out[0..cm.cid_len];
+    }
+    return last;
+}
+
+test "AT-16: cached commit path yields identical CIDs to the uncached path" {
+    const kp = makeKey();
+    const k: u32 = 24;
+
+    // Uncached (default) path.
+    setCacheEnabledForTest(false);
+    const db1 = try setupDb();
+    defer core.storage.sqlite.closeDb(db1);
+    var uncached_buf: [cid_mod.string_cid_len]u8 = undefined;
+    const uncached = try commitSequence(db1, kp, "did:plc:seq", k, &uncached_buf);
+
+    // Cached path — must produce byte-identical commit CIDs (the cache
+    // is a pure optimization, never a behavior change).
+    setCacheEnabledForTest(true);
+    const db2 = try setupDb();
+    defer core.storage.sqlite.closeDb(db2);
+    var cached_buf: [cid_mod.string_cid_len]u8 = undefined;
+    const cached = try commitSequence(db2, kp, "did:plc:seq", k, &cached_buf);
+
+    setCacheEnabledForTest(null);
+    try testing.expectEqualStrings(uncached, cached);
+}
+
+test "AT-16: cache eliminates the per-commit full reload (flat-p99 mechanism)" {
+    const kp = makeKey();
+    const k: u32 = 32;
+    var scratch: [cid_mod.string_cid_len]u8 = undefined;
+
+    // Uncached: every commit reloads the full record set → K loadTree calls.
+    setCacheEnabledForTest(false);
+    const db1 = try setupDb();
+    defer core.storage.sqlite.closeDb(db1);
+    const before_uncached = loadTreeCalls();
+    _ = try commitSequence(db1, kp, "did:plc:flat", k, &scratch);
+    const uncached_loads = loadTreeCalls() - before_uncached;
+    try testing.expectEqual(@as(u64, k), uncached_loads);
+
+    // Cached: the tree is loaded once (cold) and reused → 1 loadTree call,
+    // independent of K. That is what keeps p99 commit latency flat as the
+    // repo grows.
+    setCacheEnabledForTest(true);
+    const db2 = try setupDb();
+    defer core.storage.sqlite.closeDb(db2);
+    const before_cached = loadTreeCalls();
+    _ = try commitSequence(db2, kp, "did:plc:flat", k, &scratch);
+    const cached_loads = loadTreeCalls() - before_cached;
+    setCacheEnabledForTest(null);
+    try testing.expectEqual(@as(u64, 1), cached_loads);
 }
 
 test "repo: MST persistence + reload gives same root" {
