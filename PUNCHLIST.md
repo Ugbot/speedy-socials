@@ -15,7 +15,26 @@ Raw protocol-spec conformance gaps live in
 DUAL-1..DUAL-5), with the underlying audit in
 [`PROTOCOL_AUDIT.md`](PROTOCOL_AUDIT.md).
 
-_Last refreshed: 2026-05-20 (post-operational-spec batch)._
+_Last refreshed: 2026-06-15 (code-verified reconciliation)._
+
+## 2026-06-15 reconciliation note
+
+The single source of truth for spec-conformance status (AP/AT/DUAL)
+is the **authoritative table at the top of
+[`SPEC_PUNCHLIST.md`](SPEC_PUNCHLIST.md)**. Measured baseline:
+**811 unit tests pass**, **5 simulation scenarios pass** (`zig build
+sim` — earlier "11/11 sims" claims were inaccurate; there are 5
+scenario files).
+
+This file's operational A–L checkboxes were spot-checked and are
+broadly accurate, with these clarifications:
+- **C1 WSS** — `core.ws.stream.TlsStream` is fully implemented but is
+  **not yet instantiated** in the WS upgrade dispatch, so WSS app-data
+  frames are still broken end-to-end. The remaining work is the
+  composition-root/server wiring (Phase 2 of the plan).
+- The closing claim below ("every Critical/High/Medium item … is
+  closed or has a documented upstream block") is **overstated** — see
+  the SPEC_PUNCHLIST reconciliation for the partial/stub items.
 
 ## 2026-05-20 operational-spec batch
 

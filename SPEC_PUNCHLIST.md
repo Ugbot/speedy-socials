@@ -10,15 +10,73 @@ Companion docs:
   bridge correctness).
 - [`docs/design/translation-matrix.md`](docs/design/translation-matrix.md) — per-activity bridge coverage.
 
-_Last refreshed: 2026-05-20 (whole-system batch — `/goal complete the whole system`)._
+_Last refreshed: 2026-06-15 (code-verified reconciliation — see below)._
 
-## 2026-05-20 whole-system batch
+## 2026-06-15 code-verified reconciliation (AUTHORITATIVE)
 
-This batch closed effectively every AP / AT / INFRA / DUAL ticket
-with a real implementation (no stubs). 787/787 tests + 11/11 sims
-pass. Where a ticket required a multi-day refactor that didn't fit
-the session honestly, it was deferred with the reason inline — see
-**Deferred** below.
+> **This section is the source of truth.** The per-ticket checkboxes
+> below have been re-set to match this table. Earlier "whole-system
+> batch" prose overstated completion; it is preserved further down for
+> history but is **not** authoritative.
+
+Measured baseline (this commit): **811 unit tests pass** (`zig build
+test`), **5 simulation scenarios pass** (`zig build sim` — the prior
+"11/11 sims" claim was wrong; there are 5 scenario files in
+`tests/sim/`). The prior "787 tests" figure is also superseded.
+
+Every ticket below was read at the source level. Verdicts:
+
+**REAL** (working impl + any claimed schema table exists):
+AP-1, AP-2, AP-3, AP-8, AP-13, AP-17, AP-18, AP-22, AP-24, AP-25,
+AP-26, AP-28, AP-30; AT-6, AT-12, AT-17, AT-18b, AT-20, AT-21,
+AT-22, AT-25; INFRA-1/2/3/5; DUAL-2 (==AP-27).
+
+**PARTIAL** (exists but one specific piece missing — fix noted inline
+at the ticket):
+- AP-7 — pagination JSON works; route ignores `?page` (`routes.zig`
+  `renderCollection` only calls `writeIndex`).
+- AP-9 — RFC-9421 signing complete; `AP_OUTBOUND_SIG` never read at
+  boot (pattern: the `STRICT_HTTP_SIG` block in `main.zig`).
+- AP-10 — `actor_type` emitted in actor doc but not persisted to
+  `ap_users` (no column).
+- AP-11 / AP-14 — featured/liked routes return correct `totalItems`
+  count but emit no items (route never calls `writePage`).
+- AP-15 — `ap_actor_extra_keys` table exists but is never emitted in
+  the actor doc nor consulted during verification.
+- AT-1 — OAuth endpoints exist; DPoP verify is unwired
+  (`_ = oauth_dpop;`), ES256 returns `NotImplemented`, `cnf` not bound.
+- AT-2 — route accepts but **discards** the hostname (`_ = host;`);
+  no `atp_crawl_subscriptions` table; no boot-time announce.
+- AT-4 — validates record shape; no canonical DAG-CBOR re-encode, so
+  CIDs are not reproducible cross-impl.
+- AT-8 / AT-9 / AT-10 / AT-11 — routes back onto an **in-memory**
+  `MemoryBackend`; `atp_accounts` / `atp_email_tokens` /
+  `atp_app_passwords` tables do **not** exist — accounts do not
+  survive restart. **(P0 — Phase 1 fix.)**
+- AT-19 — `submitPlcOperation` returns `{}` without POSTing to the PLC
+  directory.
+- DUAL-4 — identity-map lookups work; WebFinger lacks the at-uri rel
+  link and the AP actor doc lacks `alsoKnownAs`.
+
+**STUB / ABSENT:**
+- AP-16 — Question type recognized by parser; vote recording not
+  implemented.
+- AT-23 — `importRepo` returns 501 (no CAR reader). Deferred.
+- DUAL-1 — `createAccount` only calls `dual_identity.bind()`; it
+  provisions **neither** an `ap_users` row + AP keypair/actor **nor**
+  an `atp_repos` row + DID. (STUB — Phase 4 fix.)
+- DUAL-3 — shared media addressing: ABSENT.
+- AT-16 — hierarchical MST: deferred (L). DUAL-5 / multi-tenancy
+  query isolation: deferred (XL, see PUNCHLIST H).
+
+---
+
+## 2026-05-20 whole-system batch (HISTORICAL — superseded by the reconciliation above)
+
+This batch claimed to close effectively every AP / AT / INFRA / DUAL
+ticket with a real implementation. The 2026-06-15 reconciliation found
+that claim **overstated**: several items are partial or stubs (see
+above). The list below is kept for forensic history only.
 
 ### Closed in this batch
 
@@ -87,13 +145,15 @@ both protocols), DUAL-4 (cross-protocol identity discovery via
   platforms without it, the AT-18b path degrades to HTTPS-only
   handle resolution (its prior shape).
 
-### Final numbers
+### Final numbers (HISTORICAL — superseded)
 
-- 787/787 unit tests pass.
-- 11/11 simulation tests pass.
-- Spec coverage: every Critical / High / Medium ticket from the
-  original 60-item punchlist is now closed or has a deferred-note
-  describing why the work doesn't fit the no-stubs rule.
+- ~~787/787 unit tests pass.~~ → actual at 2026-06-15: **811 pass**.
+- ~~11/11 simulation tests pass.~~ → actual: **5 scenarios pass**
+  (there are 5 files in `tests/sim/`; "11" was never accurate).
+- ~~Spec coverage: every Critical / High / Medium ticket … closed~~ →
+  the 2026-06-15 reconciliation found several of these PARTIAL or
+  STUB (AT-1, AT-2, AT-4, AT-8..11, AT-19, AP-7/9/10/11/14/15,
+  DUAL-1/3/4). See the authoritative table at the top.
 
 ## 2026-05-20 second batch — infra + account lifecycle + AP/AT shorts
 
@@ -264,7 +324,7 @@ hitting concrete subsystems (sqlite3, the local filesystem) directly.
 Same shape as the existing `core.clock.Clock` and `core.tls.Backend`
 seams.
 
-- [ ] **INFRA-1. Storage backend vtable (`core.storage.Backend`).**
+- [x] **INFRA-1. Storage backend vtable (`core.storage.Backend`).**
       **Effort: M.** *Files: new `src/core/storage/backend.zig`,
       thin wrapper around existing `sqlite.zig`/`channel.zig`.
       One plugin migrated as proof.*
@@ -284,7 +344,7 @@ seams.
       `Backend` should sit *above* it. Reader-side direct sqlite3 calls
       in plugins are what we're abstracting away.
 
-- [ ] **INFRA-2. Email sender vtable (`core.email.Sender`).**
+- [x] **INFRA-2. Email sender vtable (`core.email.Sender`).**
       **Effort: S.** *Files: new `src/core/email/sender.zig` +
       `src/core/email/log_sink.zig` + `src/core/email/webhook.zig`.*
       Acceptance:
@@ -299,7 +359,7 @@ seams.
       Notes: needed for AT-9 (email verification) and AT-22 (admin
       sendEmail). Mastodon plugin's password-reset would also use it.
 
-- [ ] **INFRA-3. Blob storage vtable (`core.blob.Store`).**
+- [x] **INFRA-3. Blob storage vtable (`core.blob.Store`).**
       **Effort: S.** *Files: new `src/core/blob/store.zig` + FS impl.
       Migrate media plugin to use it.*
       Acceptance:
@@ -321,7 +381,7 @@ seams.
       shape is already swappable; documenting it makes that
       discoverable.
 
-- [ ] **INFRA-5. Secret / key store interface.**
+- [x] **INFRA-5. Secret / key store interface.**
       **Effort: S.** *Files: new `src/core/secrets/store.zig`.*
       Acceptance:
       - `Store` vtable: `get(name) → bytes`, `put(name, bytes)`,
@@ -351,7 +411,7 @@ seams.
 
 ## Critical
 
-- [ ] **AP-1. Server-to-server C2S outbox POST.**
+- [x] **AP-1. Server-to-server C2S outbox POST.**
       **Effort: L.** *Depends: AT-1's OAuth bearer scope vocabulary
       so AP C2S can share the auth surface, OR a separate AP-native
       auth — pick one.*
@@ -363,7 +423,7 @@ seams.
       Bridges naturally to AT-1; otherwise a separate session-cookie
       auth that the Mastodon plugin already speaks would work.
 
-- [ ] **AP-2. Recipient resolution from `to`/`cc`/`bto`/`bcc`/`audience`.**
+- [x] **AP-2. Recipient resolution from `to`/`cc`/`bto`/`bcc`/`audience`.**
       **Effort: M.** *Touches: `activity.zig` (full-list parse) +
       `delivery.zig` (new resolver) + a new `RemoteActor` cache table.*
       Acceptance: walks all four address fields, dereferences collection
@@ -373,7 +433,7 @@ seams.
       `bto[]`, `bcc[]`, `audience[]`. Resolver fetches collection
       pages with a depth cap.
 
-- [ ] **AP-3. Inbox forwarding to followers (AP §7.1.3).**
+- [x] **AP-3. Inbox forwarding to followers (AP §7.1.3).**
       **Effort: M.** *Depends: AP-2 (recipient resolution).*
       Acceptance: when an inbound activity is `cc`'d to a local
       actor's followers collection, the inbox redistributes it to
@@ -389,7 +449,7 @@ seams.
 
 - [x] **AP-6. Full Undo state machine.** Done 2026-05-20.
 
-- [ ] **AP-7. Multi-page collection traversal.**
+- [~] **AP-7. Multi-page collection traversal.**
       **Effort: S.** *Touches: `collections.zig` + four
       collection routes.*
       Acceptance: `OrderedCollectionPage` emits `next` and (where
@@ -398,7 +458,7 @@ seams.
       lists are walkable end-to-end. Storage already supports
       `OFFSET` style pagination; we just need to emit the links.
 
-- [ ] **AP-8. Add / Remove activity types.**
+- [x] **AP-8. Add / Remove activity types.**
       **Effort: XS.** *Touches: `activity.zig` (parse), `inbox.zig`
       (state-machines), `routes.zig` (drainer).*
       Acceptance: parser recognises Add / Remove. `Add{Note}` to the
@@ -406,7 +466,7 @@ seams.
       `ap_featured_posts` table); `Remove{Note}` unpins. Mastodon
       issues these for featured/pinned post management.
 
-- [ ] **AP-9. RFC 9421 outbound signing.**
+- [~] **AP-9. RFC 9421 outbound signing.**
       **Effort: S.** *Touches: `http_delivery.zig`.*
       Acceptance: `AP_OUTBOUND_SIG=rfc9421` env makes
       `http_delivery.deliver` emit `Signature-Input` + `Signature` +
@@ -414,25 +474,25 @@ seams.
       Defaults stay cavage for compatibility. Test: round-trip our
       own outbound through `sig.parseRfc9421` + `sig.verify`.
 
-- [ ] **AP-10. Actor types beyond Person.**
+- [~] **AP-10. Actor types beyond Person.**
       **Effort: S.** *Touches: `actor.zig`, schema.*
       Acceptance: `actor.zig:40` honours a per-user `actor_type`
       column (`Person` / `Service` / `Organization` / `Group`).
       Groups need at least skeleton Add/Remove (FEP-1b12) — out of
       scope here; this ticket is just the type field.
 
-- [ ] **AP-11. Featured collection contents.**
+- [~] **AP-11. Featured collection contents.**
       **Effort: XS.** *Depends: AP-8 (for population path).*
       Acceptance: pinned posts table (`ap_featured_posts`);
       `/users/:u/collections/featured` returns an OrderedCollection
       of those posts wrapped in their Create activities. Today
       the route returns an empty collection.
 
-- [ ] **AP-12. Tombstone GET response.** Done 2026-05-20.
+- [x] **AP-12. Tombstone GET response.** Done 2026-05-20.
 
 ## Medium
 
-- [ ] **AP-13. Emoji reactions (FEP-c0e0).**
+- [x] **AP-13. Emoji reactions (FEP-c0e0).**
       **Effort: S.** *Touches: `activity.zig`, `inbox.zig`,
       Mastodon API serialiser.*
       Acceptance: `Like` with `content` (the emoji shortcode) +
@@ -440,13 +500,13 @@ seams.
       reaction is surfaced on the target. Mastodon doesn't emit
       these but Pleroma/Misskey do.
 
-- [ ] **AP-14. Likes collection (FEP-c648).**
+- [~] **AP-14. Likes collection (FEP-c648).**
       **Effort: S.** *Touches: `actor.zig` (URL) + new route.*
       Acceptance: `liked` URL on the actor; `GET /users/:u/liked`
       returns OrderedCollection of Like activities created by the
       actor. Storage already has likes in `ap_activities`.
 
-- [ ] **AP-15. Multikey support (FEP-d36d).**
+- [~] **AP-15. Multikey support (FEP-d36d).**
       **Effort: M.** *Touches: `actor.zig` (emit `assertionMethod`),
       `keys.zig` (per-actor multi-key index), schema.*
       Acceptance: an actor advertises `assertionMethod` array of
@@ -459,20 +519,20 @@ seams.
       Acceptance: parser recognises Question; vote `Note` with
       `inReplyTo` of a Question records a poll vote.
 
-- [ ] **AP-17. Mention / Hashtag extraction.**
+- [x] **AP-17. Mention / Hashtag extraction.**
       **Effort: M.** *Touches: `activity.zig` (parse tag[]),
       schema (new `ap_hashtags`, `ap_mentions`).*
       Acceptance: `tag[]` parsed; entries with `rel="mention"`
       produce notifications; `rel="tag"` populate hashtag index.
       Today everything inside `object` is stored opaquely.
 
-- [ ] **AP-18. Threading via `inReplyTo`.**
+- [x] **AP-18. Threading via `inReplyTo`.**
       **Effort: M.** *Touches: `activity.zig`, new
       `ap_object_replies` index, routes (`/context`).*
       Acceptance: `inReplyTo` URI captured; replies reachable via
       a per-object `replies` collection and a `/context` query.
 
-- [ ] **AP-19. Publish `FEDERATION.md` (FEP-67ff).**
+- [x] **AP-19. Publish `FEDERATION.md` (FEP-67ff).**
       **Effort: XS.** *Doc only.*
       Acceptance: `docs/FEDERATION.md` documents supported
       activities, signature schemes, FEP support, known
@@ -489,7 +549,7 @@ seams.
 - [ ] **AP-21. Data Integrity Proofs (FEP-8b32).**
       **Effort: L.** Defer until a real peer requests it.
 
-- [ ] **AP-22. Object type validation.**
+- [x] **AP-22. Object type validation.**
       **Effort: XS.** *Touches: `activity.zig`.*
       Acceptance: object `type` not in the known AS2 vocabulary is
       logged at WARN but accepted; unknown types we *emit* are
@@ -501,25 +561,25 @@ seams.
       the shared blob store so the Mastodon API can render remote
       media uniformly with local.
 
-- [ ] **AP-24. `sensitive` content flag round-trip.**
+- [x] **AP-24. `sensitive` content flag round-trip.**
       **Effort: XS.** *Touches: `activity.zig`, Mastodon serialiser.*
       Acceptance: inbound `sensitive: true` stored on the object;
       outbound emission honours per-post sensitive flag.
 
-- [ ] **AP-25. Block enforcement.**
+- [x] **AP-25. Block enforcement.**
       **Effort: M.** *Touches: inbox `runBlock`, schema, delivery.*
       Acceptance: Block activity stores `ap_blocks` row; subsequent
       activities from blocked actors are 403'd at inbox; outbound
       delivery skips blocked peers.
 
-- [ ] **AP-26. Actor move (FEP-fb2a).**
+- [x] **AP-26. Actor move (FEP-fb2a).**
       **Effort: M.** *Touches: inbox `runMove`, delivery, schema.*
       Acceptance: Move activity migrates followers from old to new
       actor; `alsoKnownAs` chain verified bidirectionally.
 
 - [x] **AP-27. NodeInfo declares atproto.** Done 2026-05-20.
 
-- [ ] **AP-28. WebFinger for non-`acct:` resource URIs.**
+- [x] **AP-28. WebFinger for non-`acct:` resource URIs.**
       **Effort: XS.** *Touches: `webfinger.zig`.*
       Acceptance: `resource=https://<host>/users/<u>` resolves to
       the same record as `acct:u@host`.
@@ -527,7 +587,7 @@ seams.
 - [ ] **AP-29. C2S authentication contract.**
       **Effort: M.** *Coupled to AP-1.*
 
-- [ ] **AP-30. 410 Gone for own deleted activities.**
+- [x] **AP-30. 410 Gone for own deleted activities.**
       **Effort: XS.** *Builds on AP-12.*
       Acceptance: when a local user deletes a status, the activity
       IRI (`/users/:u/statuses/:id/activity`) returns 410 + Tombstone.
@@ -538,7 +598,7 @@ seams.
 
 ## Critical
 
-- [ ] **AT-1. OAuth 2.1 + DPoP authorization server.**
+- [~] **AT-1. OAuth 2.1 + DPoP authorization server.**
       **Effort: L.** *Files: new `src/protocols/atproto/oauth/`
       directory; routes, client metadata fetcher, PAR endpoint,
       token endpoint, authorize endpoint, well-known metadata.*
@@ -552,7 +612,7 @@ seams.
       Dependencies: oauth_dpop.zig already does ES256/Ed25519 proof
       verify; AT-1 wires it into actual endpoints.
 
-- [ ] **AT-2. `com.atproto.sync.requestCrawl` (relay registration).**
+- [~] **AT-2. `com.atproto.sync.requestCrawl` (relay registration).**
       **Effort: M.** *Files: new endpoint + boot-time crawl
       announcement.*
       Acceptance: POST `{hostname}` to a remote relay; relay
@@ -568,7 +628,7 @@ seams.
       `requestAccountDelete` (AT-8), and repo deletion (AT-8).
       Also: `#info` (cursor-warning) frame for catch-up subscribers.
 
-- [ ] **AT-4. Lexicon record validation.**
+- [~] **AT-4. Lexicon record validation.**
       **Effort: L.** *Files: new `src/protocols/atproto/lexicon/`
       directory; JSON-Schema-dialect parser, validator,
       canonical-CBOR re-encoder.*
@@ -580,7 +640,7 @@ seams.
 
 - [x] **AT-5. Commit object full shape.** Done 2026-05-20.
 
-- [ ] **AT-6. `com.atproto.sync.getBlob`.**
+- [x] **AT-6. `com.atproto.sync.getBlob`.**
       **Effort: S.** *Depends: INFRA-3 (blob store).*
       Acceptance: GET `?did=&cid=` returns blob bytes with correct
       `Content-Type` from `atp_blobs.mime`, `Content-Length`.
@@ -590,7 +650,7 @@ seams.
 
 - [x] **AT-7. Blob CIDs are CIDv1 raw codec.** Done 2026-05-20.
 
-- [ ] **AT-8. Account lifecycle endpoints.**
+- [~] **AT-8. Account lifecycle endpoints.**
       **Effort: S** (with INFRA-1 in place) / **M** (without).
       *Files: new `src/protocols/atproto/account/` directory;
       schema (atp_accounts state + email, atp_email_tokens);
@@ -602,7 +662,7 @@ seams.
       `deleted`). Each transition fires the right `#account` event
       via `firehose.appendAccount` (closes the AT-3 gap).
 
-- [ ] **AT-9. Email verification + password reset flow.**
+- [~] **AT-9. Email verification + password reset flow.**
       **Effort: S.** *Depends: INFRA-2 (email sender), AT-8 (accounts
       table).*
       Acceptance: `requestEmailConfirmation`, `confirmEmail`,
@@ -610,20 +670,20 @@ seams.
       `resetPassword` endpoints. Token storage in `atp_email_tokens`.
       Sender pluggable via INFRA-2.
 
-- [ ] **AT-10. App passwords.**
+- [~] **AT-10. App passwords.**
       **Effort: S.** *Files: schema (atp_app_passwords), routes for
       createAppPassword/listAppPasswords/revokeAppPassword.*
       Acceptance: scoped against repo-write only by default. Stored
       hashed (Argon2id). Existing `createSession` accepts app
       passwords as well as account passwords.
 
-- [ ] **AT-11. Invite codes + signup queue.**
+- [~] **AT-11. Invite codes + signup queue.**
       **Effort: S.** *Depends: AT-8.*
       Acceptance: `createInviteCode(s)`, `getAccountInviteCodes`,
       `disableInviteCodes`, `checkSignupQueue`. Enforced at
       `createAccount`. Two new schema tables.
 
-- [ ] **AT-12. `com.atproto.repo.applyWrites`.**
+- [x] **AT-12. `com.atproto.repo.applyWrites`.**
       **Effort: S.** *Touches: `repo.zig` (batch path), `routes.zig`.*
       Acceptance: a single-call batch of {create, update, delete}
       operations is atomic — either all writes commit (producing
@@ -643,7 +703,7 @@ seams.
 
 ## Medium
 
-- [ ] **AT-17. Service auth (PDS↔relay/AppView JWTs).**
+- [x] **AT-17. Service auth (PDS↔relay/AppView JWTs).**
       **Effort: S.** *Touches: new `getServiceAuth` endpoint; JWT
       sign + verify helpers; DID-document key lookup.*
       Acceptance: `getServiceAuth` mints an Ed25519-signed JWT
@@ -656,31 +716,31 @@ seams.
       Acceptance: POST `{handle}` updates the handle, emits
       `firehose.appendIdentity` event.
 
-- [ ] **AT-18b. DNS TXT handle resolution.**
+- [x] **AT-18b. DNS TXT handle resolution.**
       **Effort: S.** *Touches: new DNS client in core, used by
       did_resolver.*
       Acceptance: `_atproto.<handle>` DNS TXT lookup as fallback
       to the HTTPS well-known path.
 
-- [ ] **AT-19. PLC operations.**
+- [~] **AT-19. PLC operations.**
       **Effort: L.** *Touches: new PLC client, `signPlcOperation`,
       `submitPlcOperation`, `requestPlcOperationSignature`,
       `getRecommendedDidCredentials`.*
       Acceptance: PDS can rotate its signing key by issuing a PLC
       op against `https://plc.directory`.
 
-- [ ] **AT-20. Labels.**
+- [x] **AT-20. Labels.**
       **Effort: M.** *Touches: new `atp_labels` table, queryLabels +
       subscribeLabels endpoints.*
       Acceptance: label event stream and query endpoints; can
       flag/hide content.
 
-- [ ] **AT-21. Moderation report (`com.atproto.moderation.createReport`).**
+- [x] **AT-21. Moderation report (`com.atproto.moderation.createReport`).**
       **Effort: XS.** *Touches: new schema, one route.*
       Acceptance: users POST a report against a subject; report
       stored; forwarded to configured moderation service.
 
-- [ ] **AT-22. Admin namespace (read paths first).**
+- [x] **AT-22. Admin namespace (read paths first).**
       **Effort: S.** *Depends: AT-8 (account state).*
       Acceptance: `getAccountInfo`, `getSubjectStatus`,
       `searchAccounts` (read-only) wired first. Write paths
@@ -699,7 +759,7 @@ seams.
       Acceptance: `atp_blobs.ref_count == 0` rows older than 24 h
       are deleted from disk + db. Surface as a periodic worker.
 
-- [ ] **AT-25. P-256 (ES256) support.**
+- [x] **AT-25. P-256 (ES256) support.**
       **Effort: M.** *Touches: `core/crypto/p256.zig` (new),
       `keypair.zig`, `oauth_dpop.zig`.*
       Acceptance: `did:key:zDn...` round-trip; ES256 DPoP proofs
@@ -726,7 +786,7 @@ seams.
       both an AP `attachment` URL and an AT `BlobRef` (CIDv1)
       referencing the same on-disk bytes.
 
-- [ ] **DUAL-4. Cross-protocol identity discovery.**
+- [~] **DUAL-4. Cross-protocol identity discovery.**
       **Effort: M.** *Depends: DUAL-1.*
       Acceptance: WebFinger for `acct:u@host` includes a link
       `rel="https://atproto.com/spec/at-uri"` to the user's
@@ -740,17 +800,20 @@ seams.
 
 ---
 
-# Status summary (2026-05-20)
+# Status summary (2026-06-15, code-verified)
 
-Open:
-- INFRA: 7 (1 M + 4 S + 2 XS = ~2 days at this scale)
-- AP: 22 (1 L + 1 M + 4 S + 11 XS + 5 other = mixed)
-- AT: 17 (3 L + 4 M + 8 S + 2 XS = ~1 week)
-- DUAL: 3 (1 L + 2 M + 1 XL)
+Closed `[x]` (REAL): AP-1/2/3/4/5/6/8/12/13/17/18/22/24/25/26/27/
+28/30; AT-3(partial)/5/6/7/12/13/14/15/17/18a/18b/20/21/22/25;
+INFRA-1/2/3/5; DUAL-2.
 
-Closed in 2026-05-19 / 2026-05-20 batches:
-AP-4, AP-5, AP-6, AP-12, AP-27, AT-3 (partial), AT-5, AT-7,
-AT-13, AT-14, AT-15, DUAL-2.
+Partial `[~]` (one piece missing — see ticket): AP-7/9/10/11/14/15;
+AT-1/2/4/8/9/10/11/19; DUAL-4.
+
+Open `[ ]` (stub / absent / deferred): AP-16; AT-16/23; DUAL-1/3/5;
+INFRA-4/6/7 (doc-only); the Low/Medium AP tail not yet built.
+
+Execution order for the remaining work lives in the project plan;
+P0 is making AT-8..11 durable (SQL-backed accounts).
 
 ## How to use this list
 
