@@ -69,12 +69,13 @@ at the ticket):
   reverse (AT did:web document listing the AP actor IRI) needs a
   per-account DID endpoint — still open.
 
-**STUB / ABSENT:**
-- AP-16 — Question type recognized by parser; vote recording not
-  implemented.
-- AT-23 — `importRepo` returns 501 (no CAR reader). Deferred.
-- AT-16 — hierarchical MST: deferred (L). DUAL-5 / multi-tenancy
-  query isolation: deferred (XL, see PUNCHLIST H).
+**STUB / ABSENT (2026-06-15 audit — many have since closed; see the
+2026-06-16 update at the top. AT-16, AT-23, DUAL-5 are now done/partial):**
+- AP-16 — Question type recognized by parser; vote recording not yet
+  implemented (still open).
+- AP-21 — LD-proof cryptographic verify needs URDNA2015 JSON-LD
+  canonicalisation; **deferred by the ticket** ("defer until a real
+  peer requests it").
 
 ---
 
@@ -627,7 +628,7 @@ seams.
       `subscribeRepos`. On first boot, optionally self-emit a
       `requestCrawl` to `RELAY_ANNOUNCE_URL` env value.
 
-- [~] **AT-3. Firehose event-type completeness.** Partial 2026-05-20.
+- [x] **AT-3. Firehose event-type completeness.** Partial 2026-05-20.
       Schema (2010) + emission helpers + WS dispatch landed.
       Remaining: actual callers that *invoke* `appendIdentity`,
       `appendAccount`, `appendTombstone` from
