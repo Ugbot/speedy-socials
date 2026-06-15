@@ -60,6 +60,33 @@ const WsUpgradeRouter = ws_upgrade_router.WsUpgradeRouter;
 const WsUpgradeContext = ws_upgrade_router.WsUpgradeContext;
 const tls_mod = @import("tls.zig");
 const TlsBackend = tls_mod.TlsBackend;
+const ws_stream_mod = @import("ws/stream.zig");
+
+/// C1: adapter binding a `TlsBackend`'s data-plane hooks (keyed by fd)
+/// to the `TlsStream.TlsAdapter` shape. The TlsStream runs `readBlocking`
+/// on a dedicated reader thread (blocking TLS reads are safe there);
+/// writes go through the handler thread. `close` shuts the socket down
+/// so the blocked reader returns and `TlsStream.close` can join it — the
+/// accept loop then calls `be.closeConn(fd)` to free the TLS session.
+const TlsStreamAdapterCtx = struct {
+    be: TlsBackend,
+    fd: std.posix.fd_t,
+
+    fn readBlocking(ptr: *anyopaque, dst: []u8) ws_stream_mod.Error!usize {
+        const self: *TlsStreamAdapterCtx = @ptrCast(@alignCast(ptr));
+        return self.be.readSome(self.fd, dst) catch return ws_stream_mod.Error.ReadFailed;
+    }
+    fn writeAll(ptr: *anyopaque, bytes: []const u8) ws_stream_mod.Error!void {
+        const self: *TlsStreamAdapterCtx = @ptrCast(@alignCast(ptr));
+        self.be.writeAll(self.fd, bytes) catch return ws_stream_mod.Error.WriteFailed;
+    }
+    fn close(ptr: *anyopaque) void {
+        const self: *TlsStreamAdapterCtx = @ptrCast(@alignCast(ptr));
+        // Unblock the reader thread's blocking TLS read; the session
+        // itself is torn down by the accept loop's `be.closeConn`.
+        _ = std.c.shutdown(self.fd, std.c.SHUT.RDWR);
+    }
+};
 const assert_mod = @import("assert.zig");
 const assert = assert_mod.assert;
 const assertLe = assert_mod.assertLe;
@@ -328,7 +355,37 @@ pub const Server = struct {
             .io = self.io,
             .arena = &conn.arena,
         };
-        try handler(&up_ctx);
+
+        // C1: mint the data-plane stream so handlers exchange frames
+        // through the right transport. When the TLS backend intercepts
+        // the data plane, the bare fd carries ciphertext — frames must
+        // go through a `TlsStream` over the backend's read/write hooks;
+        // otherwise a `PlainStream` over the fd is correct.
+        const fd = stream.socket.handle;
+        if (self.cfg.tls) |be| {
+            if (be.interceptsDataPlane()) {
+                var adapter_ctx = TlsStreamAdapterCtx{ .be = be, .fd = fd };
+                var tls_stream = ws_stream_mod.TlsStream.init(.{
+                    .ptr = &adapter_ctx,
+                    .read_blocking = TlsStreamAdapterCtx.readBlocking,
+                    .write_all = TlsStreamAdapterCtx.writeAll,
+                    .close = TlsStreamAdapterCtx.close,
+                });
+                if (tls_stream.start()) |_| {
+                    const s = tls_stream.stream();
+                    defer s.close(); // sets closed flag, shuts fd, joins reader
+                    up_ctx.ws_stream = s;
+                    return handler(&up_ctx);
+                } else |_| {
+                    // Reader-thread spawn failed; fall back to the bare
+                    // write path (handler's writeAll has a fallback).
+                    return handler(&up_ctx);
+                }
+            }
+        }
+        var plain = ws_stream_mod.PlainStream.init(fd);
+        up_ctx.ws_stream = plain.stream();
+        return handler(&up_ctx);
     }
 
     fn dispatchAndRespond(

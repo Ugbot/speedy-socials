@@ -394,6 +394,93 @@ test "WS-3 loopback: PlainStream carries ws frame end-to-end" {
     }
 }
 
+// C1: socketpair-backed adapter — exercises the EXACT path the server's
+// WS upgrade dispatcher uses for TLS: a reader thread doing blocking
+// reads, handler-thread writes, and a `close` that shuts the fd down to
+// unblock the blocked reader so the join completes (no hang).
+const SockAdapter = struct {
+    fd: std.posix.fd_t,
+
+    fn read(ptr: *anyopaque, dst: []u8) Error!usize {
+        const self: *SockAdapter = @ptrCast(@alignCast(ptr));
+        // Blocking read; EOF (after shutdown) and errors both map to a
+        // clean 0 so the reader loop exits and `close` can join.
+        const n = std.posix.read(self.fd, dst) catch return 0;
+        return n;
+    }
+    fn write(ptr: *anyopaque, bytes: []const u8) Error!void {
+        const self: *SockAdapter = @ptrCast(@alignCast(ptr));
+        var off: usize = 0;
+        while (off < bytes.len) {
+            const n = std.c.write(self.fd, bytes.ptr + off, bytes.len - off);
+            if (n <= 0) return error.WriteFailed;
+            off += @intCast(n);
+        }
+    }
+    fn closeFn(ptr: *anyopaque) void {
+        const self: *SockAdapter = @ptrCast(@alignCast(ptr));
+        _ = std.c.shutdown(self.fd, std.c.SHUT.RDWR);
+    }
+};
+
+test "C1: TlsStream over a socketpair carries ws frames and close joins" {
+    const ws_frame = @import("frame.zig");
+    var pair: [2]std.posix.fd_t = undefined;
+    if (std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &pair) != 0) return error.SocketpairFailed;
+    defer _ = std.c.close(pair[0]);
+    defer _ = std.c.close(pair[1]);
+
+    // Server side drives a TlsStream over pair[0]; the test peer is pair[1].
+    var ad = SockAdapter{ .fd = pair[0] };
+    var tls = TlsStream.init(.{
+        .ptr = &ad,
+        .read_blocking = SockAdapter.read,
+        .write_all = SockAdapter.write,
+        .close = SockAdapter.closeFn,
+    });
+    try tls.start();
+    const s = tls.stream();
+
+    const payload = "wss-frame-hello";
+    var enc: [64]u8 = undefined;
+    const n = try ws_frame.encode(.binary, payload, false, &enc);
+
+    // Peer → server: the reader thread decrypts (here: plain copies)
+    // into the ring; readNonblocking surfaces it on the handler thread.
+    _ = std.c.write(pair[1], enc[0..n].ptr, n);
+    var recv: [64]u8 = undefined;
+    var got: usize = 0;
+    var waited: u32 = 0;
+    while (got < n) {
+        const m = s.readNonblocking(recv[got..]) catch break;
+        if (m > 0) {
+            got += m;
+            continue;
+        }
+        sleepMs(1);
+        waited += 1;
+        if (waited > 500) break;
+    }
+    try testing.expectEqual(@as(usize, n), got);
+    switch (try ws_frame.decode(recv[0..got], false)) {
+        .ok => |ok| try testing.expectEqualSlices(u8, payload, ok.frame.payload),
+        .need_more => return error.UnexpectedNeedMore,
+    }
+
+    // Server → peer: write a frame through the TlsStream write path.
+    try s.writeAll(enc[0..n]);
+    var back: [64]u8 = undefined;
+    const bn = try std.posix.read(pair[1], &back);
+    switch (try ws_frame.decode(back[0..bn], false)) {
+        .ok => |ok| try testing.expectEqualSlices(u8, payload, ok.frame.payload),
+        .need_more => return error.UnexpectedNeedMore,
+    }
+
+    // close() must join the blocked reader thread without hanging —
+    // SockAdapter.closeFn shuts the fd down to unblock the read.
+    s.close();
+}
+
 test "TlsStream reader thread drains adapter into ring" {
     MockAdapter.feed_buf[0..5].* = "hello".*;
     MockAdapter.feed_len = 5;
