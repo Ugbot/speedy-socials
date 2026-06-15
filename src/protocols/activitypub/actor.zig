@@ -72,6 +72,10 @@ pub fn writePerson(cfg: Config, out: []u8) WriteError![]const u8 {
     w += try fmtInto(out[w..], "\"id\":\"https://{s}/users/{s}\",", .{ cfg.hostname, cfg.username });
     w += try fmtInto(out[w..], "\"type\":\"{s}\",", .{cfg.actor_type.asString()});
     w += try fmtInto(out[w..], "\"preferredUsername\":\"{s}\",", .{cfg.username});
+    // DUAL-4: advertise the account's AT Protocol identity so an AP
+    // consumer can cross to the at:// side. Unified-signup accounts use
+    // the AP username as the AT handle.
+    w += try fmtInto(out[w..], "\"alsoKnownAs\":[\"at://{s}\"],", .{cfg.username});
     if (cfg.display_name.len > 0) {
         w += try fmtInto(out[w..], "\"name\":\"{s}\",", .{cfg.display_name});
     }

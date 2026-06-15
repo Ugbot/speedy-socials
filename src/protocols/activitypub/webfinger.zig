@@ -54,12 +54,17 @@ pub fn parseResourceParam(resource: []const u8) WriteError!struct { username: []
 }
 
 pub fn writeJrd(cfg: Config, out: []u8) WriteError![]const u8 {
+    // DUAL-4: the `at-uri` link advertises the account's AT Protocol
+    // identity so an AppView / crawler discovering us over WebFinger can
+    // cross to the at:// side. For unified-signup accounts the AP
+    // username is the AT handle, so the URI is `at://<username>`.
     const fmt =
         "{{\"subject\":\"acct:{s}@{s}\"," ++
         "\"aliases\":[\"https://{s}/users/{s}\",\"https://{s}/@{s}\"]," ++
         "\"links\":[" ++
         "{{\"rel\":\"self\",\"type\":\"application/activity+json\",\"href\":\"https://{s}/users/{s}\"}}," ++
-        "{{\"rel\":\"http://webfinger.net/rel/profile-page\",\"type\":\"text/html\",\"href\":\"https://{s}/@{s}\"}}" ++
+        "{{\"rel\":\"http://webfinger.net/rel/profile-page\",\"type\":\"text/html\",\"href\":\"https://{s}/@{s}\"}}," ++
+        "{{\"rel\":\"https://atproto.com/spec/at-uri\",\"href\":\"at://{s}\"}}" ++
         "]}}";
     const result = std.fmt.bufPrint(out, fmt, .{
         cfg.username, cfg.hostname,
@@ -67,6 +72,7 @@ pub fn writeJrd(cfg: Config, out: []u8) WriteError![]const u8 {
         cfg.hostname, cfg.username,
         cfg.hostname, cfg.username,
         cfg.hostname, cfg.username,
+        cfg.username,
     }) catch return error.BufferTooSmall;
     return result;
 }
@@ -100,6 +106,13 @@ test "writeJrd emits all required fields" {
     try testing.expect(std.mem.indexOf(u8, out, "https://example.com/@alice") != null);
     // Deprecated Atom link should NOT appear (AP-M1).
     try testing.expect(std.mem.indexOf(u8, out, "schemas.google.com") == null);
+}
+
+test "DUAL-4: writeJrd advertises the at-uri discovery link" {
+    var buf: [1024]u8 = undefined;
+    const out = try writeJrd(.{ .hostname = "example.com", .username = "alice.example.com" }, &buf);
+    try testing.expect(std.mem.indexOf(u8, out, "\"rel\":\"https://atproto.com/spec/at-uri\"") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "\"href\":\"at://alice.example.com\"") != null);
 }
 
 test "writeJrd fails on too-small buffer" {
