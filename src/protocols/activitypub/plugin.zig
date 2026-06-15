@@ -49,6 +49,11 @@ pub const delivery = @import("delivery.zig");
 pub const outbox_worker = @import("outbox_worker.zig");
 pub const key_fetcher_http = @import("key_fetcher_http.zig");
 pub const http_delivery = @import("http_delivery.zig");
+pub const provisioning = @import("provisioning.zig");
+
+/// DUAL-1: provision a local AP actor (user row + Ed25519 key). Exposed
+/// so the composition root can hand it to the AT plugin's unified signup.
+pub const provisionLocalUser = provisioning.provisionLocalUser;
 
 // ──────────────────────────────────────────────────────────────────────
 // Public composition-root API
@@ -129,6 +134,7 @@ test {
     _ = outbox_worker;
     _ = key_fetcher_http;
     _ = http_delivery;
+    _ = provisioning;
     _ = @import("integrity_proof.zig");
 }
 

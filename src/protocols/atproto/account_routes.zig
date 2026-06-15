@@ -25,9 +25,22 @@ const State = @import("state.zig");
 const xrpc = @import("xrpc.zig");
 const auth_mod = @import("auth.zig");
 const firehose = @import("firehose.zig");
+const repo_mod = @import("repo.zig");
+const keypair = @import("keypair.zig");
 
 const account = core.account;
 const email_mod = core.email;
+const c = @import("sqlite").c;
+
+/// DUAL-1: optional hook the composition root wires to the AP plugin's
+/// `provisionLocalUser`, so a single AT signup also mints the matching
+/// ActivityPub actor (user row + Ed25519 key). Null = AT-only signup.
+const ApProvisionFn = *const fn (db: *c.sqlite3, username: []const u8, now: i64) anyerror!void;
+var ap_provision_hook: ?ApProvisionFn = null;
+
+pub fn setApProvisionHook(hook: ApProvisionFn) void {
+    ap_provision_hook = hook;
+}
 
 // ──────────────────────────────────────────────────────────────────────
 // Helpers
@@ -149,6 +162,16 @@ fn createAccount(hc: *HandlerContext) anyerror!void {
         var ap_actor_buf: [320]u8 = undefined;
         if (std.fmt.bufPrint(&ap_actor_buf, "https://{s}/users/{s}", .{ st.host, handle })) |ap_actor| {
             _ = core.dual_identity.bind(db, did, ap_actor, did, "", st.clock.wallUnix()) catch {};
+        } else |_| {}
+        // DUAL-1: provision the matching AP actor so the bound IRI
+        // actually resolves + can sign federation traffic.
+        if (ap_provision_hook) |hook| hook(db, handle, st.clock.wallUnix()) catch {};
+        // DUAL-1: create the AT repo now (with the PDS signing key's
+        // did:key) so the account has a repo + DID document immediately,
+        // not lazily on first write.
+        var didkey_buf: [128]u8 = undefined;
+        if (keypair.formatDidKeyEd25519(st.jwt_key.public_key, &didkey_buf)) |didkey| {
+            repo_mod.ensureRepo(db, did, didkey, st.clock.wallUnix()) catch {};
         } else |_| {}
     }
 

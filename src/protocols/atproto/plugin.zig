@@ -71,6 +71,9 @@ pub fn attachDb(db: *c.sqlite3) void {
     state.attachDb(db);
 }
 
+/// DUAL-1: wire the AP-actor provisioning hook used by unified signup.
+pub const setApProvisionHook = @import("account_routes.zig").setApProvisionHook;
+
 pub fn attachWorkers(pool: *anyopaque) void {
     state.attachWorkers(pool);
 }

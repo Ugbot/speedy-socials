@@ -561,6 +561,13 @@ pub fn main() !void {
     atproto.attachDb(db);
     atproto.attachWorkers(&atp_workers);
 
+    // DUAL-1: unified signup. When the AT plugin's `createAccount` mints
+    // a local account it also provisions the matching AP actor (user row
+    // + Ed25519 key) via this hook, and binds the two in the
+    // cross-protocol identity map — one signup, both networks.
+    atproto.setApProvisionHook(activitypub.provisionLocalUser);
+    log_ptr.info("boot", "unified signup wired (AT createAccount → AP actor provisioning)");
+
     // ── Media plugin wiring (W1.4 + W5.5 filesystem spillover) ────
     media.attachDb(db);
     media.setBaseUrl("http://127.0.0.1:8080");
