@@ -29,6 +29,7 @@ const repo_mod = @import("repo.zig");
 const firehose = @import("firehose.zig");
 const tid_mod = @import("tid.zig");
 const dag = @import("dag_cbor.zig");
+const json_dagcbor = @import("json_dagcbor.zig");
 const mst = @import("mst.zig");
 const cid_mod = @import("cid.zig");
 const car = @import("car.zig");
@@ -192,25 +193,21 @@ fn createRecord(hc: *HandlerContext) anyerror!void {
     // AT-4: lexicon validation — pulls the registered RecordSpec
     // for `collection` and checks required + scalar shape. Unknown
     // collections pass through.
-    if (xrpc.jsonObjectField(hc.request.body, "record")) |record_value| {
-        lexicon.validate(collection, record_value) catch |e| switch (e) {
-            error.MissingRequiredField => return xrpc.writeError(hc, .bad_request, "InvalidRecord", "missing required field"),
-            error.WrongType => return xrpc.writeError(hc, .bad_request, "InvalidRecord", "wrong field type"),
-            error.StringTooLong => return xrpc.writeError(hc, .bad_request, "InvalidRecord", "string field too long"),
-            else => return xrpc.writeError(hc, .bad_request, "InvalidRecord", "validation failed"),
-        };
-    }
+    const record_value = xrpc.jsonObjectField(hc.request.body, "record") orelse
+        return xrpc.writeError(hc, .bad_request, "InvalidRequest", "missing record");
+    lexicon.validate(collection, record_value) catch |e| switch (e) {
+        error.MissingRequiredField => return xrpc.writeError(hc, .bad_request, "InvalidRecord", "missing required field"),
+        error.WrongType => return xrpc.writeError(hc, .bad_request, "InvalidRecord", "wrong field type"),
+        error.StringTooLong => return xrpc.writeError(hc, .bad_request, "InvalidRecord", "string field too long"),
+        else => return xrpc.writeError(hc, .bad_request, "InvalidRecord", "validation failed"),
+    };
 
-    // Persist a tiny CBOR value with the raw request body. Canonical
-    // CBOR re-encoding remains a future ticket (the lexicon check
-    // above gates which shapes get in).
-    var enc_buf: [4096]u8 = undefined;
-    var enc = dag.Encoder.init(&enc_buf);
-    enc.writeMapHeader(2) catch return xrpc.writeError(hc, .internal, "InternalError", "encode");
-    enc.writeText("$type") catch return xrpc.writeError(hc, .internal, "InternalError", "encode");
-    enc.writeText(collection) catch return xrpc.writeError(hc, .internal, "InternalError", "encode");
-    enc.writeText("body") catch return xrpc.writeError(hc, .internal, "InternalError", "encode");
-    enc.writeText(hc.request.body) catch return xrpc.writeError(hc, .internal, "InternalError", "encode");
+    // AT-4: re-encode the record to canonical DAG-CBOR so the resulting
+    // CID is reproducible across implementations (sorted map keys,
+    // shortest-form ints, DAG-JSON $link/$bytes honoured).
+    var enc_buf: [16384]u8 = undefined;
+    const record_cbor = json_dagcbor.encode(record_value, &enc_buf) catch
+        return xrpc.writeError(hc, .bad_request, "InvalidRecord", "record not DAG-CBOR encodable");
 
     var rng = core.rng.Rng.init(@as(u64, @bitCast(st.clock.wallUnix())));
     var ts = tid_mod.State.init(&rng);
@@ -225,7 +222,7 @@ fn createRecord(hc: *HandlerContext) anyerror!void {
     repo_mod.loadTree(db, repo_did, &tree) catch {};
 
     const ops = [_]repo_mod.Operation{
-        .{ .collection = collection, .rkey = "", .value_cbor = enc.written() },
+        .{ .collection = collection, .rkey = "", .value_cbor = record_cbor },
     };
     const commit = repo_mod.commit(db, repo_did, st.jwt_key, rev, &tree, &ops, st.clock.wallUnix(), rkey) catch {
         return xrpc.writeError(hc, .internal, "InternalError", "commit");

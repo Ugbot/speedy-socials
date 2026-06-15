@@ -121,6 +121,7 @@ test {
     _ = @import("lexicon.zig");
     _ = @import("blob_gc.zig");
     _ = @import("firehose_buffer.zig");
+    _ = @import("json_dagcbor.zig");
 }
 
 test "atproto plugin registers" {
