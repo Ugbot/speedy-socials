@@ -28,8 +28,14 @@ Every ticket below was read at the source level. Verdicts:
 
 **REAL** (working impl + any claimed schema table exists):
 AP-1, AP-2, AP-3, AP-8, AP-13, AP-17, AP-18, AP-22, AP-24, AP-25,
-AP-26, AP-28, AP-30; AT-6, AT-12, AT-17, AT-18b, AT-20, AT-21,
-AT-22, AT-25; INFRA-1/2/3/5; DUAL-2 (==AP-27).
+AP-26, AP-28, AP-30; AT-6, AT-8, AT-9, AT-10, AT-11, AT-12, AT-17,
+AT-18b, AT-20, AT-21, AT-22, AT-25; INFRA-1/2/3/5; DUAL-2 (==AP-27).
+
+  _AT-8/9/10/11 became durable on 2026-06-15 (commit e9efcd0): the
+  account store is now SQLite-backed by default (`atp_accounts` /
+  `atp_email_tokens` / `atp_app_passwords` / `atp_invites`), surviving
+  restart, with `#account` / `#tombstone` / `#identity` firehose emits
+  on every state transition._
 
 **PARTIAL** (exists but one specific piece missing — fix noted inline
 at the ticket):
@@ -49,10 +55,6 @@ at the ticket):
   no `atp_crawl_subscriptions` table; no boot-time announce.
 - AT-4 — validates record shape; no canonical DAG-CBOR re-encode, so
   CIDs are not reproducible cross-impl.
-- AT-8 / AT-9 / AT-10 / AT-11 — routes back onto an **in-memory**
-  `MemoryBackend`; `atp_accounts` / `atp_email_tokens` /
-  `atp_app_passwords` tables do **not** exist — accounts do not
-  survive restart. **(P0 — Phase 1 fix.)**
 - AT-19 — `submitPlcOperation` returns `{}` without POSTing to the PLC
   directory.
 - DUAL-4 — identity-map lookups work; WebFinger lacks the at-uri rel
@@ -650,7 +652,7 @@ seams.
 
 - [x] **AT-7. Blob CIDs are CIDv1 raw codec.** Done 2026-05-20.
 
-- [~] **AT-8. Account lifecycle endpoints.**
+- [x] **AT-8. Account lifecycle endpoints.**
       **Effort: S** (with INFRA-1 in place) / **M** (without).
       *Files: new `src/protocols/atproto/account/` directory;
       schema (atp_accounts state + email, atp_email_tokens);
@@ -662,7 +664,7 @@ seams.
       `deleted`). Each transition fires the right `#account` event
       via `firehose.appendAccount` (closes the AT-3 gap).
 
-- [~] **AT-9. Email verification + password reset flow.**
+- [x] **AT-9. Email verification + password reset flow.**
       **Effort: S.** *Depends: INFRA-2 (email sender), AT-8 (accounts
       table).*
       Acceptance: `requestEmailConfirmation`, `confirmEmail`,
@@ -670,14 +672,14 @@ seams.
       `resetPassword` endpoints. Token storage in `atp_email_tokens`.
       Sender pluggable via INFRA-2.
 
-- [~] **AT-10. App passwords.**
+- [x] **AT-10. App passwords.**
       **Effort: S.** *Files: schema (atp_app_passwords), routes for
       createAppPassword/listAppPasswords/revokeAppPassword.*
       Acceptance: scoped against repo-write only by default. Stored
       hashed (Argon2id). Existing `createSession` accepts app
       passwords as well as account passwords.
 
-- [~] **AT-11. Invite codes + signup queue.**
+- [x] **AT-11. Invite codes + signup queue.**
       **Effort: S.** *Depends: AT-8.*
       Acceptance: `createInviteCode(s)`, `getAccountInviteCodes`,
       `disableInviteCodes`, `checkSignupQueue`. Enforced at
