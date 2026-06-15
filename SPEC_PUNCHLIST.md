@@ -47,16 +47,15 @@ at the ticket):
   the actor doc nor consulted during verification.
 - AT-2 — route accepts but **discards** the hostname (`_ = host;`);
   no `atp_crawl_subscriptions` table; no boot-time announce.
-- DUAL-4 — identity-map lookups work; WebFinger lacks the at-uri rel
-  link and the AP actor doc lacks `alsoKnownAs`.
+- DUAL-4 — AP-side discovery done (2026-06-15): WebFinger emits the
+  at-uri link + the AP actor doc carries `alsoKnownAs:["at://…"]`. The
+  reverse (AT did:web document listing the AP actor IRI) needs a
+  per-account DID endpoint — still open.
 
 **STUB / ABSENT:**
 - AP-16 — Question type recognized by parser; vote recording not
   implemented.
 - AT-23 — `importRepo` returns 501 (no CAR reader). Deferred.
-- DUAL-1 — `createAccount` only calls `dual_identity.bind()`; it
-  provisions **neither** an `ap_users` row + AP keypair/actor **nor**
-  an `atp_repos` row + DID. (STUB — Phase 4 fix.)
 - DUAL-3 — shared media addressing: ABSENT.
 - AT-16 — hierarchical MST: deferred (L). DUAL-5 / multi-tenancy
   query isolation: deferred (XL, see PUNCHLIST H).
@@ -762,7 +761,10 @@ seams.
 
 # Part C — Cross-protocol (DUAL-*)
 
-- [ ] **DUAL-1. Unified signup → both protocols.**
+- [x] **DUAL-1. Unified signup → both protocols.** (2026-06-15) AT
+      `createAccount` provisions the AP actor (ap_users + Ed25519 key
+      via `activitypub.provisionLocalUser`), ensures the AT repo, and
+      binds both in `core_identity_map`.
       **Effort: L.** *Depends: AT-8, INFRA-1 (cross-plugin shared
       account table).*
       Acceptance: creating a local account provisions (a) an
