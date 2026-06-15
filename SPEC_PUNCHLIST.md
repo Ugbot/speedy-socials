@@ -45,12 +45,8 @@ at the ticket):
   count but emit no items (route never calls `writePage`).
 - AP-15 — `ap_actor_extra_keys` table exists but is never emitted in
   the actor doc nor consulted during verification.
-- AT-1 — OAuth endpoints exist; DPoP verify is unwired
-  (`_ = oauth_dpop;`), ES256 returns `NotImplemented`, `cnf` not bound.
 - AT-2 — route accepts but **discards** the hostname (`_ = host;`);
   no `atp_crawl_subscriptions` table; no boot-time announce.
-- AT-4 — validates record shape; no canonical DAG-CBOR re-encode, so
-  CIDs are not reproducible cross-impl.
 - DUAL-4 — identity-map lookups work; WebFinger lacks the at-uri rel
   link and the AP actor doc lacks `alsoKnownAs`.
 
@@ -594,7 +590,7 @@ seams.
 
 ## Critical
 
-- [~] **AT-1. OAuth 2.1 + DPoP authorization server.**
+- [x] **AT-1. OAuth 2.1 + DPoP authorization server.**
       **Effort: L.** *Files: new `src/protocols/atproto/oauth/`
       directory; routes, client metadata fetcher, PAR endpoint,
       token endpoint, authorize endpoint, well-known metadata.*
@@ -624,7 +620,7 @@ seams.
       `requestAccountDelete` (AT-8), and repo deletion (AT-8).
       Also: `#info` (cursor-warning) frame for catch-up subscribers.
 
-- [~] **AT-4. Lexicon record validation.**
+- [x] **AT-4. Lexicon record validation.**
       **Effort: L.** *Files: new `src/protocols/atproto/lexicon/`
       directory; JSON-Schema-dialect parser, validator,
       canonical-CBOR re-encoder.*
