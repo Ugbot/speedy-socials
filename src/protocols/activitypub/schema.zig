@@ -268,8 +268,17 @@ pub const collection_items_migration: Migration = .{
     .down = "DROP TABLE ap_collection_items;",
 };
 
+// AP-10: per-user actor type (Person / Service / Organization / Group).
+pub const actor_type_migration: Migration = .{
+    .id = 1016,
+    .name = "activitypub:actor-type",
+    .up = "ALTER TABLE ap_users ADD COLUMN actor_type TEXT NOT NULL DEFAULT 'Person';",
+    .down = null,
+};
+
 pub const all_migrations = [_]Migration{
     users_migration,
+    actor_type_migration,
     actor_keys_migration,
     remote_actors_migration,
     federation_outbox_migration,

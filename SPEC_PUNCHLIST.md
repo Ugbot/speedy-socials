@@ -39,10 +39,6 @@ AT-18b, AT-20, AT-21, AT-22, AT-25; INFRA-1/2/3/5; DUAL-2 (==AP-27).
 
 **PARTIAL** (exists but one specific piece missing — fix noted inline
 at the ticket):
-- AP-10 — `actor_type` emitted in actor doc but not persisted to
-  `ap_users` (no column).
-- AP-11 / AP-14 — featured/liked routes return correct `totalItems`
-  count but emit no items (route never calls `writePage`).
 - AP-15 — `ap_actor_extra_keys` table exists but is never emitted in
   the actor doc nor consulted during verification.
 - DUAL-4 — AP-side discovery done (2026-06-15): WebFinger emits the
@@ -462,14 +458,14 @@ seams.
       Defaults stay cavage for compatibility. Test: round-trip our
       own outbound through `sig.parseRfc9421` + `sig.verify`.
 
-- [~] **AP-10. Actor types beyond Person.**
+- [x] **AP-10. Actor types beyond Person.**
       **Effort: S.** *Touches: `actor.zig`, schema.*
       Acceptance: `actor.zig:40` honours a per-user `actor_type`
       column (`Person` / `Service` / `Organization` / `Group`).
       Groups need at least skeleton Add/Remove (FEP-1b12) — out of
       scope here; this ticket is just the type field.
 
-- [~] **AP-11. Featured collection contents.**
+- [x] **AP-11. Featured collection contents.**
       **Effort: XS.** *Depends: AP-8 (for population path).*
       Acceptance: pinned posts table (`ap_featured_posts`);
       `/users/:u/collections/featured` returns an OrderedCollection
@@ -488,7 +484,7 @@ seams.
       reaction is surfaced on the target. Mastodon doesn't emit
       these but Pleroma/Misskey do.
 
-- [~] **AP-14. Likes collection (FEP-c648).**
+- [x] **AP-14. Likes collection (FEP-c648).**
       **Effort: S.** *Touches: `actor.zig` (URL) + new route.*
       Acceptance: `liked` URL on the actor; `GET /users/:u/liked`
       returns OrderedCollection of Like activities created by the

@@ -138,9 +138,14 @@ const LocalUser = struct {
     indexable: bool = true,
     pem_buf: [keys.max_pem_bytes]u8 = undefined,
     pem_len: usize = 0,
+    actor_type_buf: [16]u8 = undefined,
+    actor_type_len: usize = 0,
 
     fn username(self: *const LocalUser) []const u8 {
         return self.username_buf[0..self.username_len];
+    }
+    fn actorType(self: *const LocalUser) []const u8 {
+        return self.actor_type_buf[0..self.actor_type_len];
     }
     fn displayName(self: *const LocalUser) []const u8 {
         return self.display_buf[0..self.display_len];
@@ -158,7 +163,7 @@ fn loadUser(db: *c.sqlite3, username: []const u8) ?LocalUser {
     const sql =
         \\SELECT u.id, u.username, COALESCE(u.display_name,''), COALESCE(u.bio,''),
         \\       u.is_locked, u.discoverable, u.indexable,
-        \\       COALESCE(k.public_pem, '')
+        \\       COALESCE(k.public_pem, ''), COALESCE(u.actor_type, 'Person')
         \\FROM ap_users u
         \\LEFT JOIN ap_actor_keys k ON k.actor_id = u.id
         \\WHERE u.username = ?
@@ -180,6 +185,7 @@ fn loadUser(db: *c.sqlite3, username: []const u8) ?LocalUser {
     u.discoverable = c.sqlite3_column_int(stmt, 5) != 0;
     u.indexable = c.sqlite3_column_int(stmt, 6) != 0;
     copyTextCol(stmt.?, 7, &u.pem_buf, &u.pem_len);
+    copyTextCol(stmt.?, 8, &u.actor_type_buf, &u.actor_type_len);
     return u;
 }
 
@@ -394,6 +400,8 @@ fn handleUserActor(hc: *HandlerContext) anyerror!void {
         .manually_approves_followers = user.is_locked,
         .discoverable = user.discoverable,
         .indexable = user.indexable,
+        // AP-10: honour the per-user actor type (defaults to Person).
+        .actor_type = actor_mod.ActorType.parse(user.actorType()) orelse .person,
     }, &body) catch return writeJson(hc, .internal, "{\"error\":\"actor buf\"}");
     try writeJsonLd(hc, .ok, out);
 }
@@ -1396,4 +1404,29 @@ test "AP-6: applyUndoByIri on unknown IRI is a no-op" {
     defer sqlite_mod.closeDb(db);
     try @import("schema.zig").applyAllForTests(db);
     try applyUndoByIri(db, "https://nowhere/x");
+}
+
+test "AP-10: actor_type persists and renders" {
+    const sqlite_mod = core.storage.sqlite;
+    const db = try sqlite_mod.openWriter(":memory:");
+    defer sqlite_mod.closeDb(db);
+    try @import("schema.zig").applyAllForTests(db);
+    var em: [*c]u8 = null;
+    _ = c.sqlite3_exec(db,
+        "INSERT INTO ap_users(username, display_name, bio, is_locked, discoverable, indexable, created_at, actor_type) " ++
+        "VALUES ('svc','Service Bot','',0,1,1,0,'Service')",
+        null, null, &em);
+    if (em != null) c.sqlite3_free(em);
+
+    const u = loadUser(db, "svc") orelse return error.TestUserMissing;
+    try testing.expectEqualStrings("Service", u.actorType());
+
+    var body: [4096]u8 = undefined;
+    const out = try actor_mod.writePerson(.{
+        .hostname = "example.com",
+        .username = u.username(),
+        .public_key_pem = "",
+        .actor_type = actor_mod.ActorType.parse(u.actorType()) orelse .person,
+    }, &body);
+    try testing.expect(std.mem.indexOf(u8, out, "\"type\":\"Service\"") != null);
 }
