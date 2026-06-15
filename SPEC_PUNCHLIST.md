@@ -51,8 +51,6 @@ at the ticket):
   no `atp_crawl_subscriptions` table; no boot-time announce.
 - AT-4 — validates record shape; no canonical DAG-CBOR re-encode, so
   CIDs are not reproducible cross-impl.
-- AT-19 — `submitPlcOperation` returns `{}` without POSTing to the PLC
-  directory.
 - DUAL-4 — identity-map lookups work; WebFinger lacks the at-uri rel
   link and the AP actor doc lacks `alsoKnownAs`.
 
@@ -720,7 +718,7 @@ seams.
       Acceptance: `_atproto.<handle>` DNS TXT lookup as fallback
       to the HTTPS well-known path.
 
-- [~] **AT-19. PLC operations.**
+- [x] **AT-19. PLC operations.**
       **Effort: L.** *Touches: new PLC client, `signPlcOperation`,
       `submitPlcOperation`, `requestPlcOperationSignature`,
       `getRecommendedDidCredentials`.*
