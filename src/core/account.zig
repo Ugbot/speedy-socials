@@ -287,6 +287,21 @@ pub fn resetGlobal() void {
 }
 
 // ──────────────────────────────────────────────────────────────────────
+// SqliteBackend — durable account store (AT-8/9/10/11). The production
+// default. Implemented in the sibling `account_sqlite.zig` to keep this
+// module readable; re-exported here so callers say
+// `core.account.SqliteBackend` / `core.account.sqlite_migration`.
+// ──────────────────────────────────────────────────────────────────────
+
+pub const SqliteBackend = @import("account_sqlite.zig").SqliteBackend;
+pub const sqlite_migration = @import("account_sqlite.zig").sqlite_migration;
+
+test {
+    // Pull the sibling's tests into the core test binary.
+    _ = @import("account_sqlite.zig");
+}
+
+// ──────────────────────────────────────────────────────────────────────
 // Token helpers — shared between backends.
 // ──────────────────────────────────────────────────────────────────────
 

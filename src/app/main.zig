@@ -307,15 +307,29 @@ pub fn main() !void {
 
     // INFRA-1/2/3/5: wire pluggable backends with safe defaults.
     // Operators swap these out via env at boot.
-    //   * Account store: in-memory by default; SQLite-backed impl
-    //     lands in a follow-up tranche. The in-memory shape supports
-    //     full AT-8..AT-11 lifecycles for dev / test deployments.
+    //   * Account store: SQLite-backed by DEFAULT (AT-8..AT-11 are
+    //     durable — accounts survive restart). `ACCOUNT_BACKEND=memory`
+    //     selects the ephemeral in-process backend for tests / throwaway
+    //     dev nodes.
     //   * Email sender: LogSink by default; flip to webhook when
     //     `EMAIL_WEBHOOK_URL` is set.
     //   * Blob store: FsStore rooted at `MEDIA_ROOT` (existing var).
     //   * Secrets: FileStore rooted at `SECRETS_DIR` if set.
     var account_backend_mem = core.account.MemoryBackend.init();
-    core.account.setGlobal(account_backend_mem.backend());
+    var account_backend_sqlite = core.account.SqliteBackend.init(db);
+    const use_memory_accounts = blk: {
+        if (std.c.getenv("ACCOUNT_BACKEND")) |envp| {
+            break :blk std.mem.eql(u8, std.mem.sliceTo(envp, 0), "memory");
+        }
+        break :blk false;
+    };
+    if (use_memory_accounts) {
+        core.account.setGlobal(account_backend_mem.backend());
+        log_ptr.warn("boot", "account backend: in-memory (EPHEMERAL — accounts do NOT survive restart; ACCOUNT_BACKEND=memory)");
+    } else {
+        core.account.setGlobal(account_backend_sqlite.backend());
+        log_ptr.info("boot", "account backend: sqlite (durable)");
+    }
     defer core.account.resetGlobal();
 
     var email_log = core.email.LogSink.init();
@@ -349,6 +363,9 @@ pub fn main() !void {
     // DUAL-1: cross-protocol identity-map schema lives at core so
     // both AP and AT plugins can read/write it.
     try schema.register(core.dual_identity.migration);
+    // AT-8..11: durable account tables (atp_accounts / email tokens /
+    // app passwords / invites) backing `core.account.SqliteBackend`.
+    try schema.register(core.account.sqlite_migration);
     try registry.registerAllSchemas(&ctx, &schema);
     try schema.applyAll(db);
 
