@@ -125,6 +125,11 @@ pub const Claims = struct {
     /// for regular session tokens.
     aud_buf: [max_aud_bytes]u8 = undefined,
     aud_len: u16 = 0,
+    /// AT-1: DPoP confirmation thumbprint (RFC 7638 `jkt`, base64url).
+    /// When set, `sign` emits `"cnf":{"jkt":"…"}` binding the token to
+    /// the client's DPoP key. Empty for non-DPoP tokens.
+    cnf_jkt_buf: [64]u8 = undefined,
+    cnf_jkt_len: u8 = 0,
 
     pub fn sub(self: *const Claims) []const u8 {
         return self.sub_buf[0..self.sub_len];
@@ -134,6 +139,9 @@ pub const Claims = struct {
     }
     pub fn aud(self: *const Claims) []const u8 {
         return self.aud_buf[0..self.aud_len];
+    }
+    pub fn cnfJkt(self: *const Claims) []const u8 {
+        return self.cnf_jkt_buf[0..self.cnf_jkt_len];
     }
 
     pub fn setSub(self: *Claims, s: []const u8) AtpError!void {
@@ -153,6 +161,12 @@ pub const Claims = struct {
         @memcpy(self.aud_buf[0..s.len], s);
         self.aud_len = @intCast(s.len);
     }
+
+    pub fn setCnfJkt(self: *Claims, s: []const u8) AtpError!void {
+        if (s.len > self.cnf_jkt_buf.len) return error.BufferTooSmall;
+        @memcpy(self.cnf_jkt_buf[0..s.len], s);
+        self.cnf_jkt_len = @intCast(s.len);
+    }
 };
 
 // Header is fixed: {"alg":"EdDSA","typ":"JWT"} (base64url encoded).
@@ -166,21 +180,30 @@ pub fn sign(kp: keypair.Ed25519KeyPair, claims: Claims, out: []u8) AtpError![]co
     // Build payload JSON in a scratch buffer. `aud` is included
     // only when non-empty (AT-17 service-auth grants set it; regular
     // session tokens don't).
+    // Build the payload incrementally: mandatory fields, then optional
+    // `aud` (AT-17) and `cnf` (AT-1 DPoP binding), then close.
     var payload_buf: [768]u8 = undefined;
-    const aud_str = claims.aud();
     const payload_json = blk: {
-        if (aud_str.len > 0) {
-            break :blk std.fmt.bufPrint(
-                &payload_buf,
-                "{{\"sub\":\"{s}\",\"scope\":\"{s}\",\"iat\":{d},\"exp\":{d},\"jti\":\"{s}\",\"aud\":\"{s}\"}}",
-                .{ claims.sub(), claims.scope.str(), claims.iat, claims.exp, claims.jti(), aud_str },
-            ) catch return error.BufferTooSmall;
-        }
-        break :blk std.fmt.bufPrint(
+        const head = std.fmt.bufPrint(
             &payload_buf,
-            "{{\"sub\":\"{s}\",\"scope\":\"{s}\",\"iat\":{d},\"exp\":{d},\"jti\":\"{s}\"}}",
+            "{{\"sub\":\"{s}\",\"scope\":\"{s}\",\"iat\":{d},\"exp\":{d},\"jti\":\"{s}\"",
             .{ claims.sub(), claims.scope.str(), claims.iat, claims.exp, claims.jti() },
         ) catch return error.BufferTooSmall;
+        var plen = head.len;
+        const aud_str = claims.aud();
+        if (aud_str.len > 0) {
+            const a = std.fmt.bufPrint(payload_buf[plen..], ",\"aud\":\"{s}\"", .{aud_str}) catch return error.BufferTooSmall;
+            plen += a.len;
+        }
+        const cnf_str = claims.cnfJkt();
+        if (cnf_str.len > 0) {
+            const ccnf = std.fmt.bufPrint(payload_buf[plen..], ",\"cnf\":{{\"jkt\":\"{s}\"}}", .{cnf_str}) catch return error.BufferTooSmall;
+            plen += ccnf.len;
+        }
+        if (plen + 1 > payload_buf.len) return error.BufferTooSmall;
+        payload_buf[plen] = '}';
+        plen += 1;
+        break :blk payload_buf[0..plen];
     };
 
     var pos: usize = 0;

@@ -36,6 +36,10 @@ const oauth_dpop = @import("oauth_dpop.zig");
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const base64url = std.base64.url_safe_no_pad;
 
+/// AT-1: process-wide DPoP proof verifier. Holds the replay (`jti`)
+/// window across token requests. Single PDS instance per process.
+var dpop_verifier: oauth_dpop.Verifier = oauth_dpop.Verifier.init();
+
 // ──────────────────────────────────────────────────────────────────────
 // AS / RS metadata
 // ──────────────────────────────────────────────────────────────────────
@@ -233,18 +237,21 @@ fn token(hc: *HandlerContext) anyerror!void {
     const code_verifier = xrpc.jsonStringField(hc.request.body, "code_verifier") orelse
         return xrpc.writeError(hc, .bad_request, "invalid_request", "missing code_verifier");
 
-    // DPoP proof: header `DPoP` carries a JWT proving the client
-    // controls the key. We require the header to be present and
-    // shape-validate as a 3-segment JWT. Full crypto verification +
-    // `cnf.jkt` binding rides on the Verifier path in oauth_dpop;
-    // we extract the public-key thumbprint from the header `jwk`
-    // for the access-token `cnf` claim.
+    // AT-1: DPoP proof. The `DPoP` header carries a JWT signed by the
+    // client's key, with that key embedded in the proof header `jwk`.
+    // Verify the signature (EdDSA or ES256) + htm/htu/iat/replay, and
+    // derive the RFC 7638 `jkt` thumbprint for the token's `cnf` claim.
     const dpop_header = hc.request.header("DPoP") orelse
         return xrpc.writeError(hc, .bad_request, "invalid_dpop_proof", "missing DPoP header");
     if (std.mem.count(u8, dpop_header, ".") != 2) {
         return xrpc.writeError(hc, .bad_request, "invalid_dpop_proof", "DPoP must be a 3-segment JWT");
     }
-    _ = oauth_dpop; // crypto verification wired in a follow-up
+    var htu_buf: [320]u8 = undefined;
+    const htu = std.fmt.bufPrint(&htu_buf, "https://{s}/oauth/token", .{st.host}) catch
+        return xrpc.writeError(hc, .internal, "InternalError", "htu");
+    var jkt_buf: [64]u8 = undefined;
+    const jkt = dpop_verifier.verifyDpopHeader(dpop_header, "POST", htu, st.clock.wallUnix(), &jkt_buf) catch
+        return xrpc.writeError(hc, .bad_request, "invalid_dpop_proof", "DPoP proof verification failed");
 
     // Look up + consume the auth code.
     var sel: ?*c.sqlite3_stmt = null;
@@ -304,14 +311,8 @@ fn token(hc: *HandlerContext) anyerror!void {
     _ = c.sqlite3_step(del.?);
     _ = c.sqlite3_finalize(del);
 
-    // Thumbprint over the DPoP header JWT itself stands in for the
-    // RFC 7638 `jkt` until cnf-binding lands proper.
-    var jkt_buf: [44]u8 = undefined;
-    const jkt = computeJkt(dpop_header, &jkt_buf) catch
-        return xrpc.writeError(hc, .internal, "InternalError", "jkt");
-
-    // Mint access + refresh tokens. The access token's `aud` is the
-    // PDS host; the `cnf.jkt` ties it to the DPoP key.
+    // Mint access + refresh tokens, both DPoP-bound via `cnf.jkt`
+    // (the real RFC 7638 thumbprint derived from the verified proof).
     const now = st.clock.wallUnix();
     var access_jti: [16]u8 = undefined;
     fillJti(&access_jti, now, 5);
@@ -319,7 +320,7 @@ fn token(hc: *HandlerContext) anyerror!void {
     var ac: auth_mod.Claims = .{ .scope = .access, .iat = now, .exp = now + auth_mod.access_ttl_seconds };
     try ac.setSub(did);
     try ac.setJti(&access_jti);
-    try ac.setAud(jkt); // we smuggle the jkt via aud until Claims learns `cnf`
+    try ac.setCnfJkt(jkt);
 
     var ab: [auth_mod.max_jwt_bytes]u8 = undefined;
     const access = try auth_mod.sign(st.jwt_key, ac, &ab);
@@ -329,7 +330,7 @@ fn token(hc: *HandlerContext) anyerror!void {
     var rc: auth_mod.Claims = .{ .scope = .refresh, .iat = now, .exp = now + auth_mod.refresh_ttl_seconds };
     try rc.setSub(did);
     try rc.setJti(&rj);
-    try rc.setAud(jkt);
+    try rc.setCnfJkt(jkt);
     var rb: [auth_mod.max_jwt_bytes]u8 = undefined;
     const refresh = try auth_mod.sign(st.jwt_key, rc, &rb);
 
@@ -339,17 +340,6 @@ fn token(hc: *HandlerContext) anyerror!void {
         .{ access, auth_mod.access_ttl_seconds, refresh },
     ) catch return xrpc.writeError(hc, .internal, "InternalError", "fmt");
     try xrpc.writeJsonBody(hc, .ok, resp);
-}
-
-fn computeJkt(jwk: []const u8, out: []u8) ![]const u8 {
-    // RFC 7638 thumbprint: SHA-256 of the canonical JWK JSON.
-    // oauth_dpop emits the JWK in canonical form already.
-    if (out.len < 44) return error.BufferTooSmall;
-    var hash: [32]u8 = undefined;
-    Sha256.hash(jwk, &hash, .{});
-    const n = base64url.Encoder.calcSize(32);
-    _ = base64url.Encoder.encode(out[0..n], &hash);
-    return out[0..n];
 }
 
 fn fillJti(out: []u8, seed: i64, salt: u8) void {

@@ -9,10 +9,11 @@
 //!
 //! Current status:
 //!   * Ed25519 (alg=EdDSA) DPoP proofs: sign + verify implemented.
-//!   * ES256 (alg=ES256): returns `NotImplemented`.
-//!   * Client metadata fetch: function pointer stub — wired through
-//!     `core.workers.Pool` in production.
-//!   * JWK thumbprint validation: SHA-256 over canonical JWK JSON.
+//!   * ES256 (alg=ES256): sign + verify implemented.
+//!   * `verifyDpopHeader` parses the proof's own header `jwk`, verifies
+//!     against the embedded key (dispatching on `alg`), and returns the
+//!     RFC 7638 `jkt` for `cnf` binding.
+//!   * JWK thumbprint: SHA-256 over canonical JWK JSON (Ed25519 + EC).
 //!   * Replay window: `seen_jti` ring; rejects any jti seen in the
 //!     last `max_seen_jti` proofs.
 
@@ -113,6 +114,71 @@ pub const Verifier = struct {
         self.seen_lens[slot] = cap;
         self.write_idx +%= 1;
     }
+
+    /// Replay guard usable by callers that verified signature/claims via
+    /// a path that doesn't bundle replay (e.g. `verifyProofEs256`).
+    pub fn checkReplay(self: *Verifier, jti: []const u8) ProofError!void {
+        if (self.seenJti(jti)) return error.Replayed;
+        self.rememberJti(jti);
+    }
+
+    /// AT-1: verify a DPoP proof whose public key is embedded in the
+    /// proof's own header `jwk` (the real wire shape), dispatching on
+    /// `alg` (EdDSA or ES256). On success writes the RFC 7638 `jkt`
+    /// thumbprint (base64url) into `out_jkt` and returns that slice —
+    /// the caller binds it into the access token's `cnf.jkt`.
+    pub fn verifyDpopHeader(
+        self: *Verifier,
+        proof_jwt: []const u8,
+        expected_htm: []const u8,
+        expected_htu: []const u8,
+        now_unix: i64,
+        out_jkt: []u8,
+    ) ProofError![]const u8 {
+        const dot1 = std.mem.indexOfScalar(u8, proof_jwt, '.') orelse return error.Malformed;
+        var header_dec: [512]u8 = undefined;
+        const hn = b64UrlDecode(proof_jwt[0..dot1], &header_dec) catch return error.Malformed;
+        const header = header_dec[0..hn];
+        const alg = extractString(header, "alg") catch return error.BadClaims;
+
+        var jkt_raw: [32]u8 = undefined;
+        if (std.mem.eql(u8, alg, "EdDSA")) {
+            const x = extractString(header, "x") catch return error.BadClaims;
+            var pk: [keypair.ed25519_public_len]u8 = undefined;
+            const xn = b64UrlDecode(x, &pk) catch return error.Malformed;
+            if (xn != keypair.ed25519_public_len) return error.Malformed;
+            // verifyProof bundles the replay check for the EdDSA path.
+            try self.verifyProof(proof_jwt, pk, expected_htm, expected_htu, now_unix);
+            jkt_raw = jwkThumbprintEd25519(pk);
+        } else if (std.mem.eql(u8, alg, "ES256")) {
+            const x = extractString(header, "x") catch return error.BadClaims;
+            const y = extractString(header, "y") catch return error.BadClaims;
+            var xb: [32]u8 = undefined;
+            var yb: [32]u8 = undefined;
+            if ((b64UrlDecode(x, &xb) catch return error.Malformed) != 32) return error.Malformed;
+            if ((b64UrlDecode(y, &yb) catch return error.Malformed) != 32) return error.Malformed;
+            var uncompressed: [65]u8 = undefined;
+            uncompressed[0] = 0x04;
+            @memcpy(uncompressed[1..33], &xb);
+            @memcpy(uncompressed[33..65], &yb);
+            const pk = Ecdsa256.PublicKey.fromSec1(&uncompressed) catch return error.Malformed;
+            try verifyProofEs256(proof_jwt, pk.toCompressedSec1(), expected_htm, expected_htu, now_unix);
+            // ES256 verify doesn't bundle replay — enforce it here.
+            const rest = proof_jwt[dot1 + 1 ..];
+            const dot2_rel = std.mem.indexOfScalar(u8, rest, '.') orelse return error.Malformed;
+            var pdec: [1024]u8 = undefined;
+            const pn = b64UrlDecode(rest[0..dot2_rel], &pdec) catch return error.Malformed;
+            const jti = extractString(pdec[0..pn], "jti") catch return error.BadClaims;
+            try self.checkReplay(jti);
+            jkt_raw = jwkThumbprintEs256(xb, yb);
+        } else {
+            return error.NotImplemented;
+        }
+
+        if (out_jkt.len < 43) return error.BadClaims;
+        const n = b64UrlEncodeShim(&jkt_raw, out_jkt);
+        return out_jkt[0..n];
+    }
 };
 
 fn extractString(body: []const u8, key: []const u8) ![]const u8 {
@@ -194,6 +260,21 @@ pub fn jwkThumbprintEd25519(public_key: [keypair.ed25519_public_len]u8) [32]u8 {
     return hash;
 }
 
+/// JWK thumbprint (RFC 7638) for a P-256 (ES256) public key. Canonical
+/// JWK is `{"crv":"P-256","kty":"EC","x":"<b64url>","y":"<b64url>"}`
+/// (members in lexicographic order, no whitespace).
+pub fn jwkThumbprintEs256(x: [32]u8, y: [32]u8) [32]u8 {
+    var x_b64: [44]u8 = undefined;
+    var y_b64: [44]u8 = undefined;
+    const xn = b64UrlEncodeShim(&x, &x_b64);
+    const yn = b64UrlEncodeShim(&y, &y_b64);
+    var canon: [256]u8 = undefined;
+    const s = std.fmt.bufPrint(&canon, "{{\"crv\":\"P-256\",\"kty\":\"EC\",\"x\":\"{s}\",\"y\":\"{s}\"}}", .{ x_b64[0..xn], y_b64[0..yn] }) catch unreachable;
+    var hash: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(s, &hash, .{});
+    return hash;
+}
+
 fn b64UrlEncodeShim(src: []const u8, dst: []u8) usize {
     const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     var i: usize = 0;
@@ -236,11 +317,16 @@ pub fn signProof(
 ) AtpError![]const u8 {
     if (out.len < auth.max_jwt_bytes) return error.BufferTooSmall;
 
-    // Header for DPoP includes the JWK; for simplicity here we use a
-    // fixed pre-encoded header that omits the JWK. Production DPoP
-    // requires the JWK in the header; that lands when ES256 + full
-    // metadata fetch is implemented.
-    const header_b64 = "eyJhbGciOiJFZERTQSIsInR5cCI6ImRwb3Atand0In0";
+    // RFC 9449 header carries the proof key as a JWK so the verifier
+    // can recover it. Ed25519 → OKP/Ed25519.
+    var x_b64: [44]u8 = undefined;
+    const xn = b64UrlEncodeShim(&kp.public_key, &x_b64);
+    var header_buf: [256]u8 = undefined;
+    const header_json = std.fmt.bufPrint(
+        &header_buf,
+        "{{\"alg\":\"EdDSA\",\"typ\":\"dpop+jwt\",\"jwk\":{{\"crv\":\"Ed25519\",\"kty\":\"OKP\",\"x\":\"{s}\"}}}}",
+        .{x_b64[0..xn]},
+    ) catch return error.BufferTooSmall;
 
     var payload_buf: [512]u8 = undefined;
     const payload_json = std.fmt.bufPrint(
@@ -250,8 +336,7 @@ pub fn signProof(
     ) catch return error.BufferTooSmall;
 
     var pos: usize = 0;
-    @memcpy(out[pos..][0..header_b64.len], header_b64);
-    pos += header_b64.len;
+    pos += b64UrlEncodeShim(header_json, out[pos..]);
     out[pos] = '.';
     pos += 1;
     pos += b64UrlEncodeShim(payload_json, out[pos..]);
@@ -453,6 +538,62 @@ test "dpop: es256 rejects tampered signature" {
     @memcpy(copy[0..proof.len], proof);
     copy[proof.len - 1] = if (copy[proof.len - 1] == 'A') 'B' else 'A';
     try testing.expectError(error.BadSignature, verifyProofEs256(copy[0..proof.len], compressed, "POST", "https://pds.test/oauth/token", 2005));
+}
+
+test "AT-1: verifyDpopHeader recovers EdDSA key from header jwk + derives jkt" {
+    var seed: [32]u8 = undefined;
+    @memset(&seed, 0x31);
+    const kp = keypair.Ed25519KeyPair.fromSeed(seed);
+    var buf: [auth.max_jwt_bytes]u8 = undefined;
+    const proof = try signProof(kp, "POST", "https://pds.test/oauth/token", 3000, "at1-ed", &buf);
+
+    var v = Verifier.init();
+    var jkt_buf: [64]u8 = undefined;
+    const jkt = try v.verifyDpopHeader(proof, "POST", "https://pds.test/oauth/token", 3005, &jkt_buf);
+
+    // The returned jkt must equal the canonical Ed25519 thumbprint.
+    var expect_b64: [44]u8 = undefined;
+    const raw = jwkThumbprintEd25519(kp.public_key);
+    const en = b64UrlEncodeShim(&raw, &expect_b64);
+    try testing.expectEqualStrings(expect_b64[0..en], jkt);
+
+    // Replay of the same proof is rejected.
+    try testing.expectError(error.Replayed, v.verifyDpopHeader(proof, "POST", "https://pds.test/oauth/token", 3006, &jkt_buf));
+}
+
+test "AT-1: verifyDpopHeader verifies ES256 proof + derives jkt" {
+    var seed: [Ecdsa256.KeyPair.seed_length]u8 = undefined;
+    @memset(&seed, 0x57);
+    const kp = try Ecdsa256.KeyPair.generateDeterministic(seed);
+    const compressed = kp.public_key.toCompressedSec1();
+    var buf: [auth.max_jwt_bytes]u8 = undefined;
+    const proof = try signProofEs256(kp.secret_key.toBytes(), compressed, "POST", "https://pds.test/oauth/token", 4000, "at1-es", &buf);
+
+    var v = Verifier.init();
+    var jkt_buf: [64]u8 = undefined;
+    const jkt = try v.verifyDpopHeader(proof, "POST", "https://pds.test/oauth/token", 4005, &jkt_buf);
+
+    // Compare against the canonical EC thumbprint computed from (x,y).
+    const uncompressed = kp.public_key.toUncompressedSec1();
+    var xb: [32]u8 = undefined;
+    var yb: [32]u8 = undefined;
+    @memcpy(&xb, uncompressed[1..33]);
+    @memcpy(&yb, uncompressed[33..65]);
+    var expect_b64: [44]u8 = undefined;
+    const raw = jwkThumbprintEs256(xb, yb);
+    const en = b64UrlEncodeShim(&raw, &expect_b64);
+    try testing.expectEqualStrings(expect_b64[0..en], jkt);
+}
+
+test "AT-1: verifyDpopHeader rejects htu mismatch" {
+    var seed: [32]u8 = undefined;
+    @memset(&seed, 0x32);
+    const kp = keypair.Ed25519KeyPair.fromSeed(seed);
+    var buf: [auth.max_jwt_bytes]u8 = undefined;
+    const proof = try signProof(kp, "POST", "https://pds.test/oauth/token", 3000, "at1-bad-htu", &buf);
+    var v = Verifier.init();
+    var jkt_buf: [64]u8 = undefined;
+    try testing.expectError(error.BadClaims, v.verifyDpopHeader(proof, "POST", "https://evil.test/oauth/token", 3005, &jkt_buf));
 }
 
 test "dpop: jwk thumbprint stable for same key" {
