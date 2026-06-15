@@ -522,7 +522,7 @@ seams.
       activities, signature schemes, FEP support, known
       incompatibilities. Linked from README + NodeInfo metadata.
 
-- [ ] **AP-20. Replay-window nonce cache.**
+- [x] **AP-20. Replay-window nonce cache.**
       **Effort: XS.** *Pairs with AP-5; new tiny LRU.*
       Acceptance: a bounded cache of `(keyId, signature_b64)` keeps
       the last N minutes of accepted signatures; identical
@@ -568,7 +568,7 @@ seams.
       Acceptance: `resource=https://<host>/users/<u>` resolves to
       the same record as `acct:u@host`.
 
-- [ ] **AP-29. C2S authentication contract.**
+- [x] **AP-29. C2S authentication contract.**
       **Effort: M.** *Coupled to AP-1.*
 
 - [x] **AP-30. 410 Gone for own deleted activities.**
