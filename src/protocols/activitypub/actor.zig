@@ -56,6 +56,10 @@ pub const Config = struct {
     indexable: bool = true,
     /// AP-10: per-actor type. Default `Person`.
     actor_type: ActorType = .person,
+    /// AP-15: the actor's Ed25519 key as a multibase string
+    /// (`z6Mk…` — base58btc of multicodec-prefixed key). When set, the
+    /// actor advertises an `assertionMethod` Multikey (FEP-d36d).
+    assertion_multibase: []const u8 = "",
 };
 
 pub fn writePerson(cfg: Config, out: []u8) WriteError![]const u8 {
@@ -115,7 +119,17 @@ pub fn writePerson(cfg: Config, out: []u8) WriteError![]const u8 {
         .{ cfg.hostname, cfg.username, cfg.hostname, cfg.username });
     // PEM contains newlines — JSON-escape them to `\n`.
     w += try escapePem(out[w..], cfg.public_key_pem);
-    w += try copy(out[w..], "\"}}");
+    w += try copy(out[w..], "\"}"); // close publicKeyPem string + publicKey object
+    // AP-15: advertise the signing key as a Multikey assertionMethod
+    // (FEP-d36d) so verifiers that prefer Multikey can find it.
+    if (cfg.assertion_multibase.len > 0) {
+        w += try fmtInto(out[w..],
+            ",\"assertionMethod\":[{{\"id\":\"https://{s}/users/{s}#main-key\"," ++
+            "\"type\":\"Multikey\",\"controller\":\"https://{s}/users/{s}\"," ++
+            "\"publicKeyMultibase\":\"{s}\"}}]",
+            .{ cfg.hostname, cfg.username, cfg.hostname, cfg.username, cfg.assertion_multibase });
+    }
+    w += try copy(out[w..], "}"); // close actor object
     return out[0..w];
 }
 

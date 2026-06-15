@@ -390,6 +390,11 @@ fn handleUserActor(hc: *HandlerContext) anyerror!void {
         return writeHtml(hc, .ok, html);
     }
 
+    // AP-15: derive the Ed25519 key's multibase (z6Mk…) from the PEM so
+    // the actor advertises a Multikey assertionMethod (FEP-d36d).
+    var mb_buf: [80]u8 = undefined;
+    const assertion_mb = actorKeyMultibase(user.pem(), &mb_buf) orelse "";
+
     var body: [max_response_bytes]u8 = undefined;
     const out = actor_mod.writePerson(.{
         .hostname = st.hostname(),
@@ -402,6 +407,7 @@ fn handleUserActor(hc: *HandlerContext) anyerror!void {
         .indexable = user.indexable,
         // AP-10: honour the per-user actor type (defaults to Person).
         .actor_type = actor_mod.ActorType.parse(user.actorType()) orelse .person,
+        .assertion_multibase = assertion_mb,
     }, &body) catch return writeJson(hc, .internal, "{\"error\":\"actor buf\"}");
     try writeJsonLd(hc, .ok, out);
 }
@@ -1115,6 +1121,24 @@ fn preparePageStmt(
     return stmt;
 }
 
+/// AP-15: encode an Ed25519 public-key PEM as a `publicKeyMultibase`
+/// string (`z` + base58btc(multicodec-0xed01 ‖ raw32)). Returns null for
+/// a missing / non-Ed25519 / unparseable key.
+fn actorKeyMultibase(pem: []const u8, out: []u8) ?[]const u8 {
+    if (pem.len == 0) return null;
+    const kid = keys.KeyId.fromSlice("k") catch return null;
+    const pk = keys.parsePublicKeyPem(pem, kid) catch return null;
+    if (pk.algo != .ed25519) return null;
+    var mc: [34]u8 = undefined;
+    mc[0] = 0xed;
+    mc[1] = 0x01;
+    mc[2..34].* = pk.ed25519Bytes();
+    if (out.len < 1) return null;
+    out[0] = 'z';
+    const n = core.crypto.multibase.base58btcEncode(&mc, out[1..]) catch return null;
+    return out[0 .. 1 + n];
+}
+
 fn renderCollection(hc: *HandlerContext, kind: collections.CollectionKind) !void {
     const st = state_mod.get();
     const username = hc.params.get("u") orelse return writeJson(hc, .bad_request, "{\"error\":\"missing user\"}");
@@ -1463,4 +1487,27 @@ test "AP-10: actor_type persists and renders" {
         .actor_type = actor_mod.ActorType.parse(u.actorType()) orelse .person,
     }, &body);
     try testing.expect(std.mem.indexOf(u8, out, "\"type\":\"Service\"") != null);
+}
+
+test "AP-15: actor advertises a Multikey assertionMethod (FEP-d36d)" {
+    const kid = try keys.KeyId.fromSlice("https://h/users/alice#main-key");
+    const pair = try keys.generateEd25519FromSeed(kid, keys.testSeed(1));
+    var pem_buf: [256]u8 = undefined;
+    const pem_len = try keys.writeEd25519PublicPem(pair.public.ed25519Bytes(), &pem_buf);
+    const pem = pem_buf[0..pem_len];
+
+    var mb_buf: [80]u8 = undefined;
+    const mb = actorKeyMultibase(pem, &mb_buf) orelse return error.NoMultibase;
+    try testing.expect(mb[0] == 'z');
+
+    var body: [max_response_bytes]u8 = undefined;
+    const out = try actor_mod.writePerson(.{
+        .hostname = "h",
+        .username = "alice",
+        .public_key_pem = pem,
+        .assertion_multibase = mb,
+    }, &body);
+    try testing.expect(std.mem.indexOf(u8, out, "\"assertionMethod\":[") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "\"type\":\"Multikey\"") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "\"publicKeyMultibase\":\"z") != null);
 }
