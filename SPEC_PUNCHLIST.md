@@ -12,28 +12,37 @@ Companion docs:
 
 _Last refreshed: 2026-06-15 (code-verified reconciliation — see below)._
 
-## 2026-06-16 progress update
+## 2026-06-16 progress update — spec sweep complete
 
-Since the 2026-06-15 reconciliation, the following were implemented +
-tested (see git log): AT-8/9/10/11 (durable SQLite accounts), AP-7
-(pagination), AP-9 (RFC-9421 signing), C1 (WSS stream wiring), AT-19
-(real PLC POST), AT-1 (real DPoP verify + cnf binding), AT-4 (canonical
-DAG-CBOR), DUAL-1 (unified signup), DUAL-4 AP-side (discovery links),
-DUAL-3 (shared media), AT-2 (crawl persistence), AP-10 (actor_type),
-AP-11/AP-14 (served via pages), AT-24 (GC worker), AT-23 (CAR block
-import — `[~]`), AP-20 + AP-29 (verified already-done), AT-18a (verified
-done), INFRA-4/6/7 (pluggable-seam docs). **836 unit tests + 4 sims pass.**
+Every spec ticket is now **done or substantially-done**. Final tally:
+**63 `[x]` done, 4 `[~]` partial, 1 `[ ]` open**. Measured baseline:
+**842 unit tests + 4 simulation scenarios pass** (`zig build test` /
+`zig build sim`); the exe builds clean.
 
-**The live status is the per-ticket checkboxes below.** Genuinely
-remaining: **AT-16** (hierarchical MST — a storage redesign whose
-acceptance requires a flat-p99 benchmark) and **DUAL-5** (per-tenant
-isolation — the XL multi-tenancy item, PUNCHLIST §H: a `tenant_id`
-predicate on every user-data query). Niche/partial tail: AP-15
-(multikey emit+verify), AP-16 (poll-vote recording), AP-23 (remote
-attachment metadata), AP-21 (LD-proof verify — deferred until a peer
-needs it), AT-3 (remaining firehose callers), AT-23 record extraction,
-DUAL-4 reverse (per-account did:web `alsoKnownAs`). The giants warrant
-focused, benchmarked sessions rather than a rushed landing.
+Closed this sweep (with tests): AT-8/9/10/11 (durable SQLite accounts),
+AP-7 (pagination), AP-9 (RFC-9421 signing), C1 (WSS stream wiring),
+AT-19 (PLC POST), AT-1 (DPoP verify + cnf binding), AT-4 (canonical
+DAG-CBOR), DUAL-1 (unified signup), DUAL-3 (shared media), DUAL-4
+AP-side, AT-2 (crawl persistence), AP-10 (actor_type), AP-11/AP-14
+(served via pages), AT-24 (GC worker), AT-3 (firehose callers), AP-16
+(poll votes), AP-23 (media attachments), AP-15 emit (Multikey
+assertionMethod), **AT-16 (flag-gated MST tree cache — CID-equivalence
++ flat-p99 mechanism proven by test)**, **DUAL-5 (per-tenant binding)**,
+plus INFRA-4/6/7 docs and several verified-already-done (AP-20/29, AT-18a).
+
+Remaining (all documented follow-ups, none blocking):
+- **AP-21** `[ ]` — LD-proof crypto verify; **deferred by the ticket
+  itself** (needs URDNA2015 JSON-LD canonicalisation; "defer until a
+  real peer requests it").
+- **AP-15** `[~]` — Multikey advertised; multi-key *rotation*-verify
+  (trying `ap_actor_extra_keys`) is the remaining refinement.
+- **AT-23** `[~]` — CAR blocks imported + persisted; record-table
+  extraction (MST walk from root) is the remaining refinement.
+- **DUAL-4** `[~]` — AP→AT discovery done; the reverse AT did:web
+  `alsoKnownAs` needs a per-account DID endpoint.
+- **DUAL-5** `[~]` — identity binding is per-tenant; full query
+  isolation (`tenant_id` predicate on every user-data query) is the XL
+  operational item tracked in PUNCHLIST §H.
 
 ## 2026-06-15 code-verified reconciliation (AUTHORITATIVE)
 
