@@ -805,7 +805,7 @@ seams.
       `at://` URI; atproto DID document `alsoKnownAs` includes
       both `at://<handle>` and the AP actor IRI.
 
-- [ ] **DUAL-5. Per-tenant identity isolation.**
+- [~] **DUAL-5. Per-tenant identity isolation.**
       **Effort: XL.** *Tied to PUNCHLIST H.*
       Acceptance: when multi-tenancy lands, the AP↔AT identity
       binding is per-tenant.

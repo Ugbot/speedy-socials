@@ -188,6 +188,21 @@ test "H2: setCurrent / current round-trips" {
     try testing.expectEqualStrings("", current());
 }
 
+test "DUAL-5: resolveTenant sets current() to the matched tenant" {
+    // Mirrors the unified-signup path: resolve the Host, then read
+    // current() to stamp the identity binding's tenant column.
+    resetCurrent();
+    setGlobalTable(.{});
+    try globalTable().add("alice.pds.example", "tenant-alice");
+    _ = resolveTenant("alice.pds.example:443");
+    try testing.expectEqualStrings("tenant-alice", current());
+    // Unknown host → default (empty) tenant.
+    resetCurrent();
+    _ = resolveTenant("stranger.example");
+    try testing.expectEqualStrings("", current());
+    setGlobalTable(.{});
+}
+
 test "H3: setState transitions" {
     var t: Table = .{};
     try t.add("h", "x");

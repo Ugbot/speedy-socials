@@ -159,9 +159,14 @@ fn createAccount(hc: *HandlerContext) anyerror!void {
         // DUAL-1: bind the new account's AP actor IRI <→> AT DID in
         // the cross-protocol identity map so a single signup serves
         // both networks.
+        // DUAL-5: resolve the tenant from the request Host so the
+        // identity binding is recorded per-tenant. When no tenants are
+        // configured this is the empty (default) tenant — same as before.
+        _ = core.tenancy.resolveTenant(hc.request.header("Host") orelse "");
+        const tenant = core.tenancy.current();
         var ap_actor_buf: [320]u8 = undefined;
         if (std.fmt.bufPrint(&ap_actor_buf, "https://{s}/users/{s}", .{ st.host, handle })) |ap_actor| {
-            _ = core.dual_identity.bind(db, did, ap_actor, did, "", st.clock.wallUnix()) catch {};
+            _ = core.dual_identity.bind(db, did, ap_actor, did, tenant, st.clock.wallUnix()) catch {};
         } else |_| {}
         // DUAL-1: provision the matching AP actor so the bound IRI
         // actually resolves + can sign federation traffic.
