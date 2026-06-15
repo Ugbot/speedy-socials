@@ -118,6 +118,9 @@ pub const Activity = struct {
     /// AP-17: top-level tag entries captured for indexing. We pull
     /// up to `max_tags` mentions / hashtags from the `tag[]` array.
     tags: TagList = .{},
+    /// AP-23: media `attachment[]` from the inner object (url +
+    /// mediaType + alt text), so remote media can be rendered uniformly.
+    attachments: AttachmentList = .{},
 };
 
 pub const max_addressed: u8 = 16;
@@ -153,6 +156,28 @@ pub const TagList = struct {
     pub fn push(self: *TagList, t: Tag) void {
         if (self.len >= max_tags) return;
         self.items[self.len] = t;
+        self.len += 1;
+    }
+};
+
+pub const max_attachments: u8 = 8;
+
+pub const Attachment = struct {
+    url: []const u8 = &.{},
+    media_type: []const u8 = &.{},
+    name: []const u8 = &.{},
+};
+
+pub const AttachmentList = struct {
+    items: [max_attachments]Attachment = undefined,
+    len: u8 = 0,
+
+    pub fn slice(self: *const AttachmentList) []const Attachment {
+        return self.items[0..self.len];
+    }
+    pub fn push(self: *AttachmentList, a: Attachment) void {
+        if (self.len >= max_attachments) return;
+        self.items[self.len] = a;
         self.len += 1;
     }
 };
@@ -538,6 +563,9 @@ fn parseInlineObject(sc: *Scanner, out: *Activity) ApError!void {
             // AP-17: same shape as the top-level tag, but on the
             // inline object. Mastodon emits it here for Create{Note}.
             try parseTagList(sc, &out.tags);
+        } else if (std.mem.eql(u8, key, "attachment")) {
+            // AP-23: media attachments on the inline object.
+            try parseAttachmentList(sc, &out.attachments);
         } else {
             try skipValue(sc, 2);
         }
@@ -662,6 +690,84 @@ fn parseTagObject(sc: *Scanner) ApError!Tag {
             if (sc.peek() == '"') out.name = try parseString(sc) else try skipValue(sc, 2);
         } else if (std.mem.eql(u8, key, "href")) {
             if (sc.peek() == '"') out.href = try parseString(sc) else try skipValue(sc, 2);
+        } else {
+            try skipValue(sc, 2);
+        }
+        sc.skipWhitespace();
+        if (sc.peek() == ',') {
+            sc.advance();
+            continue;
+        }
+        if (sc.peek() == '}') {
+            sc.advance();
+            return out;
+        }
+        return error.BadObject;
+    }
+}
+
+fn parseAttachmentList(sc: *Scanner, list: *AttachmentList) ApError!void {
+    sc.skipWhitespace();
+    if (sc.peek() != '[') {
+        if (sc.peek() == '{') {
+            list.push(try parseAttachmentObject(sc));
+            return;
+        }
+        try skipValue(sc, 1);
+        return;
+    }
+    sc.advance();
+    var guard: u32 = 0;
+    while (true) {
+        guard += 1;
+        if (guard > 256) return error.BadObject;
+        sc.skipWhitespace();
+        if (sc.peek() == ']') {
+            sc.advance();
+            return;
+        }
+        if (sc.peek() == '{') {
+            list.push(try parseAttachmentObject(sc));
+        } else {
+            try skipValue(sc, 2);
+        }
+        sc.skipWhitespace();
+        if (sc.peek() == ',') {
+            sc.advance();
+            continue;
+        }
+        if (sc.peek() == ']') {
+            sc.advance();
+            return;
+        }
+        return error.BadObject;
+    }
+}
+
+fn parseAttachmentObject(sc: *Scanner) ApError!Attachment {
+    if (sc.peek() != '{') return error.BadObject;
+    sc.advance();
+    var out: Attachment = .{};
+    var guard: u32 = 0;
+    while (true) {
+        guard += 1;
+        if (guard > 64) return error.BadObject;
+        sc.skipWhitespace();
+        if (sc.peek() == '}') {
+            sc.advance();
+            return out;
+        }
+        const key = try parseString(sc);
+        sc.skipWhitespace();
+        if (sc.peek() != ':') return error.BadObject;
+        sc.advance();
+        sc.skipWhitespace();
+        if (std.mem.eql(u8, key, "url")) {
+            if (sc.peek() == '"') out.url = try parseString(sc) else try skipValue(sc, 2);
+        } else if (std.mem.eql(u8, key, "mediaType")) {
+            if (sc.peek() == '"') out.media_type = try parseString(sc) else try skipValue(sc, 2);
+        } else if (std.mem.eql(u8, key, "name")) {
+            if (sc.peek() == '"') out.name = try parseString(sc) else try skipValue(sc, 2);
         } else {
             try skipValue(sc, 2);
         }

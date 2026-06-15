@@ -563,7 +563,7 @@ seams.
       logged at WARN but accepted; unknown types we *emit* are
       restricted to the published vocabulary.
 
-- [ ] **AP-23. Attachment parsing into media plugin.**
+- [x] **AP-23. Attachment parsing into media plugin.**
       **Effort: M.** *Depends: INFRA-3 (blob store).*
       Acceptance: `attachment[]` from inbound Note creates rows in
       the shared blob store so the Mastodon API can render remote

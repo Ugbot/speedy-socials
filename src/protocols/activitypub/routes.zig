@@ -612,6 +612,9 @@ fn drainSideEffects(db: *c.sqlite3, st: *state_mod.State, raw_body: []const u8, 
             .record_poll_vote => |v| {
                 _ = recordPollVote(db, st.clock, v.activity_iri, v.question_iri, v.actor, v.option_name) catch {};
             },
+            .record_attachment => |a| {
+                _ = recordAttachment(db, a.object_iri, a.url, a.media_type, a.name) catch {};
+            },
             else => {},
         }
     }
@@ -628,6 +631,20 @@ fn recordPollVote(db: *c.sqlite3, clock: core.clock.Clock, activity_iri: []const
     _ = c.sqlite3_bind_text(stmt, 3, actor.ptr, @intCast(actor.len), c.sqliteTransientAsDestructor());
     _ = c.sqlite3_bind_text(stmt, 4, option_name.ptr, @intCast(option_name.len), c.sqliteTransientAsDestructor());
     _ = c.sqlite3_bind_int64(stmt, 5, clock.wallUnix());
+    _ = c.sqlite3_step(stmt.?);
+}
+
+// AP-23: record a media attachment for an inbound object (idempotent on
+// (object_iri, url)).
+fn recordAttachment(db: *c.sqlite3, object_iri: []const u8, url: []const u8, media_type: []const u8, name: []const u8) !void {
+    var stmt: ?*c.sqlite3_stmt = null;
+    const sql = "INSERT OR IGNORE INTO ap_attachments (object_iri, url, media_type, name) VALUES (?,?,?,?)";
+    if (c.sqlite3_prepare_v2(db, sql, -1, &stmt, null) != c.SQLITE_OK) return;
+    defer _ = c.sqlite3_finalize(stmt);
+    _ = c.sqlite3_bind_text(stmt, 1, object_iri.ptr, @intCast(object_iri.len), c.sqliteTransientAsDestructor());
+    _ = c.sqlite3_bind_text(stmt, 2, url.ptr, @intCast(url.len), c.sqliteTransientAsDestructor());
+    _ = c.sqlite3_bind_text(stmt, 3, media_type.ptr, @intCast(media_type.len), c.sqliteTransientAsDestructor());
+    _ = c.sqlite3_bind_text(stmt, 4, name.ptr, @intCast(name.len), c.sqliteTransientAsDestructor());
     _ = c.sqlite3_step(stmt.?);
 }
 

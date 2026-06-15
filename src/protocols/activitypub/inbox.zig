@@ -115,6 +115,8 @@ pub const SideEffect = union(enum) {
     /// AP-16: a poll vote — a Create{Note} with `name` (option) +
     /// `inReplyTo` (the Question IRI).
     record_poll_vote: struct { activity_iri: []const u8, question_iri: []const u8, actor: []const u8, option_name: []const u8 },
+    /// AP-23: a media attachment from the inbound object's `attachment[]`.
+    record_attachment: struct { object_iri: []const u8, url: []const u8, media_type: []const u8, name: []const u8 },
     /// Returned only when the state machine wants to drop the activity
     /// with no other effect (e.g., duplicate Like). Caller logs.
     drop_silently: struct { reason: []const u8 },
@@ -257,6 +259,18 @@ fn runCreate(env: *const Envelope, eff: *SideEffectBuffer) ApError!void {
                         .actor = env.activity.actor,
                         .option_name = env.activity.object_name,
                     } });
+                }
+                // AP-23: capture media attachments on the object.
+                var ai: u8 = 0;
+                while (ai < env.activity.attachments.len) : (ai += 1) {
+                    const att = env.activity.attachments.items[ai];
+                    if (att.url.len == 0) continue;
+                    eff.push(.{ .record_attachment = .{
+                        .object_iri = env.activity.object_id,
+                        .url = att.url,
+                        .media_type = att.media_type,
+                        .name = att.name,
+                    } }) catch break; // buffer full — bounded, drop the rest
                 }
                 s = .persist_activity;
             },
@@ -771,6 +785,30 @@ test "AP-16: Create{Note} with name + inReplyTo records a poll vote" {
             try std.testing.expectEqualStrings("https://q/poll/1", v.question_iri);
             try std.testing.expectEqualStrings("Option B", v.option_name);
             try std.testing.expectEqualStrings("https://a/voter", v.actor);
+            found = true;
+        },
+        else => {},
+    };
+    try std.testing.expect(found);
+}
+
+test "AP-23: Create{Note} with attachment[] records media attachments" {
+    var rng = Rng.init(3);
+    var sc = SimClock.init(0);
+    const act = try activity.parse(
+        \\{"id":"https://a/x/3","type":"Create","actor":"https://a/u",
+        \\ "object":{"id":"https://a/n/3","type":"Note","content":"pic",
+        \\  "attachment":[{"type":"Document","mediaType":"image/png","url":"https://a/media/1.png","name":"alt"}]}}
+    );
+    var env = buildEnvelope(act, false, sc.clock(), &rng);
+    var eff: SideEffectBuffer = .{};
+    try dispatch(&env, &eff);
+    var found = false;
+    for (eff.slice()) |e| switch (e) {
+        .record_attachment => |a| {
+            try std.testing.expectEqualStrings("https://a/n/3", a.object_iri);
+            try std.testing.expectEqualStrings("https://a/media/1.png", a.url);
+            try std.testing.expectEqualStrings("image/png", a.media_type);
             found = true;
         },
         else => {},

@@ -295,10 +295,28 @@ pub const poll_votes_migration: Migration = .{
     .down = "DROP TABLE ap_poll_votes;",
 };
 
+// AP-23: media attachments captured from inbound objects.
+pub const attachments_migration: Migration = .{
+    .id = 1018,
+    .name = "activitypub:attachments",
+    .up =
+    \\CREATE TABLE IF NOT EXISTS ap_attachments (
+    \\    object_iri TEXT NOT NULL,
+    \\    url        TEXT NOT NULL,
+    \\    media_type TEXT NOT NULL DEFAULT '',
+    \\    name       TEXT NOT NULL DEFAULT '',
+    \\    PRIMARY KEY (object_iri, url)
+    \\) STRICT;
+    \\CREATE INDEX IF NOT EXISTS ap_attachments_obj_idx ON ap_attachments (object_iri);
+    ,
+    .down = "DROP TABLE ap_attachments;",
+};
+
 pub const all_migrations = [_]Migration{
     users_migration,
     actor_type_migration,
     poll_votes_migration,
+    attachments_migration,
     actor_keys_migration,
     remote_actors_migration,
     federation_outbox_migration,
