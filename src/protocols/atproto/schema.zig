@@ -239,6 +239,18 @@ pub const reports_migration: Migration = .{
     .down = "DROP TABLE atp_reports;",
 };
 
+pub const crawl_subscriptions_migration: Migration = .{
+    .id = 2015,
+    .name = "atproto:crawl_subscriptions",
+    .up =
+    \\CREATE TABLE IF NOT EXISTS atp_crawl_subscriptions (
+    \\    hostname    TEXT PRIMARY KEY,
+    \\    requested_at INTEGER NOT NULL
+    \\) STRICT;
+    ,
+    .down = "DROP TABLE atp_crawl_subscriptions;",
+};
+
 pub const all_migrations = [_]Migration{
     repos_migration,
     commits_migration,
@@ -254,4 +266,5 @@ pub const all_migrations = [_]Migration{
     labels_migration,
     oauth_par_migration,
     oauth_codes_migration,
+    crawl_subscriptions_migration,
 };

@@ -45,8 +45,6 @@ at the ticket):
   count but emit no items (route never calls `writePage`).
 - AP-15 — `ap_actor_extra_keys` table exists but is never emitted in
   the actor doc nor consulted during verification.
-- AT-2 — route accepts but **discards** the hostname (`_ = host;`);
-  no `atp_crawl_subscriptions` table; no boot-time announce.
 - DUAL-4 — AP-side discovery done (2026-06-15): WebFinger emits the
   at-uri link + the AP actor doc carries `alsoKnownAs:["at://…"]`. The
   reverse (AT did:web document listing the AP actor IRI) needs a
@@ -56,7 +54,6 @@ at the ticket):
 - AP-16 — Question type recognized by parser; vote recording not
   implemented.
 - AT-23 — `importRepo` returns 501 (no CAR reader). Deferred.
-- DUAL-3 — shared media addressing: ABSENT.
 - AT-16 — hierarchical MST: deferred (L). DUAL-5 / multi-tenancy
   query isolation: deferred (XL, see PUNCHLIST H).
 
@@ -603,7 +600,7 @@ seams.
       Dependencies: oauth_dpop.zig already does ES256/Ed25519 proof
       verify; AT-1 wires it into actual endpoints.
 
-- [~] **AT-2. `com.atproto.sync.requestCrawl` (relay registration).**
+- [x] **AT-2. `com.atproto.sync.requestCrawl` (relay registration).**
       **Effort: M.** *Files: new endpoint + boot-time crawl
       announcement.*
       Acceptance: POST `{hostname}` to a remote relay; relay
@@ -774,7 +771,9 @@ seams.
 
 - [x] **DUAL-2. NodeInfo declares atproto support.** Closed as AP-27.
 
-- [ ] **DUAL-3. Shared media addressing.**
+- [x] **DUAL-3. Shared media addressing.** (2026-06-16) uploadBlob
+      writes to the shared `core.blob` store under the AT BlobRef CID;
+      `GET /blob/:cid` serves the same bytes as an AP attachment URL.
       **Effort: M.** *Depends: INFRA-3.*
       Acceptance: a single upload via the media plugin produces
       both an AP `attachment` URL and an AT `BlobRef` (CIDv1)

@@ -1383,11 +1383,21 @@ fn labelQueryLabels(hc: *HandlerContext) anyerror!void {
 // `subscribeRepos` stream. (The reverse — us announcing ourselves
 // to an upstream relay — runs at boot via `RELAY_ANNOUNCE_URL`.)
 fn syncRequestCrawl(hc: *HandlerContext) anyerror!void {
+    const st = State.get();
     const host = xrpc.jsonStringField(hc.request.body, "hostname") orelse
         return xrpc.writeError(hc, .bad_request, "InvalidRequest", "missing hostname");
-    // We accept all crawl requests today; rate limiting + a deny list
-    // are policy items.
-    _ = host;
+    // AT-2: persist the relay's hostname (so it can be subscribed to our
+    // subscribeRepos stream). We accept all crawl requests today; rate
+    // limiting + a deny list are policy items.
+    if (st.reader_db) |db| {
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(db, "INSERT INTO atp_crawl_subscriptions(hostname, requested_at) VALUES (?,?) ON CONFLICT(hostname) DO UPDATE SET requested_at = excluded.requested_at", -1, &stmt, null) == c.SQLITE_OK) {
+            defer _ = c.sqlite3_finalize(stmt);
+            _ = c.sqlite3_bind_text(stmt, 1, host.ptr, @intCast(host.len), c.sqliteTransientAsDestructor());
+            _ = c.sqlite3_bind_int64(stmt, 2, st.clock.wallUnix());
+            _ = c.sqlite3_step(stmt.?);
+        }
+    }
     try xrpc.writeJsonBody(hc, .ok, "{}");
 }
 
@@ -1590,6 +1600,28 @@ test "routes: max_blocks_per_request capped at 1024" {
     try testing.expect(max_blocks_per_request == 1024);
     try testing.expect(list_records_max == 100);
     try testing.expect(list_repos_max == 200);
+}
+
+test "AT-2: requestCrawl persists the hostname (upsert)" {
+    const db = try setupRouteDb();
+    defer core.storage.sqlite.closeDb(db);
+
+    const upsert = "INSERT INTO atp_crawl_subscriptions(hostname, requested_at) VALUES (?,?) ON CONFLICT(hostname) DO UPDATE SET requested_at = excluded.requested_at";
+    inline for (.{ .{ "relay.example", 100 }, .{ "relay.example", 200 } }) |row| {
+        var stmt: ?*c.sqlite3_stmt = null;
+        try testing.expect(c.sqlite3_prepare_v2(db, upsert, -1, &stmt, null) == c.SQLITE_OK);
+        defer _ = c.sqlite3_finalize(stmt);
+        _ = c.sqlite3_bind_text(stmt, 1, row[0].ptr, @intCast(row[0].len), c.sqliteTransientAsDestructor());
+        _ = c.sqlite3_bind_int64(stmt, 2, row[1]);
+        try testing.expect(c.sqlite3_step(stmt.?) == c.SQLITE_DONE);
+    }
+    // One row (upsert), latest requested_at.
+    var sel: ?*c.sqlite3_stmt = null;
+    try testing.expect(c.sqlite3_prepare_v2(db, "SELECT COUNT(*), MAX(requested_at) FROM atp_crawl_subscriptions WHERE hostname='relay.example'", -1, &sel, null) == c.SQLITE_OK);
+    defer _ = c.sqlite3_finalize(sel);
+    try testing.expect(c.sqlite3_step(sel.?) == c.SQLITE_ROW);
+    try testing.expectEqual(@as(i64, 1), c.sqlite3_column_int64(sel, 0));
+    try testing.expectEqual(@as(i64, 200), c.sqlite3_column_int64(sel, 1));
 }
 
 test "routes: lookupBlock finds an MST block by CID" {
