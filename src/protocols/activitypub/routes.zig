@@ -970,6 +970,109 @@ fn handleLiked(hc: *HandlerContext) anyerror!void {
     try renderCollection(hc, .liked);
 }
 
+/// Minimal query-param lookup (no URL-decoding needed for `page`).
+/// Local to avoid a cross-plugin import of `atproto.xrpc`.
+fn queryParam(query: []const u8, name: []const u8) ?[]const u8 {
+    var i: usize = 0;
+    while (i < query.len) {
+        const seg_end = std.mem.indexOfScalarPos(u8, query, i, '&') orelse query.len;
+        const seg = query[i..seg_end];
+        if (std.mem.indexOfScalar(u8, seg, '=')) |eq| {
+            if (std.mem.eql(u8, seg[0..eq], name)) return seg[eq + 1 ..];
+        } else if (std.mem.eql(u8, seg, name)) {
+            return "";
+        }
+        i = seg_end + 1;
+    }
+    return null;
+}
+
+/// AP-7: type-erased iterator over a bound page query. Each `next`
+/// steps the statement and emits the column-0 IRI as a quoted JSON
+/// string; null/empty cells (e.g. a Like with no object) are skipped.
+const PageIter = struct {
+    stmt: ?*c.sqlite3_stmt,
+    /// Latch: once the statement reaches a non-row result we must NOT
+    /// step again. `prepare_v2` auto-resets a DONE statement on the
+    /// next `step`, which would silently re-run the query from row 1 —
+    /// breaking `writePage`'s has-more probe.
+    done: bool = false,
+
+    fn next(state: ?*anyopaque, out: []u8) ?[]const u8 {
+        const self: *PageIter = @ptrCast(@alignCast(state.?));
+        if (self.done) return null;
+        while (true) {
+            if (c.sqlite3_step(self.stmt) != c.SQLITE_ROW) {
+                self.done = true;
+                return null;
+            }
+            const p = c.sqlite3_column_text(self.stmt, 0);
+            const n: usize = @intCast(c.sqlite3_column_bytes(self.stmt, 0));
+            if (n == 0 or p == null) continue; // skip null/empty cells
+            if (out.len < n + 2) return null;
+            out[0] = '"';
+            @memcpy(out[1 .. 1 + n], p[0..n]);
+            out[1 + n] = '"';
+            return out[0 .. n + 2];
+        }
+    }
+};
+
+/// Prepare + bind the page query for `kind`. Binds `limit`
+/// (`max_page_items + 1`, so `writePage` can probe for a `next` link)
+/// and `offset`. Returns null on prepare failure.
+fn preparePageStmt(
+    db: *c.sqlite3,
+    kind: collections.CollectionKind,
+    actor_id: i64,
+    actor_uri: []const u8,
+    featured_uri: []const u8,
+    limit: i64,
+    offset: i64,
+) ?*c.sqlite3_stmt {
+    var stmt: ?*c.sqlite3_stmt = null;
+    const transient = c.sqliteTransientAsDestructor();
+    switch (kind) {
+        .outbox => {
+            const sql = "SELECT ap_id FROM ap_activities WHERE actor_id = ? ORDER BY published DESC, id DESC LIMIT ? OFFSET ?";
+            if (c.sqlite3_prepare_v2(db, sql, -1, &stmt, null) != c.SQLITE_OK) return null;
+            _ = c.sqlite3_bind_int64(stmt, 1, actor_id);
+            _ = c.sqlite3_bind_int64(stmt, 2, limit);
+            _ = c.sqlite3_bind_int64(stmt, 3, offset);
+        },
+        .followers => {
+            const sql = "SELECT follower FROM ap_follows WHERE followee = ? AND state='accepted' ORDER BY id LIMIT ? OFFSET ?";
+            if (c.sqlite3_prepare_v2(db, sql, -1, &stmt, null) != c.SQLITE_OK) return null;
+            _ = c.sqlite3_bind_text(stmt, 1, actor_uri.ptr, @intCast(actor_uri.len), transient);
+            _ = c.sqlite3_bind_int64(stmt, 2, limit);
+            _ = c.sqlite3_bind_int64(stmt, 3, offset);
+        },
+        .following => {
+            const sql = "SELECT followee FROM ap_follows WHERE follower = ? AND state='accepted' ORDER BY id LIMIT ? OFFSET ?";
+            if (c.sqlite3_prepare_v2(db, sql, -1, &stmt, null) != c.SQLITE_OK) return null;
+            _ = c.sqlite3_bind_text(stmt, 1, actor_uri.ptr, @intCast(actor_uri.len), transient);
+            _ = c.sqlite3_bind_int64(stmt, 2, limit);
+            _ = c.sqlite3_bind_int64(stmt, 3, offset);
+        },
+        .featured => {
+            const sql = "SELECT object_iri FROM ap_collection_items WHERE collection = ? ORDER BY added_at DESC LIMIT ? OFFSET ?";
+            if (c.sqlite3_prepare_v2(db, sql, -1, &stmt, null) != c.SQLITE_OK) return null;
+            _ = c.sqlite3_bind_text(stmt, 1, featured_uri.ptr, @intCast(featured_uri.len), transient);
+            _ = c.sqlite3_bind_int64(stmt, 2, limit);
+            _ = c.sqlite3_bind_int64(stmt, 3, offset);
+        },
+        .liked => {
+            // Mirrors `countLikedByActor`'s current schema limitation
+            // (Like activities aren't indexed by actor IRI yet).
+            const sql = "SELECT object_id FROM ap_activities WHERE type = 'like' AND object_id IS NOT NULL ORDER BY published DESC, id DESC LIMIT ? OFFSET ?";
+            if (c.sqlite3_prepare_v2(db, sql, -1, &stmt, null) != c.SQLITE_OK) return null;
+            _ = c.sqlite3_bind_int64(stmt, 1, limit);
+            _ = c.sqlite3_bind_int64(stmt, 2, offset);
+        },
+    }
+    return stmt;
+}
+
 fn renderCollection(hc: *HandlerContext, kind: collections.CollectionKind) !void {
     const st = state_mod.get();
     const username = hc.params.get("u") orelse return writeJson(hc, .bad_request, "{\"error\":\"missing user\"}");
@@ -987,6 +1090,28 @@ fn renderCollection(hc: *HandlerContext, kind: collections.CollectionKind) !void
         "https://{s}/users/{s}/collections/featured",
         .{ st.hostname(), user.username() },
     ) catch return writeJson(hc, .internal, "{\"error\":\"uri buf\"}");
+
+    // AP-7: `?page=N` serves an OrderedCollectionPage of up to
+    // `max_page_items` real items with next/prev links; absent `page`
+    // serves the index document pointing at `?page=1`.
+    if (queryParam(hc.request.pathAndQuery().query, "page")) |page_str| {
+        const parsed = std.fmt.parseInt(u32, page_str, 10) catch 1;
+        const page: u32 = if (parsed == 0) 1 else parsed;
+        const offset: i64 = @intCast((page - 1) * collections.max_page_items);
+        const limit: i64 = collections.max_page_items + 1;
+        const stmt = preparePageStmt(db, kind, user.id, actor_uri, featured_uri, limit, offset) orelse
+            return writeJson(hc, .internal, "{\"error\":\"page query\"}");
+        defer _ = c.sqlite3_finalize(stmt);
+        var iter = PageIter{ .stmt = stmt };
+        var page_body: [max_response_bytes]u8 = undefined;
+        const page_out = collections.writePage(.{
+            .hostname = st.hostname(),
+            .actor_username = user.username(),
+            .kind = kind,
+            .total_items = 0, // page docs don't emit totalItems
+        }, page, @ptrCast(&iter), PageIter.next, &page_body) catch return writeJson(hc, .internal, "{\"error\":\"collection buf\"}");
+        return writeJsonLd(hc, .ok, page_out);
+    }
 
     const total: u64 = switch (kind) {
         .outbox => @intCast(countActivities(db, user.id)),
@@ -1171,6 +1296,58 @@ test "recordFollow upserts state correctly" {
     const iri_ptr = c.sqlite3_column_text(stmt, 1);
     const iri_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 1));
     try testing.expectEqualStrings("https://a/activities/follow1", iri_ptr[0..iri_len]);
+}
+
+test "AP-7: collection pagination walks followers across pages" {
+    const sqlite_mod = core.storage.sqlite;
+    const db = try sqlite_mod.openWriter(":memory:");
+    defer sqlite_mod.closeDb(db);
+    try @import("schema.zig").applyAllForTests(db);
+
+    const actor = "https://h/users/alice";
+    const total = collections.max_page_items + 1; // 41 → spills to a 2nd page
+    var i: u32 = 0;
+    var fbuf: [64]u8 = undefined;
+    while (i < total) : (i += 1) {
+        const follower = try std.fmt.bufPrint(&fbuf, "https://peer/u{d}", .{i});
+        try recordFollow(db, follower, actor, "accepted", "");
+    }
+
+    const limit: i64 = collections.max_page_items + 1;
+
+    // Page 1: full page, a `next` link, no `prev`.
+    {
+        const stmt = preparePageStmt(db, .followers, 0, actor, "", limit, 0).?;
+        defer _ = c.sqlite3_finalize(stmt);
+        var iter = PageIter{ .stmt = stmt };
+        var buf: [max_response_bytes]u8 = undefined;
+        const out = try collections.writePage(.{
+            .hostname = "h",
+            .actor_username = "alice",
+            .kind = .followers,
+            .total_items = 0,
+        }, 1, @ptrCast(&iter), PageIter.next, &buf);
+        try testing.expect(std.mem.indexOf(u8, out, "\"OrderedCollectionPage\"") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "\"next\":\"https://h/users/alice/followers?page=2\"") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "\"prev\"") == null);
+        try testing.expect(std.mem.indexOf(u8, out, "\"https://peer/u0\"") != null);
+    }
+
+    // Page 2: the remainder, a `prev` link, no `next`.
+    {
+        const stmt = preparePageStmt(db, .followers, 0, actor, "", limit, collections.max_page_items).?;
+        defer _ = c.sqlite3_finalize(stmt);
+        var iter = PageIter{ .stmt = stmt };
+        var buf: [max_response_bytes]u8 = undefined;
+        const out = try collections.writePage(.{
+            .hostname = "h",
+            .actor_username = "alice",
+            .kind = .followers,
+            .total_items = 0,
+        }, 2, @ptrCast(&iter), PageIter.next, &buf);
+        try testing.expect(std.mem.indexOf(u8, out, "\"prev\":\"https://h/users/alice/followers?page=1\"") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "\"next\"") == null);
+    }
 }
 
 test "AP-6: applyUndoByIri removes Follow row by follow_iri" {

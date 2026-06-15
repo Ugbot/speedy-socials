@@ -163,3 +163,13 @@ test "State get/reset cycle" {
     reset();
     try std.testing.expectEqualStrings("speedy-socials.local", get().hostname());
 }
+
+test "AP-9: outbound sig scheme defaults to cavage, flips to rfc9421" {
+    // Default (matches the boot default; http_delivery.deliver reads this).
+    setOutboundSigScheme(.cavage);
+    try std.testing.expectEqual(OutboundSigScheme.cavage, outboundSigScheme());
+    setOutboundSigScheme(.rfc9421);
+    try std.testing.expectEqual(OutboundSigScheme.rfc9421, outboundSigScheme());
+    // Restore the process-wide default so order-independent tests see cavage.
+    setOutboundSigScheme(.cavage);
+}

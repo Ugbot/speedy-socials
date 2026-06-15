@@ -483,6 +483,17 @@ pub fn main() !void {
         }
     }
 
+    // AP-9: outbound HTTP-signature scheme. Default cavage (fediverse
+    // majority); `AP_OUTBOUND_SIG=rfc9421` makes `http_delivery.deliver`
+    // emit RFC 9421 `Signature-Input` + `Signature` + `Content-Digest`.
+    if (std.c.getenv("AP_OUTBOUND_SIG")) |envp| {
+        const v = std.mem.sliceTo(envp, 0);
+        if (std.mem.eql(u8, v, "rfc9421")) {
+            activitypub.state.setOutboundSigScheme(.rfc9421);
+            log_ptr.info("boot", "AP outbound signatures: RFC 9421 (AP_OUTBOUND_SIG=rfc9421)");
+        }
+    }
+
     // Build the outbound HTTPS client. It shares a dedicated 4-thread
     // pool so federation fetches don't contend with inbox workers.
     // Until a TLS backend is wired in, `https://` requests fail with
