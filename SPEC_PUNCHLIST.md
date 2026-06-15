@@ -39,10 +39,6 @@ AT-18b, AT-20, AT-21, AT-22, AT-25; INFRA-1/2/3/5; DUAL-2 (==AP-27).
 
 **PARTIAL** (exists but one specific piece missing — fix noted inline
 at the ticket):
-- AP-7 — pagination JSON works; route ignores `?page` (`routes.zig`
-  `renderCollection` only calls `writeIndex`).
-- AP-9 — RFC-9421 signing complete; `AP_OUTBOUND_SIG` never read at
-  boot (pattern: the `STRICT_HTTP_SIG` block in `main.zig`).
 - AP-10 — `actor_type` emitted in actor doc but not persisted to
   `ap_users` (no column).
 - AP-11 / AP-14 — featured/liked routes return correct `totalItems`
@@ -451,7 +447,7 @@ seams.
 
 - [x] **AP-6. Full Undo state machine.** Done 2026-05-20.
 
-- [~] **AP-7. Multi-page collection traversal.**
+- [x] **AP-7. Multi-page collection traversal.**
       **Effort: S.** *Touches: `collections.zig` + four
       collection routes.*
       Acceptance: `OrderedCollectionPage` emits `next` and (where
@@ -468,7 +464,7 @@ seams.
       `ap_featured_posts` table); `Remove{Note}` unpins. Mastodon
       issues these for featured/pinned post management.
 
-- [~] **AP-9. RFC 9421 outbound signing.**
+- [x] **AP-9. RFC 9421 outbound signing.**
       **Effort: S.** *Touches: `http_delivery.zig`.*
       Acceptance: `AP_OUTBOUND_SIG=rfc9421` env makes
       `http_delivery.deliver` emit `Signature-Input` + `Signature` +

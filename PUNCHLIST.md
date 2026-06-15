@@ -197,12 +197,19 @@ _Last refreshed: 2026-05-19._
 
 ## C. TLS / WSS edges
 
-- [ ] **C1. HTTPS-fronted WebSocket data plane.**
-      Acceptance: a WSS client connects to
-      `/api/v1/streaming/user` against a TLS-enabled boot,
-      negotiates the upgrade, sends + receives one binary frame
-      with the expected payload. Integration test
-      `tests/integration/wss_loopback.zig` passes deterministically.
+- [~] **C1. HTTPS-fronted WebSocket data plane.** (Wired 2026-06-15,
+      commit b95409c.) `dispatchWsUpgrade` now mints the data-plane
+      stream: a `TlsStream` over the TLS backend's `readSome`/`writeAll`
+      hooks when the backend intercepts the data plane, else a
+      `PlainStream`. Both WS handlers already consult `ctx.ws_stream`,
+      so WSS app-data frames now flow through TLS instead of the bare
+      (ciphertext) fd. A deterministic socketpair loopback test in
+      `src/core/ws/stream.zig` covers reader-thread drain +
+      handler-thread write + clean close/join (the close `shutdown`s the
+      fd to unblock the blocking reader).
+      Remaining sub-item: a full real-TLS-handshake end-to-end
+      (`tests/integration/wss_loopback.zig` with an in-process ianic
+      client ↔ server boot) — currently a manual verification.
 
 - [ ] **C2. Multi-SNI cert dispatch.**
       Acceptance: with `TLS_SNI_CERTS=host1=...,host2=...` set, two
