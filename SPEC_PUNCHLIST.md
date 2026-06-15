@@ -356,7 +356,7 @@ seams.
       - Test: round-trip put/get/delete on a temp directory.
       Notes: also unblocks AT-6 (`getBlob`) and AT-24 (blob GC).
 
-- [ ] **INFRA-4. Rate-limit backend (already pluggable — doc only).**
+- [x] **INFRA-4. Rate-limit backend (already pluggable — doc only).**
       **Effort: XS.**
       Acceptance: `docs/design/rate-limit.md` describes how
       `core.rate_limit.Limiter` works, what swapping in a Redis-backed
@@ -378,13 +378,13 @@ seams.
       Notes: prep work for AT-19 PLC ops, AT-1 OAuth signing keys,
       and the existing AP RSA key pairs.
 
-- [ ] **INFRA-6. DID resolver — already a hook; document it.**
+- [x] **INFRA-6. DID resolver — already a hook; document it.**
       **Effort: XS.**
       Acceptance: doc-comment header on `atproto.did_resolver`
       explaining how to plug in a real PLC client, a caching
       proxy, or an offline directory.
 
-- [ ] **INFRA-7. HTTP client — already pluggable; document it.**
+- [x] **INFRA-7. HTTP client — already pluggable; document it.**
       **Effort: XS.**
       Acceptance: README section on `core.http_client.Client`
       explaining the hook pattern (e.g., `apKeyFetchClosure`).
@@ -694,7 +694,7 @@ seams.
       bound to a remote audience; PDS verifies inbound service
       JWTs via the originator's DID document key.
 
-- [ ] **AT-18a. `com.atproto.identity.updateHandle` + `#identity` emit.**
+- [x] **AT-18a. `com.atproto.identity.updateHandle` + `#identity` emit.**
       **Effort: XS.** *Touches: routes.zig, atp_repos.handle
       column.*
       Acceptance: POST `{handle}` updates the handle, emits

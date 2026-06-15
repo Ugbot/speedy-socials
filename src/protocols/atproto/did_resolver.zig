@@ -5,6 +5,15 @@
 //! a stub. In `app/main.zig` the production fetcher will dispatch to
 //! `core.workers.Pool` for blocking HTTP I/O.
 //!
+//! INFRA-6 — pluggable resolver. The fetcher is the seam: call
+//! `setFetcher(fn)` at boot to swap in any DID-resolution strategy
+//! without touching this module:
+//!   * a real PLC client (POST/GET against `https://plc.directory`);
+//!   * a caching proxy / CDN in front of PLC + did:web;
+//!   * an offline directory (a fixture map) for air-gapped / test runs.
+//! The bounded LRU cache below sits in front of whatever fetcher is
+//! installed, so a slow upstream is consulted at most once per TTL.
+//!
 //! Tiger Style:
 //!   * Bounded LRU cache. Cache size = `max_cache_entries`; eviction
 //!     by oldest-touched.

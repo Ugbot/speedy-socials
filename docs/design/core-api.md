@@ -96,3 +96,27 @@ subscription registry.
    [`pluggable-infra.md`](pluggable-infra.md).
 4. If it touches storage, register its `Migration` from the
    composition root or the owning plugin's `register_schema`.
+
+## HTTP client hook pattern (INFRA-7)
+
+`core.http_client.Client` is the single outbound HTTP surface. Plugins
+do **not** call it directly; they receive it through a hook (a function
+pointer the composition root binds at boot), which keeps the plugin
+testable with a stub and avoids threading the client pointer everywhere.
+
+Examples wired in `app/main.zig`:
+
+- **AP key fetch** — `activitypub.key_cache.setFetchHook(apKeyFetchClosure)`;
+  the closure reads `activitypub.state.get().http_client` and calls
+  `key_fetcher_http.httpFetch`.
+- **AP federation delivery** —
+  `activitypub.outbox_worker.setDeliverHook(apDeliveryClosure)`.
+- **AT DID resolution** — `atproto.did_resolver.setFetcher(atDidFetchClosure)`.
+- **PLC submit** (AT-19) reads `atproto.state.get().http_client` directly
+  on the rare admin path.
+
+To swap transport (e.g. a proxy, a recording client for tests, or an
+mTLS variant), implement the same `Client.sendSync(req, *resp)` surface
+and bind it via `atproto.attachHttpClient` / `activitypub.attachHttpClient`
+before the hooks fire. TLS for `https://` URLs is itself pluggable via
+`core.http_client.setTlsBackend` (see `core.tls`).
