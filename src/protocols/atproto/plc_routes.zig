@@ -63,15 +63,54 @@ fn signPlcOperation(hc: *HandlerContext) anyerror!void {
     try xrpc.writeJsonBody(hc, .ok, body);
 }
 
+const PlcSubmit = struct { url: []const u8, op: []const u8 };
+
+/// Pure helper: parse `did` + `operation` out of the request body and
+/// build the PLC directory submit URL (`<dir>/<did>`). Returns null when
+/// either field is missing. Factored out so the parsing + URL shape are
+/// unit-testable without a live PLC directory.
+fn buildPlcSubmit(body: []const u8, dir: []const u8, url_buf: []u8) ?PlcSubmit {
+    const did = xrpc.jsonStringField(body, "did") orelse return null;
+    const op = xrpc.jsonObjectField(body, "operation") orelse return null;
+    const url = std.fmt.bufPrint(url_buf, "{s}/{s}", .{ dir, did }) catch return null;
+    return .{ .url = url, .op = op };
+}
+
+/// PLC directory base URL (`PLC_DIRECTORY` env, default
+/// `https://plc.directory`).
+fn plcDirectory() []const u8 {
+    if (std.c.getenv("PLC_DIRECTORY")) |p| {
+        const s = std.mem.sliceTo(p, 0);
+        if (s.len > 0) return s;
+    }
+    return "https://plc.directory";
+}
+
 fn submitPlcOperation(hc: *HandlerContext) anyerror!void {
-    // Real production POSTs the signed op to the configured PLC
-    // directory. We require both `did` and `operation` fields and
-    // return a stub OK; the actual HTTP POST runs via the existing
-    // `core.http_client` once a directory URL is configured.
-    _ = xrpc.jsonStringField(hc.request.body, "did") orelse
-        return xrpc.writeError(hc, .bad_request, "InvalidRequest", "missing did");
-    if (xrpc.jsonObjectField(hc.request.body, "operation") == null) {
-        return xrpc.writeError(hc, .bad_request, "InvalidRequest", "missing operation");
+    const st = State.get();
+    var url_buf: [512]u8 = undefined;
+    const submit = buildPlcSubmit(hc.request.body, plcDirectory(), &url_buf) orelse
+        return xrpc.writeError(hc, .bad_request, "InvalidRequest", "missing did or operation");
+
+    const client = st.http_client orelse
+        return xrpc.writeError(hc, .service_unavailable, "ServiceUnavailable", "http client not configured");
+
+    // POST the signed operation object to `<dir>/<did>` per the PLC
+    // directory HTTP API.
+    var resp_storage: core.http_client.Response = .{ .status = 0 };
+    const req: core.http_client.Request = .{
+        .method = .post,
+        .url = submit.url,
+        .headers = &[_]core.http_client.Header{
+            .{ .name = "Content-Type", .value = "application/json" },
+        },
+        .body = submit.op,
+        .timeout_ms = 15_000,
+    };
+    client.sendSync(req, &resp_storage) catch
+        return xrpc.writeError(hc, .service_unavailable, "UpstreamFailure", "PLC directory unreachable");
+    if (resp_storage.status < 200 or resp_storage.status >= 300) {
+        return xrpc.writeError(hc, .service_unavailable, "UpstreamFailure", "PLC directory rejected operation");
     }
     try xrpc.writeJsonBody(hc, .ok, "{}");
 }
@@ -126,4 +165,21 @@ test "AT-19: plc routes register" {
     var r = Router.init();
     try register(&r, 0);
     try testing.expectEqual(@as(u32, 4), r.count);
+}
+
+test "AT-19: buildPlcSubmit builds <dir>/<did> URL + extracts operation" {
+    var url_buf: [512]u8 = undefined;
+    const body =
+        \\{"did":"did:plc:abc123","operation":{"type":"plc_operation","rotationKeys":["did:key:zX"]}}
+    ;
+    const got = buildPlcSubmit(body, "https://plc.directory", &url_buf) orelse return error.UnexpectedNull;
+    try testing.expectEqualStrings("https://plc.directory/did:plc:abc123", got.url);
+    try testing.expect(std.mem.indexOf(u8, got.op, "plc_operation") != null);
+    try testing.expect(got.op[0] == '{');
+}
+
+test "AT-19: buildPlcSubmit returns null when did or operation missing" {
+    var url_buf: [512]u8 = undefined;
+    try testing.expect(buildPlcSubmit("{\"operation\":{}}", "https://plc.directory", &url_buf) == null);
+    try testing.expect(buildPlcSubmit("{\"did\":\"did:plc:x\"}", "https://plc.directory", &url_buf) == null);
 }
