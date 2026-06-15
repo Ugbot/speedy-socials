@@ -1006,12 +1006,71 @@ fn repoUploadBlob(hc: *HandlerContext) anyerror!void {
         }
     }
 
+    // DUAL-3: also write the bytes into the shared content-addressed
+    // blob store under the SAME CID, so the AP side can serve them via
+    // `/blob/<cid>` — one upload, both networks reference one set of
+    // on-disk bytes (AT BlobRef `$link` == the AP attachment URL's CID).
+    if (core.blob.global()) |store| {
+        store.put(cid, bytes) catch {};
+    }
+
     var resp_buf: [512]u8 = undefined;
     const body = std.fmt.bufPrint(&resp_buf,
         "{{\"blob\":{{\"$type\":\"blob\",\"ref\":{{\"$link\":\"{s}\"}},\"mimeType\":\"{s}\",\"size\":{d}}}}}",
         .{ cid, mime, bytes.len },
     ) catch return xrpc.writeError(hc, .internal, "InternalError", "fmt");
     try xrpc.writeJsonBody(hc, .ok, body);
+}
+
+// DUAL-3: content-addressed blob URL (`GET /blob/:cid`). An AP attachment
+// `url` of `https://<host>/blob/<cid>` and the AT BlobRef `$link` of
+// `<cid>` resolve to the same bytes. Serves the inline `atp_blobs.data`
+// or, when spilled, the shared `core.blob` store.
+fn serveBlobByCid(hc: *HandlerContext) anyerror!void {
+    const st = State.get();
+    const db = st.reader_db orelse return xrpc.writeError(hc, .service_unavailable, "ServiceUnavailable", "db not ready");
+    const cid = hc.params.get("cid") orelse return xrpc.writeError(hc, .bad_request, "InvalidRequest", "missing cid");
+
+    var stmt: ?*c.sqlite3_stmt = null;
+    if (c.sqlite3_prepare_v2(db, "SELECT mime, data FROM atp_blobs WHERE cid = ?", -1, &stmt, null) != c.SQLITE_OK) {
+        return xrpc.writeError(hc, .internal, "InternalError", "prepare");
+    }
+    defer _ = c.sqlite3_finalize(stmt);
+    _ = c.sqlite3_bind_text(stmt, 1, cid.ptr, @intCast(cid.len), c.sqliteTransientAsDestructor());
+    if (c.sqlite3_step(stmt.?) != c.SQLITE_ROW) {
+        return xrpc.writeError(hc, .not_found, "BlobNotFound", "blob not present");
+    }
+    const mime_ptr = c.sqlite3_column_text(stmt, 0);
+    const mime_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 0));
+    var mime_buf: [128]u8 = undefined;
+    const mime = blk: {
+        if (mime_len == 0 or mime_ptr == null) break :blk "application/octet-stream";
+        const cap = @min(mime_len, mime_buf.len);
+        @memcpy(mime_buf[0..cap], mime_ptr[0..cap]);
+        break :blk mime_buf[0..cap];
+    };
+    if (c.sqlite3_column_type(stmt, 1) != c.SQLITE_NULL) {
+        const blob_ptr = c.sqlite3_column_blob(stmt, 1);
+        const blob_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 1));
+        const p: [*]const u8 = @ptrCast(blob_ptr);
+        try hc.response.startStatus(.ok);
+        try hc.response.header("Content-Type", mime);
+        try hc.response.headerFmt("Content-Length", "{d}", .{blob_len});
+        try hc.response.header("Connection", "close");
+        try hc.response.finishHeaders();
+        try hc.response.body(p[0..blob_len]);
+        return;
+    }
+    const store = core.blob.global() orelse return xrpc.writeError(hc, .not_found, "BlobNotFound", "missing");
+    var body_buf: [4 * 1024 * 1024]u8 = undefined;
+    const body = store.get(cid, &body_buf) catch
+        return xrpc.writeError(hc, .not_found, "BlobNotFound", "missing");
+    try hc.response.startStatus(.ok);
+    try hc.response.header("Content-Type", mime);
+    try hc.response.headerFmt("Content-Length", "{d}", .{body.len});
+    try hc.response.header("Connection", "close");
+    try hc.response.finishHeaders();
+    try hc.response.body(body);
 }
 
 // AT-23: `com.atproto.repo.importRepo`. Real semantics need a full
@@ -1489,6 +1548,7 @@ pub fn register(router: *Router, plugin_index: u16) !void {
     try router.register(.post, "/xrpc/com.atproto.identity.updateHandle", identityUpdateHandle, plugin_index); // AT-18a
     try router.register(.get, "/xrpc/com.atproto.sync.getRepoStatus", syncGetRepoStatus, plugin_index); // AT-15
     try router.register(.get, "/xrpc/com.atproto.sync.getBlob", syncGetBlob, plugin_index); // AT-6
+    try router.register(.get, "/blob/:cid", serveBlobByCid, plugin_index); // DUAL-3
 
     try router.register(.post, "/xrpc/com.atproto.moderation.createReport", moderationCreateReport, plugin_index); // AT-21
     try router.register(.get, "/xrpc/com.atproto.label.queryLabels", labelQueryLabels, plugin_index); // AT-20
@@ -1687,4 +1747,23 @@ test "AT-7: uploadBlob CID is CIDv1 raw codec" {
     // Round-trips back to the same bytes.
     const parsed = try cid_mod.parseString(s);
     try testing.expectEqualSlices(u8, blob_cid.raw(), parsed.raw());
+}
+
+test "DUAL-3: AT BlobRef CID and AP /blob URL address the same bytes" {
+    const bytes = "shared-media-bytes-across-both-networks";
+    // The CID the AT BlobRef `$link` carries (CIDv1 raw, sha2-256).
+    const blob_cid = cid_mod.computeRaw(bytes);
+    var cid_buf: [cid_mod.string_cid_len]u8 = undefined;
+    const cid = try cid_mod.encodeString(blob_cid, &cid_buf);
+
+    // The shared content-addressed store keyed by that same CID — what
+    // `uploadBlob` writes to and what `/blob/:cid` serves from.
+    var mem = core.blob.MemoryStore.init(testing.allocator);
+    defer mem.deinit();
+    const store = mem.store();
+    try store.put(cid, bytes);
+
+    var out: [128]u8 = undefined;
+    const got = try store.get(cid, &out);
+    try testing.expectEqualSlices(u8, bytes, got);
 }
