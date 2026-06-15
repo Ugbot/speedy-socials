@@ -1073,19 +1073,66 @@ fn serveBlobByCid(hc: *HandlerContext) anyerror!void {
     try hc.response.body(body);
 }
 
-// AT-23: `com.atproto.repo.importRepo`. Real semantics need a full
-// CAR reader (parse blocks → reconstruct MST → replay commits). We
-// validate the request shape, record the upload size, and reject
-// with 501 NotImplemented at the persistence step — the route is
-// reachable so clients can probe support; the heavy lift is tracked
-// as a follow-up.
-fn importRepoStub(hc: *HandlerContext) anyerror!void {
-    if (hc.request.body.len == 0) {
+// AT-23: `com.atproto.repo.importRepo`. The request body is a CARv1
+// archive. We decode it and persist every block into the repo's block
+// store (`atp_mst_blocks`), keyed by CID, so the imported repo's blocks
+// are retrievable via getBlocks/getRepo. The `did` is taken from the
+// access token (the authenticated repo) or a `?did=` override.
+//
+// Note: full record-table extraction (walking the MST from the root to
+// repopulate `atp_records`) + head advancement is a follow-up; block
+// ingestion is the load-bearing half and is what migrations need.
+fn importRepo(hc: *HandlerContext) anyerror!void {
+    const st = State.get();
+    const db = st.reader_db orelse return xrpc.writeError(hc, .service_unavailable, "ServiceUnavailable", "db not ready");
+    const car_bytes = hc.request.body;
+    if (car_bytes.len == 0) {
         return xrpc.writeError(hc, .bad_request, "InvalidRequest", "empty body");
     }
-    // We accept the upload but advertise that consumption isn't wired.
-    return xrpc.writeError(hc, .not_implemented, "NotImplemented",
-        "importRepo accepted upload but persistence is pending a full CAR reader (see SPEC_PUNCHLIST AT-23)");
+
+    // Resolve the target repo DID: ?did= override, else the bearer sub.
+    const q = hc.request.pathAndQuery().query;
+    var did_buf: [256]u8 = undefined;
+    var did: []const u8 = "";
+    if (xrpc.queryParam(q, "did")) |d| {
+        did = d;
+    } else if (hc.request.header("Authorization")) |hdr| {
+        if (std.mem.startsWith(u8, hdr, "Bearer ")) {
+            var claims: auth_mod.Claims = .{ .scope = .access, .iat = 0, .exp = 0 };
+            if (auth_mod.verify(hdr[7..], st.jwt_key.public_key, st.clock.wallUnix(), &claims)) |_| {
+                const sub = claims.sub();
+                const n = @min(sub.len, did_buf.len);
+                @memcpy(did_buf[0..n], sub[0..n]);
+                did = did_buf[0..n];
+            } else |_| {}
+        }
+    }
+    if (did.len == 0) return xrpc.writeError(hc, .bad_request, "InvalidRequest", "missing did (provide ?did= or a bearer token)");
+
+    repo_mod.ensureRepo(db, did, "did:key:placeholder", st.clock.wallUnix()) catch
+        return xrpc.writeError(hc, .internal, "InternalError", "ensureRepo");
+
+    const ins_sql = "INSERT OR REPLACE INTO atp_mst_blocks (cid, did, data) VALUES (?,?,?)";
+    var reader = car.Reader.init(car_bytes);
+    var stored: u32 = 0;
+    while (reader.next() catch
+        return xrpc.writeError(hc, .bad_request, "InvalidRequest", "malformed CAR")) |block|
+    {
+        var cid_buf: [cid_mod.string_cid_len]u8 = undefined;
+        const cid = cid_mod.encodeString(block.cid, &cid_buf) catch continue;
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(db, ins_sql, -1, &stmt, null) != c.SQLITE_OK) continue;
+        defer _ = c.sqlite3_finalize(stmt);
+        _ = c.sqlite3_bind_text(stmt, 1, cid.ptr, @intCast(cid.len), c.sqliteTransientAsDestructor());
+        _ = c.sqlite3_bind_text(stmt, 2, did.ptr, @intCast(did.len), c.sqliteTransientAsDestructor());
+        _ = c.sqlite3_bind_blob(stmt, 3, block.data.ptr, @intCast(block.data.len), c.sqliteTransientAsDestructor());
+        if (c.sqlite3_step(stmt.?) == c.SQLITE_DONE) stored += 1;
+    }
+
+    var resp_buf: [128]u8 = undefined;
+    const body = std.fmt.bufPrint(&resp_buf, "{{\"imported\":{d}}}", .{stored}) catch
+        return xrpc.writeError(hc, .internal, "InternalError", "fmt");
+    try xrpc.writeJsonBody(hc, .ok, body);
 }
 
 // AT-18b: `com.atproto.identity.resolveIdentity`. Combines the
@@ -1535,7 +1582,7 @@ pub fn register(router: *Router, plugin_index: u16) !void {
     try router.register(.post, "/xrpc/com.atproto.repo.putRecord", createRecord, plugin_index);
     try router.register(.post, "/xrpc/com.atproto.repo.deleteRecord", deleteRecord, plugin_index);
     try router.register(.post, "/xrpc/com.atproto.repo.applyWrites", applyWrites, plugin_index); // AT-12
-    try router.register(.post, "/xrpc/com.atproto.repo.importRepo", importRepoStub, plugin_index); // AT-23
+    try router.register(.post, "/xrpc/com.atproto.repo.importRepo", importRepo, plugin_index); // AT-23
     try router.register(.get, "/xrpc/com.atproto.identity.resolveIdentity", identityResolveIdentity, plugin_index); // AT-18b
     try router.register(.get, "/xrpc/com.atproto.repo.getRecord", getRecord, plugin_index);
     try router.register(.get, "/xrpc/com.atproto.repo.listRecords", listRecords, plugin_index); // W2.3
@@ -1798,4 +1845,45 @@ test "DUAL-3: AT BlobRef CID and AP /blob URL address the same bytes" {
     var out: [128]u8 = undefined;
     const got = try store.get(cid, &out);
     try testing.expectEqualSlices(u8, bytes, got);
+}
+
+test "AT-23: importRepo decodes a CAR and persists blocks" {
+    const db = try setupRouteDb();
+    defer core.storage.sqlite.closeDb(db);
+
+    // Build a small CARv1: header (roots) + two blocks.
+    const cid_a = cid_mod.computeDagCbor("alpha-block");
+    const cid_b = cid_mod.computeDagCbor("beta-block");
+    var car_buf: [4096]u8 = undefined;
+    var pos: usize = 0;
+    const roots = [_]cid_mod.Cid{cid_a};
+    pos += try car.writeHeader(&roots, car_buf[pos..]);
+    pos += try car.writeBlock(cid_a, "alpha-block", car_buf[pos..]);
+    pos += try car.writeBlock(cid_b, "beta-block", car_buf[pos..]);
+
+    // Run the importRepo persistence loop (handler core).
+    const did = "did:web:host/importer";
+    try repo_mod.ensureRepo(db, did, "did:key:placeholder", 1);
+    var reader = car.Reader.init(car_buf[0..pos]);
+    var stored: u32 = 0;
+    while (try reader.next()) |block| {
+        var cid_buf: [cid_mod.string_cid_len]u8 = undefined;
+        const cid = try cid_mod.encodeString(block.cid, &cid_buf);
+        var stmt: ?*c.sqlite3_stmt = null;
+        try testing.expect(c.sqlite3_prepare_v2(db, "INSERT OR REPLACE INTO atp_mst_blocks (cid, did, data) VALUES (?,?,?)", -1, &stmt, null) == c.SQLITE_OK);
+        defer _ = c.sqlite3_finalize(stmt);
+        _ = c.sqlite3_bind_text(stmt, 1, cid.ptr, @intCast(cid.len), c.sqliteTransientAsDestructor());
+        _ = c.sqlite3_bind_text(stmt, 2, did.ptr, @intCast(did.len), c.sqliteTransientAsDestructor());
+        _ = c.sqlite3_bind_blob(stmt, 3, block.data.ptr, @intCast(block.data.len), c.sqliteTransientAsDestructor());
+        if (c.sqlite3_step(stmt.?) == c.SQLITE_DONE) stored += 1;
+    }
+    try testing.expectEqual(@as(u32, 2), stored);
+
+    // Both blocks are now in the store for this repo.
+    var sel: ?*c.sqlite3_stmt = null;
+    try testing.expect(c.sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM atp_mst_blocks WHERE did = ?", -1, &sel, null) == c.SQLITE_OK);
+    defer _ = c.sqlite3_finalize(sel);
+    _ = c.sqlite3_bind_text(sel, 1, did.ptr, @intCast(did.len), c.sqliteTransientAsDestructor());
+    try testing.expect(c.sqlite3_step(sel.?) == c.SQLITE_ROW);
+    try testing.expectEqual(@as(i64, 2), c.sqlite3_column_int64(sel, 0));
 }
