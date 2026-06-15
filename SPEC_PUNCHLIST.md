@@ -12,6 +12,29 @@ Companion docs:
 
 _Last refreshed: 2026-06-15 (code-verified reconciliation — see below)._
 
+## 2026-06-16 progress update
+
+Since the 2026-06-15 reconciliation, the following were implemented +
+tested (see git log): AT-8/9/10/11 (durable SQLite accounts), AP-7
+(pagination), AP-9 (RFC-9421 signing), C1 (WSS stream wiring), AT-19
+(real PLC POST), AT-1 (real DPoP verify + cnf binding), AT-4 (canonical
+DAG-CBOR), DUAL-1 (unified signup), DUAL-4 AP-side (discovery links),
+DUAL-3 (shared media), AT-2 (crawl persistence), AP-10 (actor_type),
+AP-11/AP-14 (served via pages), AT-24 (GC worker), AT-23 (CAR block
+import — `[~]`), AP-20 + AP-29 (verified already-done), AT-18a (verified
+done), INFRA-4/6/7 (pluggable-seam docs). **836 unit tests + 4 sims pass.**
+
+**The live status is the per-ticket checkboxes below.** Genuinely
+remaining: **AT-16** (hierarchical MST — a storage redesign whose
+acceptance requires a flat-p99 benchmark) and **DUAL-5** (per-tenant
+isolation — the XL multi-tenancy item, PUNCHLIST §H: a `tenant_id`
+predicate on every user-data query). Niche/partial tail: AP-15
+(multikey emit+verify), AP-16 (poll-vote recording), AP-23 (remote
+attachment metadata), AP-21 (LD-proof verify — deferred until a peer
+needs it), AT-3 (remaining firehose callers), AT-23 record extraction,
+DUAL-4 reverse (per-account did:web `alsoKnownAs`). The giants warrant
+focused, benchmarked sessions rather than a rushed landing.
+
 ## 2026-06-15 code-verified reconciliation (AUTHORITATIVE)
 
 > **This section is the source of truth.** The per-ticket checkboxes
