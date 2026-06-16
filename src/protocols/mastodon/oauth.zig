@@ -54,7 +54,7 @@ fn randHex(rng: *core.rng.Rng, out: []u8) void {
 
 pub fn handleCreateApp(hc: *HandlerContext) anyerror!void {
     const st = state_mod.get();
-    const db = st.db orelse return http_util.writeError(hc, .service_unavailable, "db not ready");
+    const db = st.dbHandle() orelse return http_util.writeError(hc, .service_unavailable, "db not ready");
     const rng = st.rng orelse return http_util.writeError(hc, .service_unavailable, "rng not ready");
 
     // Accept either JSON or form-encoded body. We try JSON first.
@@ -142,7 +142,7 @@ pub fn handleAuthorize(hc: *HandlerContext) anyerror!void {
 
 pub fn handleToken(hc: *HandlerContext) anyerror!void {
     const st = state_mod.get();
-    const db = st.db orelse return http_util.writeError(hc, .service_unavailable, "db not ready");
+    const db = st.dbHandle() orelse return http_util.writeError(hc, .service_unavailable, "db not ready");
     const rng = st.rng orelse return http_util.writeError(hc, .service_unavailable, "rng not ready");
 
     const body = hc.request.body;
@@ -236,7 +236,7 @@ pub fn handleToken(hc: *HandlerContext) anyerror!void {
 
 pub fn handleRevoke(hc: *HandlerContext) anyerror!void {
     const st = state_mod.get();
-    const db = st.db orelse return http_util.writeError(hc, .service_unavailable, "db not ready");
+    const db = st.dbHandle() orelse return http_util.writeError(hc, .service_unavailable, "db not ready");
     const body = hc.request.body;
     const token = http_util.jsonString(body, "token") orelse
         http_util.formField(body, "token") orelse {

@@ -101,7 +101,7 @@ pub fn storeUpload(
     out: *StoredAttachment,
 ) Error!void {
     const st = state.get();
-    const db = st.db orelse return error.DbNotReady;
+    const db = st.dbHandle() orelse return error.DbNotReady;
     if (part.body.len == 0) return error.PayloadTooLarge; // empty is its own kind of bad
     if (part.body.len > limits.max_upload_bytes) return error.PayloadTooLarge;
 
@@ -183,7 +183,7 @@ pub fn storeBlobBytes(
 ) Error![]const u8 {
     _ = did; // single-DID-per-blob is recorded indirectly via insertAttachment caller side
     const st = state.get();
-    const db = st.db orelse return error.DbNotReady;
+    const db = st.dbHandle() orelse return error.DbNotReady;
     if (bytes.len == 0 or bytes.len > limits.max_upload_bytes) return error.PayloadTooLarge;
     if (bytes.len > limits.media_inline_threshold_bytes) return error.PayloadTooLarge;
     const cid = blobCid(bytes, out_cid);

@@ -18,6 +18,12 @@ const Plugin = core.plugin.Plugin;
 const Clock = core.clock.Clock;
 
 pub const State = struct {
+    /// H2: per-request DB handle (tenant-routed when configured, else the
+    /// boot handle). Request handlers read the DB through this.
+    pub fn dbHandle(self: *State) ?*c.sqlite3 {
+        return core.storage.currentHandle() orelse self.reader_db;
+    }
+
     /// AT Protocol sibling plugin, located by name at init time. The
     /// relay is the *only* plugin allowed to do this lookup.
     atproto: ?*const Plugin = null,

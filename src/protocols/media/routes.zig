@@ -79,7 +79,7 @@ fn kindForMime(mime: []const u8) []const u8 {
 
 fn postMedia(hc: *HandlerContext) anyerror!void {
     const st = state.get();
-    const db = st.db orelse return writeError(hc, .service_unavailable, "ServiceUnavailable", "db not ready");
+    const db = st.dbHandle() orelse return writeError(hc, .service_unavailable, "ServiceUnavailable", "db not ready");
 
     // Up-front 413 on the raw body. multipart frames push it slightly
     // higher than the file content but the spec cap applies to the
@@ -220,7 +220,7 @@ fn parseFocus(s: []const u8, x: *f32, y: *f32) void {
 
 fn getAttachment(hc: *HandlerContext) anyerror!void {
     const st = state.get();
-    const db = st.db orelse return writeError(hc, .service_unavailable, "ServiceUnavailable", "db not ready");
+    const db = st.dbHandle() orelse return writeError(hc, .service_unavailable, "ServiceUnavailable", "db not ready");
     const id_str = hc.params.get("id") orelse return writeError(hc, .bad_request, "InvalidRequest", "missing id");
     const id = std.fmt.parseInt(i64, id_str, 10) catch {
         return writeError(hc, .bad_request, "InvalidRequest", "bad id");
@@ -254,7 +254,7 @@ fn getAttachment(hc: *HandlerContext) anyerror!void {
 
 fn putAttachment(hc: *HandlerContext) anyerror!void {
     const st = state.get();
-    const db = st.db orelse return writeError(hc, .service_unavailable, "ServiceUnavailable", "db not ready");
+    const db = st.dbHandle() orelse return writeError(hc, .service_unavailable, "ServiceUnavailable", "db not ready");
     const id_str = hc.params.get("id") orelse return writeError(hc, .bad_request, "InvalidRequest", "missing id");
     const id = std.fmt.parseInt(i64, id_str, 10) catch {
         return writeError(hc, .bad_request, "InvalidRequest", "bad id");
@@ -327,7 +327,7 @@ fn extractJsonString(body: []const u8, name: []const u8) ?[]const u8 {
 
 fn getBlob(hc: *HandlerContext) anyerror!void {
     const st = state.get();
-    const db = st.db orelse return writeError(hc, .service_unavailable, "ServiceUnavailable", "db not ready");
+    const db = st.dbHandle() orelse return writeError(hc, .service_unavailable, "ServiceUnavailable", "db not ready");
     const cid = hc.params.get("cid") orelse return writeError(hc, .bad_request, "InvalidRequest", "missing cid");
 
     // Look up mime + size + data.

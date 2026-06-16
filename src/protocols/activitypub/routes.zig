@@ -309,7 +309,7 @@ fn handleWebFinger(hc: *HandlerContext) anyerror!void {
     if (!std.ascii.eqlIgnoreCase(parsed.host, st.hostname())) {
         return writeJson(hc, .not_found, "{\"error\":\"unknown host\"}");
     }
-    const db = st.db orelse {
+    const db = st.dbHandle() orelse {
         return writeJson(hc, .service_unavailable, "{\"error\":\"db not ready\"}");
     };
     const user = loadUser(db, parsed.username) orelse {
@@ -334,7 +334,7 @@ fn handleNodeInfoJrd(hc: *HandlerContext) anyerror!void {
 fn handleNodeInfo21(hc: *HandlerContext) anyerror!void {
     const st = state_mod.get();
     var stats: nodeinfo.Stats = .{};
-    if (st.db) |db| {
+    if (st.dbHandle()) |db| {
         stats.total_users = @intCast(countTable(db, "ap_users"));
         stats.local_posts = @intCast(countTable(db, "ap_activities"));
     }
@@ -367,7 +367,7 @@ fn countTable(db: *c.sqlite3, name: []const u8) i64 {
 fn handleUserActor(hc: *HandlerContext) anyerror!void {
     const st = state_mod.get();
     const username = hc.params.get("u") orelse return writeJson(hc, .bad_request, "{\"error\":\"missing user\"}");
-    const db = st.db orelse return writeJson(hc, .service_unavailable, "{\"error\":\"db not ready\"}");
+    const db = st.dbHandle() orelse return writeJson(hc, .service_unavailable, "{\"error\":\"db not ready\"}");
 
     // Tombstone check: profile URI.
     var uri_buf: [256]u8 = undefined;
@@ -458,7 +458,7 @@ fn fallbackTombstone(body: []u8, uri: []const u8) []const u8 {
 fn handleUserInbox(hc: *HandlerContext) anyerror!void {
     const st = state_mod.get();
     const username = hc.params.get("u") orelse return writeJson(hc, .bad_request, "{\"error\":\"missing user\"}");
-    const db = st.db orelse return writeJson(hc, .service_unavailable, "{\"error\":\"db not ready\"}");
+    const db = st.dbHandle() orelse return writeJson(hc, .service_unavailable, "{\"error\":\"db not ready\"}");
 
     _ = loadUser(db, username) orelse return writeJson(hc, .not_found, "{\"error\":\"unknown user\"}");
     try dispatchInbox(hc, st, db, username);
@@ -466,7 +466,7 @@ fn handleUserInbox(hc: *HandlerContext) anyerror!void {
 
 fn handleSharedInbox(hc: *HandlerContext) anyerror!void {
     const st = state_mod.get();
-    const db = st.db orelse return writeJson(hc, .service_unavailable, "{\"error\":\"db not ready\"}");
+    const db = st.dbHandle() orelse return writeJson(hc, .service_unavailable, "{\"error\":\"db not ready\"}");
     try dispatchInbox(hc, st, db, "");
 }
 
@@ -541,7 +541,7 @@ fn dispatchInbox(hc: *HandlerContext, st: *state_mod.State, db: *c.sqlite3, _: [
             if (sig.verify(&parsed, &req_view, &pk)) |_| ok = true else |_| {}
         } else |_| {}
         if (!ok) {
-            if (st.db) |xdb| ok = verifyWithExtraKey(xdb, &parsed, &req_view);
+            if (st.dbHandle()) |xdb| ok = verifyWithExtraKey(xdb, &parsed, &req_view);
         }
         if (!ok) break :sig_block;
         replay.record(parsed.key_id, parsed.signature_b64, now_unix);
@@ -992,7 +992,7 @@ fn handleOutbox(hc: *HandlerContext) anyerror!void {
 // don't run a gateway can wire OAuth verification directly.
 fn handleOutboxPost(hc: *HandlerContext) anyerror!void {
     const st = state_mod.get();
-    const db = st.db orelse return writeJson(hc, .service_unavailable, "{\"error\":\"db not ready\"}");
+    const db = st.dbHandle() orelse return writeJson(hc, .service_unavailable, "{\"error\":\"db not ready\"}");
     const username = hc.params.get("u") orelse return writeJson(hc, .bad_request, "{\"error\":\"missing user\"}");
     const owner = loadUser(db, username) orelse return writeJson(hc, .not_found, "{\"error\":\"unknown user\"}");
 
@@ -1182,7 +1182,7 @@ fn actorKeyMultibase(pem: []const u8, out: []u8) ?[]const u8 {
 fn renderCollection(hc: *HandlerContext, kind: collections.CollectionKind) !void {
     const st = state_mod.get();
     const username = hc.params.get("u") orelse return writeJson(hc, .bad_request, "{\"error\":\"missing user\"}");
-    const db = st.db orelse return writeJson(hc, .service_unavailable, "{\"error\":\"db not ready\"}");
+    const db = st.dbHandle() orelse return writeJson(hc, .service_unavailable, "{\"error\":\"db not ready\"}");
     const user = loadUser(db, username) orelse return writeJson(hc, .not_found, "{\"error\":\"unknown user\"}");
 
     // Build URI for follower/following filter.
@@ -1248,7 +1248,7 @@ fn renderCollection(hc: *HandlerContext, kind: collections.CollectionKind) !void
 // `/users/:u/statuses/:id` (the object IRI).
 fn handleUserStatus(hc: *HandlerContext) anyerror!void {
     const st = state_mod.get();
-    const db = st.db orelse return writeJson(hc, .service_unavailable, "{\"error\":\"db not ready\"}");
+    const db = st.dbHandle() orelse return writeJson(hc, .service_unavailable, "{\"error\":\"db not ready\"}");
     const username = hc.params.get("u") orelse return writeJson(hc, .bad_request, "{\"error\":\"missing user\"}");
     const id = hc.params.get("id") orelse return writeJson(hc, .bad_request, "{\"error\":\"missing id\"}");
     var uri_buf: [320]u8 = undefined;
@@ -1262,7 +1262,7 @@ fn handleUserStatus(hc: *HandlerContext) anyerror!void {
 
 fn handleUserActivity(hc: *HandlerContext) anyerror!void {
     const st = state_mod.get();
-    const db = st.db orelse return writeJson(hc, .service_unavailable, "{\"error\":\"db not ready\"}");
+    const db = st.dbHandle() orelse return writeJson(hc, .service_unavailable, "{\"error\":\"db not ready\"}");
     const username = hc.params.get("u") orelse return writeJson(hc, .bad_request, "{\"error\":\"missing user\"}");
     const id = hc.params.get("id") orelse return writeJson(hc, .bad_request, "{\"error\":\"missing id\"}");
     var uri_buf: [320]u8 = undefined;

@@ -11,8 +11,8 @@ const serialize = @import("../serialize.zig");
 
 pub fn handleInstance(hc: *HandlerContext) anyerror!void {
     const st = state_mod.get();
-    const users: i64 = if (st.db) |db| db_mod.countUsers(db) else 0;
-    const statuses: i64 = if (st.db) |db| db_mod.countStatuses(db) else 0;
+    const users: i64 = if (st.dbHandle()) |db| db_mod.countUsers(db) else 0;
+    const statuses: i64 = if (st.dbHandle()) |db| db_mod.countStatuses(db) else 0;
     var buf: [4096]u8 = undefined;
     const out = serialize.writeInstance(.{
         .hostname = st.hostname(),

@@ -14,6 +14,12 @@ const Rng = core.rng.Rng;
 const Ed25519KeyPair = @import("keypair_ed25519.zig").Ed25519KeyPair;
 
 pub const State = struct {
+    /// H2: per-request DB handle (tenant-routed when configured, else the
+    /// boot handle). Request handlers read the DB through this.
+    pub fn dbHandle(self: *State) ?*c.sqlite3 {
+        return core.storage.currentHandle() orelse self.db;
+    }
+
     /// Direct SQLite writer connection (same pattern as AP/relay).
     db: ?*c.sqlite3 = null,
     clock: Clock = undefined,

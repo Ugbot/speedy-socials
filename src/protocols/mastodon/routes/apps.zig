@@ -14,7 +14,7 @@ const serialize = @import("../serialize.zig");
 pub fn handleVerifyAppCredentials(hc: *HandlerContext) anyerror!void {
     const st = state_mod.get();
     const claims = (try auth.requireScope(hc, "read")) orelse return;
-    const db = st.db orelse return http_util.writeError(hc, .service_unavailable, "db not ready");
+    const db = st.dbHandle() orelse return http_util.writeError(hc, .service_unavailable, "db not ready");
 
     // Look up the app by id. We don't store client_id on the token; we
     // store app_id (claims.app_id) and resolve from there.

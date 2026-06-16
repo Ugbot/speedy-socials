@@ -52,7 +52,7 @@ fn writeJson(hc: *HandlerContext, status: Status, body: []const u8) !void {
 fn handleSubscribe(hc: *HandlerContext) anyerror!void {
     if (!requireAdmin(hc)) return writeJson(hc, .forbidden, "{\"error\":\"admin auth required\"}");
     const state = State.get();
-    const db = state.reader_db orelse return writeJson(hc, .service_unavailable, "{\"error\":\"db not ready\"}");
+    const db = state.dbHandle() orelse return writeJson(hc, .service_unavailable, "{\"error\":\"db not ready\"}");
 
     // Tiny body parser: `{ "kind": "...", "source": "..." }`. We only
     // pull two string fields, no allocator.
@@ -81,7 +81,7 @@ fn handleSubscribe(hc: *HandlerContext) anyerror!void {
 fn handleUnsubscribe(hc: *HandlerContext) anyerror!void {
     if (!requireAdmin(hc)) return writeJson(hc, .forbidden, "{\"error\":\"admin auth required\"}");
     const state = State.get();
-    const db = state.reader_db orelse return writeJson(hc, .service_unavailable, "{\"error\":\"db not ready\"}");
+    const db = state.dbHandle() orelse return writeJson(hc, .service_unavailable, "{\"error\":\"db not ready\"}");
 
     const id_text = hc.params.get("id") orelse {
         return writeJson(hc, .bad_request, "{\"error\":\"missing id\"}");
@@ -99,7 +99,7 @@ fn handleUnsubscribe(hc: *HandlerContext) anyerror!void {
 fn handleListSubscriptions(hc: *HandlerContext) anyerror!void {
     if (!requireAdmin(hc)) return writeJson(hc, .forbidden, "{\"error\":\"admin auth required\"}");
     const state = State.get();
-    const db = state.reader_db orelse return writeJson(hc, .service_unavailable, "{\"error\":\"db not ready\"}");
+    const db = state.dbHandle() orelse return writeJson(hc, .service_unavailable, "{\"error\":\"db not ready\"}");
 
     var rows: [sub.max_list_rows]sub.Subscription = undefined;
     const n = sub.listSubscriptions(db, 0, &rows) catch {
@@ -127,7 +127,7 @@ fn handleListSubscriptions(hc: *HandlerContext) anyerror!void {
 fn handleListLog(hc: *HandlerContext) anyerror!void {
     if (!requireAdmin(hc)) return writeJson(hc, .forbidden, "{\"error\":\"admin auth required\"}");
     const state = State.get();
-    const db = state.reader_db orelse return writeJson(hc, .service_unavailable, "{\"error\":\"db not ready\"}");
+    const db = state.dbHandle() orelse return writeJson(hc, .service_unavailable, "{\"error\":\"db not ready\"}");
 
     // Cursor: query string `?offset=N`. Defaults to 0.
     var offset: u32 = 0;
@@ -243,7 +243,7 @@ fn handleSyntheticActor(hc: *HandlerContext) anyerror!void {
         return writeJson(hc, .bad_request, "{\"error\":\"missing synth\"}");
     };
     const state = State.get();
-    const db = state.reader_db orelse {
+    const db = state.dbHandle() orelse {
         return writeJson(hc, .service_unavailable, "{\"error\":\"db not ready\"}");
     };
 
@@ -321,7 +321,7 @@ fn handleDidDoc(hc: *HandlerContext) anyerror!void {
     const did = percentDecode(raw, &did_buf);
 
     const state = State.get();
-    const db = state.reader_db orelse {
+    const db = state.dbHandle() orelse {
         return writeJson(hc, .service_unavailable, "{\"error\":\"db not ready\"}");
     };
 
@@ -422,7 +422,7 @@ fn makeUsername(did: []const u8, out: []u8) []const u8 {
 fn handleListFollowers(hc: *HandlerContext) anyerror!void {
     if (!requireAdmin(hc)) return writeJson(hc, .forbidden, "{\"error\":\"admin auth required\"}");
     const state = State.get();
-    const db = state.reader_db orelse return writeJson(hc, .service_unavailable, "{\"error\":\"db not ready\"}");
+    const db = state.dbHandle() orelse return writeJson(hc, .service_unavailable, "{\"error\":\"db not ready\"}");
     const q = hc.request.pathAndQuery().query;
     const actor = queryParam(q, "actor") orelse return writeJson(hc, .bad_request, "{\"error\":\"missing actor\"}");
 
@@ -452,7 +452,7 @@ fn handleListFollowers(hc: *HandlerContext) anyerror!void {
 fn handleAddFollower(hc: *HandlerContext) anyerror!void {
     if (!requireAdmin(hc)) return writeJson(hc, .forbidden, "{\"error\":\"admin auth required\"}");
     const state = State.get();
-    const db = state.reader_db orelse return writeJson(hc, .service_unavailable, "{\"error\":\"db not ready\"}");
+    const db = state.dbHandle() orelse return writeJson(hc, .service_unavailable, "{\"error\":\"db not ready\"}");
 
     // JSON body: {"actor":"...", "inbox":"...", "shared_inbox":"...", "follow_iri":"..."}
     var actor_url: []const u8 = "";

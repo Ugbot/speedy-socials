@@ -24,6 +24,12 @@ const Clock = core.clock.Clock;
 const Rng = core.rng.Rng;
 
 pub const State = struct {
+    /// H2: per-request DB handle (tenant-routed when configured, else the
+    /// boot handle). Request handlers read the DB through this.
+    pub fn dbHandle(self: *State) ?*c.sqlite3 {
+        return core.storage.currentHandle() orelse self.db;
+    }
+
     /// Writer-side SQLite connection. Direct synchronous access is
     /// fine here because media uploads are an admin path (rare,
     /// expensive) and the chunked download path uses read-mostly

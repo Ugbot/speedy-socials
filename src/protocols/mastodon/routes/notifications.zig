@@ -35,7 +35,7 @@ pub fn handleList(hc: *HandlerContext) anyerror!void {
     const st = state_mod.get();
     const claims = (try auth.requireScope(hc, "read")) orelse return;
     if (claims.user_id == 0) return http_util.writeError(hc, .forbidden, "client-only token");
-    const db = st.db orelse return http_util.writeError(hc, .service_unavailable, "db not ready");
+    const db = st.dbHandle() orelse return http_util.writeError(hc, .service_unavailable, "db not ready");
 
     var iter = db_mod.queryNotifications(db, claims.user_id, 40);
     defer iter.deinit();
@@ -74,7 +74,7 @@ pub fn handleClear(hc: *HandlerContext) anyerror!void {
     const st = state_mod.get();
     const claims = (try auth.requireScope(hc, "write")) orelse return;
     if (claims.user_id == 0) return http_util.writeError(hc, .forbidden, "client-only token");
-    const db = st.db orelse return http_util.writeError(hc, .service_unavailable, "db not ready");
+    const db = st.dbHandle() orelse return http_util.writeError(hc, .service_unavailable, "db not ready");
     db_mod.clearNotifications(db, claims.user_id) catch {};
     try http_util.writeJsonBody(hc, .ok, "{}");
 }

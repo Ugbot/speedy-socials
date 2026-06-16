@@ -38,7 +38,7 @@ pub fn authenticate(hc: *const HandlerContext) AuthOutcome {
         };
     };
 
-    if (st.db) |db| {
+    if (st.dbHandle()) |db| {
         if (isRevoked(db, claims.jti())) return .revoked;
     }
     return .{ .ok = claims };

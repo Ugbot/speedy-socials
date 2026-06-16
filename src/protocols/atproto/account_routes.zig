@@ -154,7 +154,7 @@ fn createAccount(hc: *HandlerContext) anyerror!void {
 
     // Account creation is also an #identity event (a new identity
     // appeared on this PDS) — emit if we have a writable DB.
-    if (st.reader_db) |db| {
+    if (st.dbHandle()) |db| {
         _ = firehose.appendIdentity(db, did, handle, st.clock.wallUnix()) catch {};
         // DUAL-1: bind the new account's AP actor IRI <→> AT DID in
         // the cross-protocol identity map so a single signup serves
@@ -237,7 +237,7 @@ fn deleteAccount(hc: *HandlerContext) anyerror!void {
     backend.setState(did, .deleted, st.clock.wallUnix()) catch
         return xrpc.writeError(hc, .internal, "InternalError", "set state");
 
-    if (st.reader_db) |db| {
+    if (st.dbHandle()) |db| {
         _ = firehose.appendAccount(db, did, false, "deleted", st.clock.wallUnix()) catch {};
         _ = firehose.appendTombstone(db, did, st.clock.wallUnix()) catch {};
     }
@@ -252,7 +252,7 @@ fn deactivateAccount(hc: *HandlerContext) anyerror!void {
         return xrpc.writeError(hc, .unauthorized, "AuthenticationRequired", "no session");
     backend.setState(sub, .deactivated, st.clock.wallUnix()) catch
         return xrpc.writeError(hc, .internal, "InternalError", "set state");
-    if (st.reader_db) |db| {
+    if (st.dbHandle()) |db| {
         _ = firehose.appendAccount(db, sub, false, "deactivated", st.clock.wallUnix()) catch {};
     }
     try xrpc.writeJsonBody(hc, .ok, "{}");
@@ -266,7 +266,7 @@ fn activateAccount(hc: *HandlerContext) anyerror!void {
         return xrpc.writeError(hc, .unauthorized, "AuthenticationRequired", "no session");
     backend.setState(sub, .active, st.clock.wallUnix()) catch
         return xrpc.writeError(hc, .internal, "InternalError", "set state");
-    if (st.reader_db) |db| {
+    if (st.dbHandle()) |db| {
         _ = firehose.appendAccount(db, sub, true, "", st.clock.wallUnix()) catch {};
     }
     try xrpc.writeJsonBody(hc, .ok, "{}");

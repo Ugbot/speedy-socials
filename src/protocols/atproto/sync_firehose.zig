@@ -89,7 +89,7 @@ fn subscribeReposHandler(ctx: *WsUpgradeContext) anyerror!void {
     defer _ = active_subscribers.fetchSub(1, .acq_rel);
 
     const st = State.get();
-    const db = st.reader_db orelse {
+    const db = st.dbHandle() orelse {
         writeCloseInternal(ctx) catch {};
         return;
     };

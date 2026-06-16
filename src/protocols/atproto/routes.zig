@@ -84,7 +84,7 @@ fn createSession(hc: *HandlerContext) anyerror!void {
     // table is created empty per-deployment; admins call
     // `auth_mod.setPassword` to provision accounts (test fixtures do
     // the same).
-    const reader_db = st.reader_db orelse {
+    const reader_db = st.dbHandle() orelse {
         return xrpc.writeError(hc, .service_unavailable, "ServiceUnavailable", "db not ready");
     };
     if (!auth_mod.verifyPassword(reader_db, ident, password)) {
@@ -180,7 +180,7 @@ fn fillJti(out: []u8, seed: i64, salt: u8) void {
 
 fn createRecord(hc: *HandlerContext) anyerror!void {
     const st = State.get();
-    const db = st.reader_db orelse {
+    const db = st.dbHandle() orelse {
         return xrpc.writeError(hc, .service_unavailable, "ServiceUnavailable", "db not ready");
     };
     const repo_did = xrpc.jsonStringField(hc.request.body, "repo") orelse {
@@ -241,7 +241,7 @@ fn createRecord(hc: *HandlerContext) anyerror!void {
 
 fn getRecord(hc: *HandlerContext) anyerror!void {
     const st = State.get();
-    const db = st.reader_db orelse {
+    const db = st.dbHandle() orelse {
         return xrpc.writeError(hc, .service_unavailable, "ServiceUnavailable", "db not ready");
     };
     const q = hc.request.pathAndQuery().query;
@@ -271,7 +271,7 @@ fn getRecord(hc: *HandlerContext) anyerror!void {
 
 fn deleteRecord(hc: *HandlerContext) anyerror!void {
     const st = State.get();
-    const db = st.reader_db orelse {
+    const db = st.dbHandle() orelse {
         return xrpc.writeError(hc, .service_unavailable, "ServiceUnavailable", "db not ready");
     };
     const repo_did = xrpc.jsonStringField(hc.request.body, "repo") orelse {
@@ -294,7 +294,7 @@ fn deleteRecord(hc: *HandlerContext) anyerror!void {
 
 fn describeRepo(hc: *HandlerContext) anyerror!void {
     const st = State.get();
-    const db = st.reader_db orelse {
+    const db = st.dbHandle() orelse {
         return xrpc.writeError(hc, .service_unavailable, "ServiceUnavailable", "db not ready");
     };
     const q = hc.request.pathAndQuery().query;
@@ -463,7 +463,7 @@ fn identityResolveDid(hc: *HandlerContext) anyerror!void {
 // takendown, deactivated, deleted) which are tracked once AT-8 lands.
 fn syncGetRepoStatus(hc: *HandlerContext) anyerror!void {
     const st = State.get();
-    const db = st.reader_db orelse {
+    const db = st.dbHandle() orelse {
         return xrpc.writeError(hc, .service_unavailable, "ServiceUnavailable", "db not ready");
     };
     const q = hc.request.pathAndQuery().query;
@@ -543,7 +543,7 @@ fn subscribeReposHttp(hc: *HandlerContext) anyerror!void {
 // W2.3 ── com.atproto.repo.listRecords ────────────────────────────
 fn listRecords(hc: *HandlerContext) anyerror!void {
     const st = State.get();
-    const db = st.reader_db orelse {
+    const db = st.dbHandle() orelse {
         return xrpc.writeError(hc, .service_unavailable, "ServiceUnavailable", "db not ready");
     };
     const q = hc.request.pathAndQuery().query;
@@ -665,7 +665,7 @@ fn lookupBlock(db: *c.sqlite3, cid_str: []const u8, out: []u8) !?usize {
 // W2.3 ── com.atproto.sync.getRecord ──────────────────────────────
 fn syncGetRecord(hc: *HandlerContext) anyerror!void {
     const st = State.get();
-    const db = st.reader_db orelse {
+    const db = st.dbHandle() orelse {
         return xrpc.writeError(hc, .service_unavailable, "ServiceUnavailable", "db not ready");
     };
     const q = hc.request.pathAndQuery().query;
@@ -740,7 +740,7 @@ fn syncGetRecord(hc: *HandlerContext) anyerror!void {
 // W2.3 ── com.atproto.sync.getBlocks ──────────────────────────────
 fn syncGetBlocks(hc: *HandlerContext) anyerror!void {
     const st = State.get();
-    const db = st.reader_db orelse {
+    const db = st.dbHandle() orelse {
         return xrpc.writeError(hc, .service_unavailable, "ServiceUnavailable", "db not ready");
     };
     const q = hc.request.pathAndQuery().query;
@@ -779,7 +779,7 @@ fn syncGetBlocks(hc: *HandlerContext) anyerror!void {
 // W2.3 ── com.atproto.sync.listRepos ──────────────────────────────
 fn syncListRepos(hc: *HandlerContext) anyerror!void {
     const st = State.get();
-    const db = st.reader_db orelse {
+    const db = st.dbHandle() orelse {
         return xrpc.writeError(hc, .service_unavailable, "ServiceUnavailable", "db not ready");
     };
     const q = hc.request.pathAndQuery().query;
@@ -851,7 +851,7 @@ fn syncListRepos(hc: *HandlerContext) anyerror!void {
 // W2.3 ── com.atproto.sync.getRepo ────────────────────────────────
 fn syncGetRepo(hc: *HandlerContext) anyerror!void {
     const st = State.get();
-    const db = st.reader_db orelse {
+    const db = st.dbHandle() orelse {
         return xrpc.writeError(hc, .service_unavailable, "ServiceUnavailable", "db not ready");
     };
     const q = hc.request.pathAndQuery().query;
@@ -985,7 +985,7 @@ fn syncGetRepo(hc: *HandlerContext) anyerror!void {
 // W2.3 ── com.atproto.repo.uploadBlob ─────────────────────────────
 fn repoUploadBlob(hc: *HandlerContext) anyerror!void {
     const st = State.get();
-    if (st.reader_db == null) {
+    if (st.dbHandle() == null) {
         return xrpc.writeError(hc, .service_unavailable, "ServiceUnavailable", "db not ready");
     }
     const auth_hdr = hc.request.header("Authorization");
@@ -1010,7 +1010,7 @@ fn repoUploadBlob(hc: *HandlerContext) anyerror!void {
     // the build graph). Instead, perform an inline storeBlob using the
     // shared `atp_blobs` table — semantically identical to what
     // `media.api.storeBlobBytes` would do.
-    const db = st.reader_db.?;
+    const db = st.dbHandle().?;
     // Spec: BlobRef CIDs are CIDv1 raw codec (0x55), sha2-256, base32-lower
     // with `b` multibase prefix. Format: `bafkrei…`.
     const blob_cid = cid_mod.computeRaw(bytes);
@@ -1076,7 +1076,7 @@ fn repoUploadBlob(hc: *HandlerContext) anyerror!void {
 // or, when spilled, the shared `core.blob` store.
 fn serveBlobByCid(hc: *HandlerContext) anyerror!void {
     const st = State.get();
-    const db = st.reader_db orelse return xrpc.writeError(hc, .service_unavailable, "ServiceUnavailable", "db not ready");
+    const db = st.dbHandle() orelse return xrpc.writeError(hc, .service_unavailable, "ServiceUnavailable", "db not ready");
     const cid = hc.params.get("cid") orelse return xrpc.writeError(hc, .bad_request, "InvalidRequest", "missing cid");
 
     var stmt: ?*c.sqlite3_stmt = null;
@@ -1132,7 +1132,7 @@ fn serveBlobByCid(hc: *HandlerContext) anyerror!void {
 // ingestion is the load-bearing half and is what migrations need.
 fn importRepo(hc: *HandlerContext) anyerror!void {
     const st = State.get();
-    const db = st.reader_db orelse return xrpc.writeError(hc, .service_unavailable, "ServiceUnavailable", "db not ready");
+    const db = st.dbHandle() orelse return xrpc.writeError(hc, .service_unavailable, "ServiceUnavailable", "db not ready");
     const car_bytes = hc.request.body;
     if (car_bytes.len == 0) {
         return xrpc.writeError(hc, .bad_request, "InvalidRequest", "empty body");
@@ -1321,7 +1321,7 @@ fn identityResolveIdentity(hc: *HandlerContext) anyerror!void {
 // single repo.commit call so one #commit event covers the batch.
 fn applyWrites(hc: *HandlerContext) anyerror!void {
     const st = State.get();
-    const db = st.reader_db orelse {
+    const db = st.dbHandle() orelse {
         return xrpc.writeError(hc, .service_unavailable, "ServiceUnavailable", "db not ready");
     };
     const repo_did = xrpc.jsonStringField(hc.request.body, "repo") orelse
@@ -1420,7 +1420,7 @@ fn applyWrites(hc: *HandlerContext) anyerror!void {
 // fall back to the configured `core.blob.global()` store.
 fn syncGetBlob(hc: *HandlerContext) anyerror!void {
     const st = State.get();
-    const db = st.reader_db orelse {
+    const db = st.dbHandle() orelse {
         return xrpc.writeError(hc, .service_unavailable, "ServiceUnavailable", "db not ready");
     };
     const q = hc.request.pathAndQuery().query;
@@ -1493,7 +1493,7 @@ fn syncGetBlob(hc: *HandlerContext) anyerror!void {
 // or more labellers (we record `src` per label row).
 fn labelQueryLabels(hc: *HandlerContext) anyerror!void {
     const st = State.get();
-    const db = st.reader_db orelse {
+    const db = st.dbHandle() orelse {
         return xrpc.writeError(hc, .service_unavailable, "ServiceUnavailable", "db not ready");
     };
     const q = hc.request.pathAndQuery().query;
@@ -1569,7 +1569,7 @@ fn syncRequestCrawl(hc: *HandlerContext) anyerror!void {
     // AT-2: persist the relay's hostname (so it can be subscribed to our
     // subscribeRepos stream). We accept all crawl requests today; rate
     // limiting + a deny list are policy items.
-    if (st.reader_db) |db| {
+    if (st.dbHandle()) |db| {
         var stmt: ?*c.sqlite3_stmt = null;
         if (c.sqlite3_prepare_v2(db, "INSERT INTO atp_crawl_subscriptions(hostname, requested_at) VALUES (?,?) ON CONFLICT(hostname) DO UPDATE SET requested_at = excluded.requested_at", -1, &stmt, null) == c.SQLITE_OK) {
             defer _ = c.sqlite3_finalize(stmt);
@@ -1596,7 +1596,7 @@ fn syncNotifyOfUpdate(hc: *HandlerContext) anyerror!void {
 // migration below.
 fn moderationCreateReport(hc: *HandlerContext) anyerror!void {
     const st = State.get();
-    const db = st.reader_db orelse {
+    const db = st.dbHandle() orelse {
         return xrpc.writeError(hc, .service_unavailable, "ServiceUnavailable", "db not ready");
     };
     const reason_type = xrpc.jsonStringField(hc.request.body, "reasonType") orelse
@@ -1655,7 +1655,7 @@ fn identityUpdateHandle(hc: *HandlerContext) anyerror!void {
         else => return xrpc.writeError(hc, .internal, "InternalError", "set handle"),
     };
 
-    if (st.reader_db) |db| {
+    if (st.dbHandle()) |db| {
         _ = firehose.appendIdentity(db, sub, new_handle, st.clock.wallUnix()) catch {};
     }
     try xrpc.writeJsonBody(hc, .ok, "{}");

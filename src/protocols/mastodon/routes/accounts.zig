@@ -26,7 +26,7 @@ fn writeAccountForUser(hc: *HandlerContext, st: *state_mod.State, u: db_mod.User
     var iso_buf: [32]u8 = undefined;
     const iso = serialize.formatIsoTimestamp(u.created_at, &iso_buf) catch "1970-01-01T00:00:00Z";
 
-    const db = st.db.?;
+    const db = st.dbHandle().?;
     var acct_uri_buf: [256]u8 = undefined;
     const acct_uri = std.fmt.bufPrint(&acct_uri_buf, "https://{s}/users/{s}", .{ st.hostname(), u.username() }) catch return http_util.writeError(hc, .internal, "uri buf");
 
@@ -48,7 +48,7 @@ fn writeAccountForUser(hc: *HandlerContext, st: *state_mod.State, u: db_mod.User
 
 pub fn handleGetAccount(hc: *HandlerContext) anyerror!void {
     const st = state_mod.get();
-    const db = st.db orelse return http_util.writeError(hc, .service_unavailable, "db not ready");
+    const db = st.dbHandle() orelse return http_util.writeError(hc, .service_unavailable, "db not ready");
     const id_str = hc.params.get("id") orelse return http_util.writeError(hc, .bad_request, "id required");
     const id = parseId(id_str);
     if (id == 0) return http_util.writeError(hc, .not_found, "unknown account");
@@ -60,14 +60,14 @@ pub fn handleVerifyCredentials(hc: *HandlerContext) anyerror!void {
     const st = state_mod.get();
     const claims = (try auth.requireScope(hc, "read")) orelse return;
     if (claims.user_id == 0) return http_util.writeError(hc, .forbidden, "client-only token");
-    const db = st.db orelse return http_util.writeError(hc, .service_unavailable, "db not ready");
+    const db = st.dbHandle() orelse return http_util.writeError(hc, .service_unavailable, "db not ready");
     const u = db_mod.findUserById(db, claims.user_id) orelse return http_util.writeError(hc, .not_found, "user gone");
     try writeAccountForUser(hc, st, u);
 }
 
 pub fn handleAccountStatuses(hc: *HandlerContext) anyerror!void {
     const st = state_mod.get();
-    const db = st.db orelse return http_util.writeError(hc, .service_unavailable, "db not ready");
+    const db = st.dbHandle() orelse return http_util.writeError(hc, .service_unavailable, "db not ready");
     const id_str = hc.params.get("id") orelse return http_util.writeError(hc, .bad_request, "id required");
     const actor_id = parseId(id_str);
 
@@ -135,7 +135,7 @@ pub fn handleAccountFollow(hc: *HandlerContext) anyerror!void {
     const st = state_mod.get();
     const claims = (try auth.requireScope(hc, "follow")) orelse return;
     if (claims.user_id == 0) return http_util.writeError(hc, .forbidden, "client-only token");
-    const db = st.db orelse return http_util.writeError(hc, .service_unavailable, "db not ready");
+    const db = st.dbHandle() orelse return http_util.writeError(hc, .service_unavailable, "db not ready");
     const id_str = hc.params.get("id") orelse return http_util.writeError(hc, .bad_request, "id required");
     const target_id = parseId(id_str);
     const me = db_mod.findUserById(db, claims.user_id) orelse return http_util.writeError(hc, .not_found, "user gone");
@@ -159,7 +159,7 @@ pub fn handleAccountUnfollow(hc: *HandlerContext) anyerror!void {
     const st = state_mod.get();
     const claims = (try auth.requireScope(hc, "follow")) orelse return;
     if (claims.user_id == 0) return http_util.writeError(hc, .forbidden, "client-only token");
-    const db = st.db orelse return http_util.writeError(hc, .service_unavailable, "db not ready");
+    const db = st.dbHandle() orelse return http_util.writeError(hc, .service_unavailable, "db not ready");
     const id_str = hc.params.get("id") orelse return http_util.writeError(hc, .bad_request, "id required");
     const target_id = parseId(id_str);
     const me = db_mod.findUserById(db, claims.user_id) orelse return http_util.writeError(hc, .not_found, "user gone");

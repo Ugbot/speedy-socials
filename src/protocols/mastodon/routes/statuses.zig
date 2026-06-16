@@ -27,7 +27,7 @@ pub fn handleCreateStatus(hc: *HandlerContext) anyerror!void {
     const st = state_mod.get();
     const claims = (try auth.requireScope(hc, "write")) orelse return;
     if (claims.user_id == 0) return http_util.writeError(hc, .forbidden, "client-only token");
-    const db = st.db orelse return http_util.writeError(hc, .service_unavailable, "db not ready");
+    const db = st.dbHandle() orelse return http_util.writeError(hc, .service_unavailable, "db not ready");
 
     const body = hc.request.body;
     const status_text = http_util.jsonString(body, "status") orelse
@@ -89,7 +89,7 @@ fn renderStatusJson(
 
 pub fn handleGetStatus(hc: *HandlerContext) anyerror!void {
     const st = state_mod.get();
-    const db = st.db orelse return http_util.writeError(hc, .service_unavailable, "db not ready");
+    const db = st.dbHandle() orelse return http_util.writeError(hc, .service_unavailable, "db not ready");
     const id_str = hc.params.get("id") orelse return http_util.writeError(hc, .bad_request, "id required");
     const id = parseId(id_str);
     const row = db_mod.findStatusById(db, id) orelse return http_util.writeError(hc, .not_found, "unknown status");
@@ -101,7 +101,7 @@ pub fn handleDeleteStatus(hc: *HandlerContext) anyerror!void {
     const st = state_mod.get();
     const claims = (try auth.requireScope(hc, "write")) orelse return;
     if (claims.user_id == 0) return http_util.writeError(hc, .forbidden, "client-only token");
-    const db = st.db orelse return http_util.writeError(hc, .service_unavailable, "db not ready");
+    const db = st.dbHandle() orelse return http_util.writeError(hc, .service_unavailable, "db not ready");
     const id_str = hc.params.get("id") orelse return http_util.writeError(hc, .bad_request, "id required");
     const id = parseId(id_str);
     const deleted = db_mod.deleteStatus(db, id, claims.user_id) catch false;
@@ -126,7 +126,7 @@ fn favouriteToggle(hc: *HandlerContext, favourite: bool) !void {
     const st = state_mod.get();
     const claims = (try auth.requireScope(hc, "write")) orelse return;
     if (claims.user_id == 0) return http_util.writeError(hc, .forbidden, "client-only token");
-    const db = st.db orelse return http_util.writeError(hc, .service_unavailable, "db not ready");
+    const db = st.dbHandle() orelse return http_util.writeError(hc, .service_unavailable, "db not ready");
     const id_str = hc.params.get("id") orelse return http_util.writeError(hc, .bad_request, "id required");
     const id = parseId(id_str);
     if (favourite) {
@@ -150,7 +150,7 @@ fn reblogToggle(hc: *HandlerContext, reblog: bool) !void {
     const st = state_mod.get();
     const claims = (try auth.requireScope(hc, "write")) orelse return;
     if (claims.user_id == 0) return http_util.writeError(hc, .forbidden, "client-only token");
-    const db = st.db orelse return http_util.writeError(hc, .service_unavailable, "db not ready");
+    const db = st.dbHandle() orelse return http_util.writeError(hc, .service_unavailable, "db not ready");
     const id_str = hc.params.get("id") orelse return http_util.writeError(hc, .bad_request, "id required");
     const id = parseId(id_str);
     if (reblog) {

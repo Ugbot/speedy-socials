@@ -24,6 +24,12 @@ pub const default_pool_size: u32 = 8;
 pub const PoolType = core.workers.Pool(default_pool_size);
 
 pub const State = struct {
+    /// H2: per-request DB handle (tenant-routed when configured, else the
+    /// boot handle). Request handlers read the DB through this.
+    pub fn dbHandle(self: *State) ?*c.sqlite3 {
+        return core.storage.currentHandle() orelse self.db;
+    }
+
     /// Direct SQLite connection used for synchronous reads + writes off
     /// the request hot path. Same pattern as relay/state.zig: admin/AP
     /// federation traffic is rare enough that one shared connection

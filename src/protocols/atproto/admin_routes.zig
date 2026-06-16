@@ -132,7 +132,7 @@ fn updateAccountHandle(hc: *HandlerContext) anyerror!void {
         error.NotFound => return xrpc.writeError(hc, .not_found, "AccountNotFound", "no account"),
         else => return xrpc.writeError(hc, .internal, "InternalError", "set handle"),
     };
-    if (st.reader_db) |db| {
+    if (st.dbHandle()) |db| {
         _ = firehose.appendIdentity(db, did, handle, st.clock.wallUnix()) catch {};
     }
     try xrpc.writeJsonBody(hc, .ok, "{}");

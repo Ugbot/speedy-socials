@@ -19,6 +19,13 @@ const keypair = @import("keypair.zig");
 const tid = @import("tid.zig");
 
 pub const State = struct {
+    /// H2: per-request DB handle. Tenant-routed when the server has bound
+    /// this request to a per-tenant database; otherwise the boot handle.
+    /// Request handlers read the DB through this (not raw `reader_db`).
+    pub fn dbHandle(self: *State) ?*c.sqlite3 {
+        return core.storage.currentHandle() orelse self.reader_db;
+    }
+
     /// Direct writer-side SQLite connection. Used by the synchronous
     /// admin-bound paths (repo commit, firehose append) that don't need
     /// the writer-thread channel. WAL allows reads in parallel.

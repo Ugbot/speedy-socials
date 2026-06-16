@@ -89,7 +89,7 @@ fn init(_: ?*anyopaque, ctx: *Context) anyerror!void {
     // Outbox worker starts only if a db was attached. In test harnesses
     // that skip the integration step it is a no-op.
     const st = state.get();
-    if (st.db) |db| {
+    if (st.dbHandle()) |db| {
         st.outbox.start(db, ctx.clock, ctx.rng) catch |err| {
             std.debug.print("activitypub: outbox worker failed to start: {s}\n", .{@errorName(err)});
         };

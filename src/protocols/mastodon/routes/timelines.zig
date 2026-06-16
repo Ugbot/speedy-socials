@@ -40,7 +40,7 @@ pub fn handleHashtag(hc: *HandlerContext) anyerror!void {
 
 fn writeTimeline(hc: *HandlerContext, hashtag_filter: []const u8, _: i64) !void {
     const st = state_mod.get();
-    const db = st.db orelse return http_util.writeError(hc, .service_unavailable, "db not ready");
+    const db = st.dbHandle() orelse return http_util.writeError(hc, .service_unavailable, "db not ready");
 
     const pq = hc.request.pathAndQuery();
     const since = if (http_util.queryParam(pq.query, "since_id")) |s| parseId(s) else 0;

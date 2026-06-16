@@ -83,7 +83,7 @@ fn wellKnownProtectedResource(hc: *HandlerContext) anyerror!void {
 
 fn parRequest(hc: *HandlerContext) anyerror!void {
     const st = State.get();
-    const db = st.reader_db orelse return xrpc.writeError(hc, .service_unavailable, "ServiceUnavailable", "db not ready");
+    const db = st.dbHandle() orelse return xrpc.writeError(hc, .service_unavailable, "ServiceUnavailable", "db not ready");
 
     // PAR accepts the same parameters as `authorize` but inline. We
     // require client_id, response_type=code, redirect_uri, code_challenge,
@@ -155,7 +155,7 @@ fn parRequest(hc: *HandlerContext) anyerror!void {
 
 fn authorize(hc: *HandlerContext) anyerror!void {
     const st = State.get();
-    const db = st.reader_db orelse return xrpc.writeError(hc, .service_unavailable, "ServiceUnavailable", "db not ready");
+    const db = st.dbHandle() orelse return xrpc.writeError(hc, .service_unavailable, "ServiceUnavailable", "db not ready");
     const backend = core.account.global() orelse return xrpc.writeError(hc, .service_unavailable, "ServiceUnavailable", "account backend not configured");
 
     const request_uri = xrpc.jsonStringField(hc.request.body, "request_uri") orelse
@@ -225,7 +225,7 @@ fn authorize(hc: *HandlerContext) anyerror!void {
 
 fn token(hc: *HandlerContext) anyerror!void {
     const st = State.get();
-    const db = st.reader_db orelse return xrpc.writeError(hc, .service_unavailable, "ServiceUnavailable", "db not ready");
+    const db = st.dbHandle() orelse return xrpc.writeError(hc, .service_unavailable, "ServiceUnavailable", "db not ready");
 
     const grant_type = xrpc.jsonStringField(hc.request.body, "grant_type") orelse
         return xrpc.writeError(hc, .bad_request, "invalid_request", "missing grant_type");

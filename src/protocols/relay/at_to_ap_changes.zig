@@ -29,7 +29,7 @@ const max_activity_id_bytes: usize = 512;
 
 pub fn onChange(kind: repo.ChangeKind, did: []const u8, collection: []const u8, rkey: []const u8, cid: []const u8) void {
     const st = state.get();
-    const db = st.reader_db orelse return;
+    const db = st.dbHandle() orelse return;
     const clock = st.clock;
 
     // We only bridge a known set of collections — the same ones the

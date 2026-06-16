@@ -374,7 +374,7 @@ fn extractUserId(ctx: *WsUpgradeContext) !?i64 {
     const now = st.clock.wallUnix();
     var claims: jwt.Claims = .{};
     jwt.verify(t, st.jwt_key.public_key, now, &claims) catch return null;
-    if (st.db) |db| {
+    if (st.dbHandle()) |db| {
         if (auth.isRevoked(db, claims.jti())) return null;
     }
     if (claims.user_id == 0) return null;

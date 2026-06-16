@@ -274,11 +274,25 @@ pub const Backend = struct {
 
 var global_backend: ?Backend = null;
 
+/// Per-thread scratch backend wrapping the current request's tenant handle.
+/// `SqliteBackend.backend()` stores `ctx = &self`, so a thread-local is
+/// pointer-stable for the duration of a request (each worker thread has its
+/// own). Rebuilt per `global()` call — trivial (just stores a db pointer).
+threadlocal var tenant_backend: SqliteBackend = undefined;
+
 pub fn setGlobal(b: Backend) void {
     global_backend = b;
 }
 
+/// The active account backend. When the server has routed this request to a
+/// per-tenant database (H2), wrap that tenant's handle so account
+/// create/lookup hit the tenant's store; otherwise the process-wide backend.
+/// Default tenant → `currentHandle()` is null → unchanged behaviour.
 pub fn global() ?Backend {
+    if (storage.currentHandle()) |h| {
+        tenant_backend = SqliteBackend.init(h);
+        return tenant_backend.backend();
+    }
     return global_backend;
 }
 
@@ -875,6 +889,60 @@ test "MemoryBackend: create + lookup by id/handle/email" {
 
     var miss: Account = .{};
     try testing.expect(!(try be.lookupById("did:plc:nobody", &miss)));
+}
+
+test "H2: per-tenant account isolation through the DbProvider seam" {
+    // The security-critical proof: an account created while routed to
+    // tenant A's database is INVISIBLE when the request is routed to
+    // tenant B (separate per-tenant SQLite files), and reappears when we
+    // route back to A. Exercises account.global() → currentHandle() →
+    // SqliteProvider per-tenant routing end to end.
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    argon2id.configure(testing.allocator, threaded.io());
+
+    const root = "/tmp/sps-acct-iso";
+    var rz: [64]u8 = undefined;
+    @memcpy(rz[0..root.len], root);
+    rz[root.len] = 0;
+    _ = std.c.mkdir(@ptrCast(&rz), 0o755);
+
+    const ddb = try storage.sqlite.openWriter(":memory:");
+    defer storage.sqlite.closeDb(ddb);
+    var prov = storage.SqliteProvider.init(testing.allocator, ddb, root);
+    defer prov.deinit();
+
+    // The provider owns + applies the schema (bookkeeping table first,
+    // then the account tables) to each per-tenant DB it opens.
+    var schema = storage.Schema.init();
+    try schema.register(.{ .id = 1, .name = "bk", .up = "CREATE TABLE migrations(id INTEGER PRIMARY KEY, name TEXT, applied_at INTEGER)", .down = null });
+    try schema.register(sqlite_migration);
+    try prov.dbProvider().migrate(&schema);
+    try prov.dbProvider().ensureTenant("ta");
+    try prov.dbProvider().ensureTenant("tb");
+
+    storage.setProvider(prov.dbProvider());
+    defer storage.setProvider(null);
+    defer storage.clearCurrentTenant();
+
+    // Create alice while routed to tenant A.
+    storage.setCurrentTenant("ta");
+    try global().?.create(&.{ .id = "did:plc:alice", .handle = "alice.ta", .email = "a@x.test", .password = "hunter2" }, 1000);
+    var acc: Account = .{};
+    try testing.expect(try global().?.lookupByHandle("alice.ta", &acc));
+
+    // Route to tenant B — alice must be absent (separate database).
+    storage.setCurrentTenant("tb");
+    var acc2: Account = .{};
+    try testing.expect(!(try global().?.lookupByHandle("alice.ta", &acc2)));
+
+    // Route back to A — present again.
+    storage.setCurrentTenant("ta");
+    try testing.expect(try global().?.lookupByHandle("alice.ta", &acc));
+
+    storage.clearCurrentTenant();
+    _ = std.c.unlink("/tmp/sps-acct-iso/ta.db");
+    _ = std.c.unlink("/tmp/sps-acct-iso/tb.db");
 }
 
 test "MemoryBackend: duplicate id rejected" {
