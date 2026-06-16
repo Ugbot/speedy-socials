@@ -766,7 +766,7 @@ seams.
 
 ## Low
 
-- [~] **AT-23. `com.atproto.repo.importRepo`.**
+- [x] **AT-23. `com.atproto.repo.importRepo`.**
       **Effort: S.** *Touches: routes.zig + CAR reader.*
       Acceptance: POST a CAR file; persist all blocks + records;
       replay missing commits. Mostly useful for migrations.

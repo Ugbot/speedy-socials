@@ -1163,6 +1163,7 @@ fn importRepo(hc: *HandlerContext) anyerror!void {
     const ins_sql = "INSERT OR REPLACE INTO atp_mst_blocks (cid, did, data) VALUES (?,?,?)";
     var reader = car.Reader.init(car_bytes);
     var stored: u32 = 0;
+    var mst_block: []const u8 = ""; // our MST root serializes as a top-level CBOR array
     while (reader.next() catch
         return xrpc.writeError(hc, .bad_request, "InvalidRequest", "malformed CAR")) |block|
     {
@@ -1175,12 +1176,94 @@ fn importRepo(hc: *HandlerContext) anyerror!void {
         _ = c.sqlite3_bind_text(stmt, 2, did.ptr, @intCast(did.len), c.sqliteTransientAsDestructor());
         _ = c.sqlite3_bind_blob(stmt, 3, block.data.ptr, @intCast(block.data.len), c.sqliteTransientAsDestructor());
         if (c.sqlite3_step(stmt.?) == c.SQLITE_DONE) stored += 1;
+        // The MST root block is the only top-level CBOR array (record
+        // blocks are maps, the commit is a map).
+        if (block.data.len > 0 and (block.data[0] >> 5) == 4) mst_block = block.data;
     }
 
+    // AT-23: extract records from the MST so getRecord/listRecords serve
+    // the imported repo (not just getBlocks). Walks the leaf array and
+    // copies each record's stored block into atp_records.
+    const extracted = if (mst_block.len > 0) extractImportedRecords(db, did, mst_block, st.clock.wallUnix()) else 0;
+
     var resp_buf: [128]u8 = undefined;
-    const body = std.fmt.bufPrint(&resp_buf, "{{\"imported\":{d}}}", .{stored}) catch
+    const body = std.fmt.bufPrint(&resp_buf, "{{\"imported\":{d},\"records\":{d}}}", .{ stored, extracted }) catch
         return xrpc.writeError(hc, .internal, "InternalError", "fmt");
     try xrpc.writeJsonBody(hc, .ok, body);
+}
+
+// AT-23: decode our MST root block (a dag-cbor array of `[key, cidlink]`)
+// and populate `atp_records` for each leaf, sourcing the record value
+// from the already-imported `atp_mst_blocks`. Returns the count inserted.
+fn extractImportedRecords(db: *c.sqlite3, did: []const u8, mst_block: []const u8, now: i64) u32 {
+    var dec = dag.Decoder.init(mst_block);
+    const top = dec.nextEvent() catch return 0;
+    const n: u64 = switch (top) {
+        .array_start => |count| count,
+        else => return 0,
+    };
+    var inserted: u32 = 0;
+    var i: u64 = 0;
+    while (i < n and i < mst.max_keys) : (i += 1) {
+        const leaf = dec.nextEvent() catch return inserted;
+        switch (leaf) {
+            .array_start => |c2| if (c2 != 2) return inserted,
+            else => return inserted,
+        }
+        const key_ev = dec.nextEvent() catch return inserted;
+        const key: []const u8 = switch (key_ev) {
+            .bytes => |b| b,
+            .text => |t| t,
+            else => return inserted,
+        };
+        const cid_ev = dec.nextEvent() catch return inserted;
+        const cidb: []const u8 = switch (cid_ev) {
+            .cid => |b| b,
+            else => return inserted,
+        };
+        if (cidb.len != cid_mod.raw_cid_len) continue;
+        var rec_cid: cid_mod.Cid = .{ .bytes = undefined };
+        @memcpy(rec_cid.bytes[0..], cidb[0..cid_mod.raw_cid_len]);
+        var cidstr_buf: [cid_mod.string_cid_len]u8 = undefined;
+        const cidstr = cid_mod.encodeString(rec_cid, &cidstr_buf) catch continue;
+        // key = "collection/rkey".
+        const slash = std.mem.lastIndexOfScalar(u8, key, '/') orelse continue;
+        const collection = key[0..slash];
+        const rkey = key[slash + 1 ..];
+        if (collection.len == 0 or rkey.len == 0) continue;
+
+        // Fetch the record value bytes from the imported blocks.
+        var vbuf: [16 * 1024]u8 = undefined;
+        var vlen: usize = 0;
+        {
+            var sel: ?*c.sqlite3_stmt = null;
+            if (c.sqlite3_prepare_v2(db, "SELECT data FROM atp_mst_blocks WHERE cid = ?", -1, &sel, null) != c.SQLITE_OK) continue;
+            defer _ = c.sqlite3_finalize(sel);
+            _ = c.sqlite3_bind_text(sel, 1, cidstr.ptr, @intCast(cidstr.len), c.sqliteTransientAsDestructor());
+            if (c.sqlite3_step(sel.?) != c.SQLITE_ROW) continue;
+            const p = c.sqlite3_column_blob(sel, 0);
+            const pn: usize = @intCast(c.sqlite3_column_bytes(sel, 0));
+            if (p == null or pn == 0 or pn > vbuf.len) continue;
+            const pp: [*]const u8 = @ptrCast(p);
+            @memcpy(vbuf[0..pn], pp[0..pn]);
+            vlen = pn;
+        }
+
+        var uri_buf: [512]u8 = undefined;
+        const uri = std.fmt.bufPrint(&uri_buf, "at://{s}/{s}/{s}", .{ did, collection, rkey }) catch continue;
+        var ins: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(db, "INSERT OR REPLACE INTO atp_records (uri, did, collection, rkey, cid, value, indexed_at) VALUES (?,?,?,?,?,?,?)", -1, &ins, null) != c.SQLITE_OK) continue;
+        defer _ = c.sqlite3_finalize(ins);
+        _ = c.sqlite3_bind_text(ins, 1, uri.ptr, @intCast(uri.len), c.sqliteTransientAsDestructor());
+        _ = c.sqlite3_bind_text(ins, 2, did.ptr, @intCast(did.len), c.sqliteTransientAsDestructor());
+        _ = c.sqlite3_bind_text(ins, 3, collection.ptr, @intCast(collection.len), c.sqliteTransientAsDestructor());
+        _ = c.sqlite3_bind_text(ins, 4, rkey.ptr, @intCast(rkey.len), c.sqliteTransientAsDestructor());
+        _ = c.sqlite3_bind_text(ins, 5, cidstr.ptr, @intCast(cidstr.len), c.sqliteTransientAsDestructor());
+        _ = c.sqlite3_bind_blob(ins, 6, &vbuf, @intCast(vlen), c.sqliteTransientAsDestructor());
+        _ = c.sqlite3_bind_int64(ins, 7, now);
+        if (c.sqlite3_step(ins.?) == c.SQLITE_DONE) inserted += 1;
+    }
+    return inserted;
 }
 
 // AT-18b: `com.atproto.identity.resolveIdentity`. Combines the
@@ -1948,4 +2031,45 @@ test "DUAL-4 reverse: per-account DID doc lists at:// + AP actor in alsoKnownAs"
     try testing.expect(std.mem.indexOf(u8, doc, "\"at://alice.example\"") != null);
     try testing.expect(std.mem.indexOf(u8, doc, "https://pds.example/users/alice.example") != null);
     try testing.expect(std.mem.indexOf(u8, doc, "\"Multikey\"") != null);
+}
+
+test "AT-23: extractImportedRecords populates atp_records from the MST block" {
+    const db = try setupRouteDb();
+    defer core.storage.sqlite.closeDb(db);
+    const did = "did:web:host/importer";
+
+    // A record block + its CID, stored as an imported block.
+    var rb: [64]u8 = undefined;
+    var renc = dag.Encoder.init(&rb);
+    try renc.writeMapHeader(1);
+    try renc.writeText("t");
+    try renc.writeText("hi");
+    const rec = renc.written();
+    const rec_cid = cid_mod.computeDagCbor(rec);
+    var rcid_buf: [cid_mod.string_cid_len]u8 = undefined;
+    const rcid = try cid_mod.encodeString(rec_cid, &rcid_buf);
+    {
+        var st_ins: ?*c.sqlite3_stmt = null;
+        try testing.expect(c.sqlite3_prepare_v2(db, "INSERT INTO atp_mst_blocks (cid, did, data) VALUES (?,?,?)", -1, &st_ins, null) == c.SQLITE_OK);
+        defer _ = c.sqlite3_finalize(st_ins);
+        _ = c.sqlite3_bind_text(st_ins, 1, rcid.ptr, @intCast(rcid.len), c.sqliteTransientAsDestructor());
+        _ = c.sqlite3_bind_text(st_ins, 2, did.ptr, @intCast(did.len), c.sqliteTransientAsDestructor());
+        _ = c.sqlite3_bind_blob(st_ins, 3, rec.ptr, @intCast(rec.len), c.sqliteTransientAsDestructor());
+        try testing.expect(c.sqlite3_step(st_ins.?) == c.SQLITE_DONE);
+    }
+
+    // MST root block: array(1) of [ "app.test.note/r1", cidlink(rec) ].
+    var mb: [256]u8 = undefined;
+    var menc = dag.Encoder.init(&mb);
+    try menc.writeArrayHeader(1);
+    try menc.writeArrayHeader(2);
+    try menc.writeBytesValue("app.test.note/r1");
+    try menc.writeCidLink(rec_cid.raw());
+
+    const n = extractImportedRecords(db, did, menc.written(), 100);
+    try testing.expectEqual(@as(u32, 1), n);
+
+    var row: repo_mod.RecordRow = .{};
+    try testing.expect(try repo_mod.getRecord(db, did, "app.test.note", "r1", &row));
+    try testing.expectEqualSlices(u8, rec, row.value());
 }
