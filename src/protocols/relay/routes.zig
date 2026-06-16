@@ -303,6 +303,97 @@ fn handleSyntheticActor(hc: *HandlerContext) anyerror!void {
     try writeJsonLd(hc, .ok, body);
 }
 
+/// A2: DID document for a synthetic AT identity minted by the bridge.
+///
+///   GET /ap/did/:did   (the `:did` segment is the full DID; colons are
+///                        path-legal, and `%3A` is decoded for clients
+///                        that escape them)
+///
+/// Publishes the Ed25519 verification method backing the bridge's commit
+/// signatures (`synthetic_keys.deriveKeypair`), so AT-side consumers can
+/// resolve the key the relay signs synthetic repos with. 404 when the DID
+/// isn't a known synthetic identity.
+fn handleDidDoc(hc: *HandlerContext) anyerror!void {
+    const raw = hc.params.get("did") orelse {
+        return writeJson(hc, .bad_request, "{\"error\":\"missing did\"}");
+    };
+    var did_buf: [identity_map.max_did_bytes]u8 = undefined;
+    const did = percentDecode(raw, &did_buf);
+
+    const state = State.get();
+    const db = state.reader_db orelse {
+        return writeJson(hc, .service_unavailable, "{\"error\":\"db not ready\"}");
+    };
+
+    var arena_buf: [4 * 1024]u8 = undefined;
+    var arena = Arena.init(&arena_buf);
+    const actor_url = identity_map.actorForDid(db, did, &arena) catch null;
+    if (actor_url == null) return writeJson(hc, .not_found, "{\"error\":\"unknown did\"}");
+
+    // Same keypair the bridge signs this repo's commits with.
+    const kp = synthetic_keys.deriveKeypair(actor_url.?);
+
+    // did:key-style Multikey: z + base58btc(0xed01 ‖ pubkey).
+    var mb_buf: [80]u8 = undefined;
+    const multibase = ed25519Multibase(kp.public_key, &mb_buf) catch {
+        return writeJson(hc, .internal, "{\"error\":\"multibase\"}");
+    };
+
+    const host = ap_to_at_mod.relayHostPublic();
+    var body_buf: [max_response_bytes]u8 = undefined;
+    const body = std.fmt.bufPrint(&body_buf,
+        \\{{"@context":["https://www.w3.org/ns/did/v1","https://w3id.org/security/multikey/v1"],"id":"{s}","alsoKnownAs":["{s}"],"verificationMethod":[{{"id":"{s}#atproto","type":"Multikey","controller":"{s}","publicKeyMultibase":"{s}"}}],"assertionMethod":["{s}#atproto"],"service":[{{"id":"#atproto_pds","type":"AtprotoPersonalDataServer","serviceEndpoint":"https://{s}"}}]}}
+    , .{ did, actor_url.?, did, did, multibase, did, host }) catch {
+        return writeJson(hc, .internal, "{\"error\":\"didbuf\"}");
+    };
+    try writeJson(hc, .ok, body);
+}
+
+/// Encode an Ed25519 public key as a did:key-style multibase string:
+/// `z` ‖ base58btc(multicodec ed25519-pub `0xed01` ‖ key).
+fn ed25519Multibase(pubkey: [32]u8, out: []u8) ![]const u8 {
+    if (out.len < 1) return error.BufferTooSmall;
+    var mc: [34]u8 = undefined;
+    mc[0] = 0xed;
+    mc[1] = 0x01;
+    @memcpy(mc[2..34], &pubkey);
+    out[0] = 'z';
+    const n = try core.crypto.multibase.base58btcEncode(&mc, out[1..]);
+    return out[0 .. 1 + n];
+}
+
+/// Decode `%XX` escapes in a path segment into `out`; returns the decoded
+/// slice (aliasing `out`). Invalid escapes are passed through verbatim.
+fn percentDecode(s: []const u8, out: []u8) []const u8 {
+    var w: usize = 0;
+    var i: usize = 0;
+    while (i < s.len and w < out.len) {
+        if (s[i] == '%' and i + 2 < s.len) {
+            const hi = hexVal(s[i + 1]);
+            const lo = hexVal(s[i + 2]);
+            if (hi != null and lo != null) {
+                out[w] = (hi.? << 4) | lo.?;
+                w += 1;
+                i += 3;
+                continue;
+            }
+        }
+        out[w] = s[i];
+        w += 1;
+        i += 1;
+    }
+    return out[0..w];
+}
+
+fn hexVal(ch: u8) ?u8 {
+    return switch (ch) {
+        '0'...'9' => ch - '0',
+        'a'...'f' => ch - 'a' + 10,
+        'A'...'F' => ch - 'A' + 10,
+        else => null,
+    };
+}
+
 /// Best-effort handle extraction from an AT DID. `did:plc:abc123` →
 /// "abc123"; `did:web:example.com:user` → "user".
 fn makeUsername(did: []const u8, out: []u8) []const u8 {
@@ -446,6 +537,9 @@ pub fn register(router: *Router, plugin_index: u16) !void {
     // A1: synthetic AP actor — strict-verifying peers fetch this to
     // pick up the public key for signature verification.
     try router.register(.get, "/ap/users/:synth", handleSyntheticActor, plugin_index);
+    // A2: DID document for synthetic AT identities (publishes the bridge's
+    // Ed25519 signing key as a Multikey verification method).
+    try router.register(.get, "/ap/did/:did", handleDidDoc, plugin_index);
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -478,4 +572,37 @@ test "parseTwoStringFields finds both fields in any order" {
     );
     try testing.expectEqualStrings("activitypub_inbox", a);
     try testing.expectEqualStrings("wss://y", b);
+}
+
+test "A2: percentDecode decodes %3A and passes through plain colons" {
+    var out: [128]u8 = undefined;
+    try testing.expectEqualStrings("did:web:host:ap:alice", percentDecode("did%3Aweb%3Ahost%3Aap%3Aalice", &out));
+    try testing.expectEqualStrings("did:web:host:ap:alice", percentDecode("did:web:host:ap:alice", &out));
+    // A trailing stray '%' is passed through, not a crash.
+    try testing.expectEqualStrings("a%", percentDecode("a%", &out));
+    try testing.expectEqualStrings("100%done", percentDecode("100%done", &out));
+}
+
+test "A2: ed25519Multibase matches the did:key z-base58btc(0xed01‖key) form" {
+    // Cross-check against the independently-built reference vector.
+    var seed: [32]u8 = undefined;
+    @memset(&seed, 0x33);
+    const kp = synthetic_keys.Ed25519KeyPair.fromSeed(seed);
+
+    var out: [80]u8 = undefined;
+    const mb = try ed25519Multibase(kp.public_key, &out);
+    try testing.expect(mb[0] == 'z');
+
+    var mc: [34]u8 = undefined;
+    mc[0] = 0xed;
+    mc[1] = 0x01;
+    @memcpy(mc[2..34], &kp.public_key);
+    var b58: [80]u8 = undefined;
+    const bn = try core.crypto.multibase.base58btcEncode(&mc, &b58);
+    try testing.expectEqualStrings(b58[0..bn], mb[1..]);
+
+    // Deterministic across calls (the bridge re-derives the same key).
+    var out2: [80]u8 = undefined;
+    const mb2 = try ed25519Multibase(kp.public_key, &out2);
+    try testing.expectEqualStrings(mb, mb2);
 }

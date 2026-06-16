@@ -39,6 +39,8 @@ const Arena = core.arena.Arena;
 
 const RelayError = core.errors.RelayError;
 
+const profile_collection = "app.bsky.actor.profile";
+
 /// The relay's hostname, used to mint synthetic AT DIDs for AP actors
 /// that have no native AT presence. Set once at boot.
 var relay_host_buf: [256]u8 = undefined;
@@ -79,6 +81,15 @@ pub fn collectionFor(act: *const Activity) ?[]const u8 {
             // body changes the CID when it actually changed.
             if (std.ascii.eqlIgnoreCase(act.object_type, "Note")) {
                 break :blk "app.bsky.feed.post";
+            }
+            // I3: AP actor profile changes arrive as Update{Person}
+            // (Mastodon also sends Update with a Person object on
+            // avatar/bio edits). Map to the AT profile collection.
+            if (std.ascii.eqlIgnoreCase(act.object_type, "Person") or
+                std.ascii.eqlIgnoreCase(act.object_type, "Service") or
+                std.ascii.eqlIgnoreCase(act.object_type, "Application"))
+            {
+                break :blk profile_collection;
             }
             break :blk null;
         },
@@ -208,16 +219,20 @@ fn onActivityReceivedImpl(act: *const Activity, raw_body: []const u8, db: *c.sql
     // — and so Create's bridged record carries the real text rather
     // than the literal string "Note".
     var record_buf: [16 * 1024]u8 = undefined;
-    const inner_content = extractApInnerContent(raw_body);
-    const record_cbor = try buildBridgeRecord(act, collection, inner_content, &record_buf);
+    const is_profile = std.mem.eql(u8, collection, profile_collection);
 
-    // Generate a stable rkey from the AP *object id* (NOT the activity
-    // id). A future Delete activity references the object id alone —
-    // keying on the same field on both sides means Delete can target
-    // the row by deriving the same rkey. Re-deliveries of Create with
-    // the same object_id INSERT-OR-REPLACE in atp_records.
-    const rkey_seed = if (act.object_id.len > 0) act.object_id else act.id;
-    const rkey = try translatedRkey(rkey_seed, &arena);
+    // I3: a profile lives at the fixed rkey `self` (one per repo), so
+    // repeated edits INSERT-OR-REPLACE the same row. Feed objects key
+    // off the AP object id so Delete can re-derive the same rkey.
+    const record_cbor = if (is_profile)
+        try buildProfileRecord(raw_body, &record_buf)
+    else
+        try buildBridgeRecord(act, collection, extractApInnerContent(raw_body), &record_buf);
+
+    const rkey = if (is_profile) "self" else blk: {
+        const rkey_seed = if (act.object_id.len > 0) act.object_id else act.id;
+        break :blk try translatedRkey(rkey_seed, &arena);
+    };
 
     // Load the current MST for this synthetic repo and commit one op.
     // The tree fits inline on the stack — at the bridge's projected
@@ -374,10 +389,44 @@ fn buildBridgeRecord(act: *const Activity, collection: []const u8, inner_content
 /// contain at most one such field at the relevant nesting level.
 /// Returns an empty slice when not found.
 fn extractApInnerContent(raw_body: []const u8) []const u8 {
-    const needle = "\"content\"";
+    return extractJsonStringField(raw_body, "content");
+}
+
+/// I3: build an AT `app.bsky.actor.profile` record from an AP Person
+/// object. Maps AP `name` → displayName and `summary` → description
+/// (Mastodon's bio). Falls back to `preferredUsername` for displayName
+/// when `name` is absent. The fields are read from the raw AP body.
+fn buildProfileRecord(raw_body: []const u8, out: []u8) ![]const u8 {
+    var display = extractJsonStringField(raw_body, "name");
+    if (display.len == 0) display = extractJsonStringField(raw_body, "preferredUsername");
+    const summary = extractJsonStringField(raw_body, "summary");
+
+    var enc = atproto.dag_cbor.Encoder.init(out);
+    try enc.writeMapHeader(3);
+    try enc.writeText("$type");
+    try enc.writeText(profile_collection);
+    try enc.writeText("displayName");
+    try enc.writeText(display);
+    try enc.writeText("description");
+    try enc.writeText(summary);
+    return enc.written();
+}
+
+/// First `"<field>":"<value>"` string value in a JSON body, with escape
+/// handling on the value. Empty slice when absent. Generalised from the
+/// original content-only extractor.
+fn extractJsonStringField(raw_body: []const u8, field: []const u8) []const u8 {
+    // Build the quoted key needle on a small stack buffer.
+    var needle_buf: [64]u8 = undefined;
+    if (field.len + 2 > needle_buf.len) return "";
+    needle_buf[0] = '"';
+    @memcpy(needle_buf[1 .. 1 + field.len], field);
+    needle_buf[1 + field.len] = '"';
+    const needle = needle_buf[0 .. field.len + 2];
+    const raw = raw_body;
     var i: usize = 0;
-    while (i + needle.len <= raw_body.len) : (i += 1) {
-        if (std.mem.eql(u8, raw_body[i..][0..needle.len], needle)) {
+    while (i + needle.len <= raw.len) : (i += 1) {
+        if (std.mem.eql(u8, raw[i..][0..needle.len], needle)) {
             // Skip whitespace + ':' + whitespace.
             var j: usize = i + needle.len;
             while (j < raw_body.len and (raw_body[j] == ' ' or raw_body[j] == '\t')) : (j += 1) {}
@@ -835,6 +884,60 @@ test "A3: Delete for an unknown object id is a logged no-op" {
     var rows: [4]subscription.LogEntry = undefined;
     const n = try subscription.listLog(db, 0, &rows);
     try testing.expect(n >= 1);
+}
+
+test "I3: Update{Person} commits an app.bsky.actor.profile record at rkey self" {
+    const db = try setupDb();
+    defer core.storage.sqlite.closeDb(db);
+    var sc = core.clock.SimClock.init(1_716_500_000);
+    setRelayHost("relay.test");
+    defer setRelayHost("");
+
+    const body =
+        "{\"type\":\"Update\",\"id\":\"https://m.example/users/gwen#updates/1\"," ++
+        "\"actor\":\"https://m.example/users/gwen\"," ++
+        "\"object\":{\"id\":\"https://m.example/users/gwen\",\"type\":\"Person\"," ++
+        "\"name\":\"Gwen 🌟\",\"preferredUsername\":\"gwen\"," ++
+        "\"summary\":\"bridge tester & <b>html</b>\"}}";
+    const act: Activity = .{
+        .activity_type = .update,
+        .id = "https://m.example/users/gwen#updates/1",
+        .actor = "https://m.example/users/gwen",
+        .object_id = "https://m.example/users/gwen",
+        .object_type = "Person",
+        .target = "",
+        .published = "2026-05-20T00:00:00Z",
+        .to_first = "",
+    };
+    onActivityReceived(&act, body, db, sc.clock());
+
+    var arena_buf: [1024]u8 = undefined;
+    var arena = Arena.init(&arena_buf);
+    const did = (try identity_map.didForActor(db, act.actor, &arena)).?;
+
+    // Exactly one profile record, at rkey 'self', carrying the name.
+    var row: atproto.repo.RecordRow = .{};
+    const found = try atproto.repo.getRecord(db, did, "app.bsky.actor.profile", "self", &row);
+    try testing.expect(found);
+    const value = row.value_buf[0..row.value_len];
+    // DAG-CBOR stores text values literally — the displayName + summary
+    // bytes appear verbatim in the encoded record.
+    try testing.expect(std.mem.indexOf(u8, value, "Gwen 🌟") != null);
+    try testing.expect(std.mem.indexOf(u8, value, "bridge tester") != null);
+
+    // The translation log records the at-uri with the profile collection.
+    var rows: [4]subscription.LogEntry = undefined;
+    const n = try subscription.listLog(db, 0, &rows);
+    try testing.expect(n >= 1);
+    try testing.expect(std.mem.indexOf(u8, rows[0].translatedId(), "app.bsky.actor.profile/self") != null);
+}
+
+test "I3: buildProfileRecord falls back to preferredUsername when name is absent" {
+    var out: [512]u8 = undefined;
+    const body = "{\"type\":\"Person\",\"preferredUsername\":\"solo\",\"summary\":\"\"}";
+    const rec = try buildProfileRecord(body, &out);
+    try testing.expect(std.mem.indexOf(u8, rec, "solo") != null);
+    try testing.expect(std.mem.indexOf(u8, rec, "app.bsky.actor.profile") != null);
 }
 
 test "onActivityReceived: unsupported activity type is silently dropped" {

@@ -16,9 +16,12 @@ const core = @import("core");
 const c = @import("sqlite").c;
 const atproto = @import("protocol_atproto");
 const repo = atproto.repo;
+const dag_cbor = atproto.dag_cbor;
 
 const state = @import("state.zig");
 const identity_map = @import("identity_map.zig");
+
+const profile_collection = "app.bsky.actor.profile";
 
 /// Bound the activity-id buffer; the AP activity id is built from
 /// the AT URI by replacing `/` → `:` to stay URL-safe.
@@ -46,6 +49,17 @@ pub fn onChange(kind: repo.ChangeKind, did: []const u8, collection: []const u8, 
     var ap_id_buf: [max_activity_id_bytes]u8 = undefined;
     const ap_id = buildApActivityId(st.relayHost(), at_uri, &ap_id_buf) catch return;
     _ = cid; // commit CID isn't needed for the AP envelope today
+
+    // I2: a profile create or update bridges to an AP `Update{Person}`
+    // carrying the actor's displayName→name + description→summary. The
+    // generic-Note path below only covers feed objects.
+    const is_profile = std.mem.eql(u8, collection, profile_collection);
+    if (is_profile and (kind == .create or kind == .update)) {
+        const payload = renderProfileUpdate(db, did, actor, ap_id, clock.wallUnix()) catch return;
+        enqueueOutboxBestEffort(db, actor, payload, clock.wallUnix());
+        logTranslation(db, "at_to_ap", at_uri, ap_id, clock.wallUnix());
+        return;
+    }
 
     switch (kind) {
         .create => {
@@ -131,6 +145,132 @@ const payload_static = struct {
     var len: u16 = 0;
 };
 
+// ── I2: AT app.bsky.actor.profile → AP Update{Person} ──────────────────
+
+pub const max_profile_field_bytes: usize = 1024;
+
+pub const ProfileFields = struct {
+    display_name: []const u8 = "",
+    description: []const u8 = "",
+};
+
+/// Extract `displayName` / `description` from a DAG-CBOR profile record.
+/// Returns empty strings for absent fields; never errors on malformed
+/// input (best-effort, slices alias the provided buffers).
+pub fn extractProfile(cbor: []const u8, dn_buf: []u8, desc_buf: []u8) ProfileFields {
+    var out: ProfileFields = .{};
+    var dec = dag_cbor.Decoder.init(cbor);
+    const first = dec.nextEvent() catch return out;
+    const pairs = switch (first) {
+        .map_start => |n| n,
+        else => return out,
+    };
+    var i: u64 = 0;
+    while (i < pairs) : (i += 1) {
+        const key_ev = dec.nextEvent() catch return out;
+        const key = switch (key_ev) {
+            .text => |t| t,
+            else => return out, // DAG-CBOR map keys are always text
+        };
+        const val_ev = dec.nextEvent() catch return out;
+        if (std.mem.eql(u8, key, "displayName")) {
+            if (val_ev == .text) out.display_name = copyInto(dn_buf, val_ev.text) else skipRest(&dec, val_ev) catch return out;
+        } else if (std.mem.eql(u8, key, "description")) {
+            if (val_ev == .text) out.description = copyInto(desc_buf, val_ev.text) else skipRest(&dec, val_ev) catch return out;
+        } else {
+            skipRest(&dec, val_ev) catch return out;
+        }
+    }
+    return out;
+}
+
+fn copyInto(buf: []u8, s: []const u8) []const u8 {
+    const n = @min(s.len, buf.len);
+    @memcpy(buf[0..n], s[0..n]);
+    return buf[0..n];
+}
+
+/// Consume the remainder of a value whose first event was already read.
+/// Recurses into containers; bounded by the DAG-CBOR decoder's own
+/// nesting limit on well-formed input.
+fn skipRest(dec: *dag_cbor.Decoder, ev: dag_cbor.Event) !void {
+    switch (ev) {
+        .map_start => |n| {
+            var i: u64 = 0;
+            while (i < n * 2) : (i += 1) {
+                const e = try dec.nextEvent();
+                try skipRest(dec, e);
+            }
+        },
+        .array_start => |n| {
+            var i: u64 = 0;
+            while (i < n) : (i += 1) {
+                const e = try dec.nextEvent();
+                try skipRest(dec, e);
+            }
+        },
+        else => {},
+    }
+}
+
+/// Render `Update{Person}` with the profile fields. Reads the profile
+/// record from `atp_records`; missing record => an Update with no
+/// name/summary (still signals "profile changed").
+fn renderProfileUpdate(db: *c.sqlite3, did: []const u8, actor: []const u8, ap_id: []const u8, _: i64) ![]const u8 {
+    var dn_buf: [max_profile_field_bytes]u8 = undefined;
+    var desc_buf: [max_profile_field_bytes]u8 = undefined;
+    var fields: ProfileFields = .{};
+
+    var row: repo.RecordRow = .{};
+    if (repo.getRecord(db, did, profile_collection, "self", &row)) |found| {
+        if (found) fields = extractProfile(row.value_buf[0..row.value_len], &dn_buf, &desc_buf);
+    } else |_| {}
+
+    var name_esc: [max_profile_field_bytes * 2]u8 = undefined;
+    var summary_esc: [max_profile_field_bytes * 2]u8 = undefined;
+    const name = jsonEscape(&name_esc, fields.display_name);
+    const summary = jsonEscape(&summary_esc, fields.description);
+
+    const fmt =
+        \\{{"@context":"https://www.w3.org/ns/activitystreams","id":"{s}","type":"Update","actor":"{s}","object":{{"id":"{s}","type":"Person","name":"{s}","summary":"{s}"}}}}
+    ;
+    const written = try std.fmt.bufPrint(&payload_static.buf, fmt, .{ ap_id, actor, actor, name, summary });
+    payload_static.len = @intCast(written.len);
+    return payload_static.buf[0..written.len];
+}
+
+/// Minimal RFC-8259 JSON string-body escaper (no surrounding quotes).
+/// Truncates if the escaped form would overflow `out`.
+fn jsonEscape(out: []u8, s: []const u8) []const u8 {
+    var w: usize = 0;
+    for (s) |ch| {
+        const seq: []const u8 = switch (ch) {
+            '"' => "\\\"",
+            '\\' => "\\\\",
+            '\n' => "\\n",
+            '\r' => "\\r",
+            '\t' => "\\t",
+            0x00...0x08, 0x0b, 0x0c, 0x0e...0x1f => {
+                // \u00XX escape, written directly to avoid a dangling slice.
+                const esc = std.fmt.bufPrint(out[w..], "\\u{x:0>4}", .{ch}) catch break;
+                w += esc.len;
+                continue;
+            },
+            else => {
+                if (w < out.len) {
+                    out[w] = ch;
+                    w += 1;
+                }
+                continue;
+            },
+        };
+        if (w + seq.len > out.len) break;
+        @memcpy(out[w .. w + seq.len], seq);
+        w += seq.len;
+    }
+    return out[0..w];
+}
+
 fn enqueueOutboxBestEffort(db: *c.sqlite3, actor: []const u8, payload: []const u8, now: i64) void {
     // Look up follower inboxes and enqueue one row per follower.
     // (Production also has the env-bootstrapped bridge_target_inbox,
@@ -196,4 +336,64 @@ test "Op-A: buildApActivityId replaces / with :" {
     var buf: [256]u8 = undefined;
     const id = try buildApActivityId("example.com", "at://did:plc:a/app.bsky.feed.post/rkey1", &buf);
     try testing.expect(std.mem.indexOf(u8, id, "at::did:plc:a:app.bsky.feed.post:rkey1") != null);
+}
+
+test "I2: extractProfile pulls displayName + description from DAG-CBOR" {
+    // Encode a realistic profile record: {$type, displayName, description,
+    // avatar:{...}} — the avatar map must be skipped, not mis-parsed.
+    var cbor_buf: [512]u8 = undefined;
+    var enc = dag_cbor.Encoder.init(&cbor_buf);
+    try enc.writeMapHeader(4);
+    try enc.writeText("$type");
+    try enc.writeText("app.bsky.actor.profile");
+    try enc.writeText("displayName");
+    try enc.writeText("Alice 🌸");
+    try enc.writeText("description");
+    try enc.writeText("hi \"there\"\nline2");
+    try enc.writeText("avatar");
+    try enc.writeMapHeader(1);
+    try enc.writeText("cid");
+    try enc.writeText("bafyblob");
+
+    var dn: [128]u8 = undefined;
+    var desc: [128]u8 = undefined;
+    const fields = extractProfile(enc.written(), &dn, &desc);
+    try testing.expectEqualStrings("Alice 🌸", fields.display_name);
+    try testing.expectEqualStrings("hi \"there\"\nline2", fields.description);
+}
+
+test "I2: extractProfile tolerates missing fields and malformed input" {
+    var dn: [64]u8 = undefined;
+    var desc: [64]u8 = undefined;
+
+    // Empty/garbage → empty fields, no crash (randomized fuzz).
+    var prng = std.Random.DefaultPrng.init(0x12_05_A2);
+    const rand = prng.random();
+    var trial: usize = 0;
+    while (trial < 200) : (trial += 1) {
+        var noise: [64]u8 = undefined;
+        const n = rand.intRangeAtMost(usize, 0, noise.len);
+        rand.bytes(noise[0..n]);
+        const f = extractProfile(noise[0..n], &dn, &desc);
+        _ = f; // must not crash
+    }
+
+    // A profile with only displayName.
+    var cbor_buf: [128]u8 = undefined;
+    var enc = dag_cbor.Encoder.init(&cbor_buf);
+    try enc.writeMapHeader(1);
+    try enc.writeText("displayName");
+    try enc.writeText("Bob");
+    const fields = extractProfile(enc.written(), &dn, &desc);
+    try testing.expectEqualStrings("Bob", fields.display_name);
+    try testing.expectEqualStrings("", fields.description);
+}
+
+test "I2: jsonEscape escapes quotes, backslashes and control chars" {
+    var out: [128]u8 = undefined;
+    try testing.expectEqualStrings("a\\\"b", jsonEscape(&out, "a\"b"));
+    try testing.expectEqualStrings("x\\\\y", jsonEscape(&out, "x\\y"));
+    try testing.expectEqualStrings("l1\\nl2", jsonEscape(&out, "l1\nl2"));
+    try testing.expectEqualStrings("\\u0001", jsonEscape(&out, "\x01"));
+    try testing.expectEqualStrings("plain", jsonEscape(&out, "plain"));
 }
