@@ -42,6 +42,7 @@ const metrics_mod = @import("metrics.zig");
 const log_mod = @import("log.zig");
 const trace_mod = @import("trace.zig");
 const tenancy_mod = @import("tenancy.zig");
+const storage_mod = @import("storage.zig");
 const rate_limit_mod = @import("rate_limit.zig");
 
 /// Monotonic nanosecond timestamp. Std's `nanoTimestamp` was removed
@@ -408,6 +409,12 @@ pub const Server = struct {
         // Suspended tenants get 503, deleted ones 404. Inert when no
         // tenant table is configured — resolveTenant returns .active.
         tenancy_mod.resetCurrent();
+        // H2: route storage to the resolved tenant's database. Cleared at
+        // the end of dispatch so a pooled/reused thread never leaks one
+        // tenant's handle into the next request. Inert (null → callers use
+        // their global handle) until a DbProvider + tenants are configured.
+        storage_mod.clearCurrentTenant();
+        defer storage_mod.clearCurrentTenant();
         if (request.header("Host")) |host_hdr| {
             switch (tenancy_mod.resolveTenant(host_hdr)) {
                 .active => {},
@@ -420,6 +427,8 @@ pub const Server = struct {
                     return;
                 },
             }
+            // Active: bind storage to this tenant (no-op for the default tenant).
+            storage_mod.setCurrentTenant(tenancy_mod.current());
         }
 
         // G3: per-IP rate limit. Inert when not configured.

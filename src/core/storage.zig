@@ -9,6 +9,18 @@ pub const backend = @import("storage/backend.zig");
 pub const Backend = backend.Backend;
 pub const SqliteBackend = backend.SqliteBackend;
 
+/// Pluggable per-tenant database provider (DbProvider + SqliteProvider) and
+/// the thread-local current-tenant routing seam. See `storage/provider.zig`.
+pub const provider = @import("storage/provider.zig");
+pub const DbProvider = provider.DbProvider;
+pub const SqliteProvider = provider.SqliteProvider;
+pub const setProvider = provider.setProvider;
+pub const dbProvider = provider.provider;
+pub const setCurrentTenant = provider.setCurrentTenant;
+pub const currentHandle = provider.currentHandle;
+pub const currentBackend = provider.currentBackend;
+pub const clearCurrentTenant = provider.clearCurrent;
+
 pub const StmtKey = stmts.StmtKey;
 pub const StmtTable = stmts.StmtTable;
 pub const Channel = channel.Channel;
@@ -32,4 +44,5 @@ test {
     _ = schema;
     _ = handle;
     _ = backend;
+    _ = provider;
 }

@@ -416,7 +416,30 @@ pub fn main() !void {
     // app passwords / invites) backing `core.account.SqliteBackend`.
     try schema.register(core.account.sqlite_migration);
     try registry.registerAllSchemas(&ctx, &schema);
-    try schema.applyAll(db);
+
+    // ── pluggable DB provider (owns migration + per-tenant routing) ──
+    // The provider applies the assembled schema to the default tenant
+    // (and, later, to each per-tenant DB it opens). Default backend =
+    // embedded SQLite over the global writer handle; per-tenant SQLite
+    // files live under TENANT_DB_ROOT (default ./tenants). Selected via
+    // STORAGE_BACKEND (postgres path wires a PostgresProvider here).
+    const tenant_root: []const u8 = if (std.c.getenv("TENANT_DB_ROOT")) |r| std.mem.sliceTo(r, 0) else "./tenants";
+    {
+        // Best-effort create the tenant DB root directory.
+        var root_z: [256]u8 = undefined;
+        if (tenant_root.len < root_z.len) {
+            @memcpy(root_z[0..tenant_root.len], tenant_root);
+            root_z[tenant_root.len] = 0;
+            _ = std.c.mkdir(@ptrCast(&root_z), 0o755);
+        }
+    }
+    var sqlite_provider = core.storage.SqliteProvider.init(gpa_allocator, db, tenant_root);
+    defer sqlite_provider.deinit();
+    core.storage.setProvider(sqlite_provider.dbProvider());
+    defer core.storage.setProvider(null);
+    // Migration ownership: the provider applies the schema (replaces the
+    // previous direct schema.applyAll(db)).
+    try sqlite_provider.dbProvider().migrate(&schema);
 
     // ── prepared statements + writer thread ────────────────────────
     try stmt_table.prepareAll(db);
@@ -819,7 +842,19 @@ pub fn main() !void {
         var tbl = core.tenancy.Table.init();
         if (tbl.parseEnv(std.mem.sliceTo(tn, 0))) {
             core.tenancy.setGlobalTable(tbl);
-            log_ptr.info("boot", "multi-tenant Host routing configured (TENANTS)");
+            // H2: eagerly open + migrate a per-tenant database for each
+            // configured tenant (the provider owns the migration). Eager
+            // at boot so the request hot path is a bounded lookup only.
+            var ti: u8 = 0;
+            while (ti < tbl.count) : (ti += 1) {
+                const tid = tbl.items[ti].id();
+                sqlite_provider.dbProvider().ensureTenant(tid) catch |err| {
+                    log_ptr.record(.warn, "boot", "failed to open tenant database", &.{
+                        .{ .k = "err", .v = @errorName(err) },
+                    });
+                };
+            }
+            log_ptr.info("boot", "multi-tenant Host routing + per-tenant storage configured (TENANTS)");
         } else |_| {
             log_ptr.warn("boot", "TENANTS failed to parse — multi-tenancy disabled");
         }
