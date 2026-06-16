@@ -159,6 +159,101 @@ fn loadInboundTlsIfConfigured(
     return ptr.backend();
 }
 
+// ── Streaming sink (Phase 4) ──────────────────────────────────────────
+// Owns the heap-pinned streaming-sink client (redis/nats/kafka) for the
+// lifetime of `main`. null/log carry no client.
+const StreamHolder = struct {
+    redis: ?*core.stream.redis_sink.RedisSink = null,
+    nats: ?*core.stream.nats_sink.NatsSink = null,
+    kafka: ?*core.stream.kafka_sink.KafkaSink = null,
+    allocator: ?std.mem.Allocator = null,
+
+    fn deinit(self: *StreamHolder) void {
+        core.stream.setGlobal(null); // detach before tearing down the client
+        if (self.allocator) |a| {
+            if (self.redis) |r| {
+                r.deinit();
+                a.destroy(r);
+            }
+            if (self.nats) |n| {
+                n.deinit();
+                a.destroy(n);
+            }
+            if (self.kafka) |k| {
+                k.deinit();
+                a.destroy(k);
+            }
+        }
+        self.* = .{};
+    }
+};
+
+/// Select + install the process-global streaming sink from STREAM_BACKEND
+/// (null|log|kafka|redis|nats). All backends are pure-Zig; redis/nats/kafka
+/// construct a long-lived heap-pinned client stored in `holder`.
+fn loadStreamSinkIfConfigured(
+    holder: *StreamHolder,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    log_ptr: *core.log.Log,
+    null_sink: *core.stream.NullSink,
+    log_sink: *core.stream.LogSink,
+) !void {
+    const backend_c = std.c.getenv("STREAM_BACKEND");
+    const backend_str = if (backend_c) |p| std.mem.sliceTo(p, 0) else "";
+    const backend = core.stream.Backend.parse(backend_str) orelse {
+        log_ptr.warn("boot", "unknown STREAM_BACKEND — defaulting to null (no-op) sink");
+        core.stream.setGlobal(null_sink.sink());
+        return;
+    };
+
+    switch (backend) {
+        .null_sink => {
+            core.stream.setGlobal(null_sink.sink());
+            log_ptr.info("boot", "stream sink: null (no-op)");
+        },
+        .log => {
+            core.stream.setGlobal(log_sink.sink());
+            log_ptr.info("boot", "stream sink: log (ring-log per publish)");
+        },
+        .redis => {
+            const url = if (std.c.getenv("REDIS_URL")) |p| std.mem.sliceTo(p, 0) else "127.0.0.1:6379";
+            const ptr = try allocator.create(core.stream.redis_sink.RedisSink);
+            errdefer allocator.destroy(ptr);
+            ptr.* = try core.stream.redis_sink.RedisSink.init(allocator, io, url);
+            holder.allocator = allocator;
+            holder.redis = ptr;
+            core.stream.setGlobal(ptr.sink());
+            log_ptr.info("boot", "stream sink: redis (XADD to Redis Streams)");
+        },
+        .nats => {
+            const url = if (std.c.getenv("NATS_URL")) |p| std.mem.sliceTo(p, 0) else "nats://127.0.0.1:4222";
+            const ptr = try allocator.create(core.stream.nats_sink.NatsSink);
+            errdefer allocator.destroy(ptr);
+            ptr.* = try core.stream.nats_sink.NatsSink.init(allocator, io, url);
+            holder.allocator = allocator;
+            holder.nats = ptr;
+            core.stream.setGlobal(ptr.sink());
+            log_ptr.info("boot", "stream sink: nats (PUB to NATS subject)");
+        },
+        .kafka => {
+            // KAFKA_BROKERS = "host:port[,...]"; we bootstrap off the first.
+            const brokers = if (std.c.getenv("KAFKA_BROKERS")) |p| std.mem.sliceTo(p, 0) else "127.0.0.1:9092";
+            const first = brokers[0 .. std.mem.indexOfScalar(u8, brokers, ',') orelse brokers.len];
+            const colon = std.mem.lastIndexOfScalar(u8, first, ':') orelse first.len;
+            const host = first[0..colon];
+            const port: u16 = if (colon < first.len) (std.fmt.parseInt(u16, first[colon + 1 ..], 10) catch 9092) else 9092;
+            const ptr = try allocator.create(core.stream.kafka_sink.KafkaSink);
+            errdefer allocator.destroy(ptr);
+            ptr.* = try core.stream.kafka_sink.KafkaSink.init(allocator, host, port);
+            holder.allocator = allocator;
+            holder.kafka = ptr;
+            core.stream.setGlobal(ptr.sink());
+            log_ptr.info("boot", "stream sink: kafka (pure-Zig zig-kafka producer)");
+        },
+    }
+}
+
 /// Shutdown phase: drain the log ring before we close storage. Wired
 /// here so the phase order is owned by the composition root.
 fn flushLogsPhase(ud: ?*anyopaque) anyerror!void {
@@ -656,42 +751,28 @@ pub fn main() !void {
         log_ptr.info("boot", "tls backend wired (native outbound)");
     }
 
-    // ── Pluggable event-stream sink (Phase H) ──────────────────────
-    // Mirrors AT firehose events + relay translations to an external
-    // stream. STREAM_BACKEND=null (default) | log | kafka. Kafka needs a
-    // binary built with -Dkafka and KAFKA_BROKERS set.
-    var log_sink_state: core.stream.LogSink = .{};
-    var kafka_holder: ?core.stream.KafkaSink = null;
-    // Clear the global sink before tearing down its backing storage on
-    // shutdown (LIFO defers: this runs before the kafka deinit below).
-    defer core.stream.setGlobal(null);
-    defer if (core.stream.kafka_enabled) {
-        if (kafka_holder) |*k| k.deinit();
+    // ── Pluggable event-stream sink (Phase 4) ──────────────────────
+    // Mirrors AT firehose events + relay translations to a runtime-
+    // selected backend: STREAM_BACKEND=null|log|kafka|redis|nats (all
+    // pure-Zig drivers). Default null (no-op). redis/nats/kafka clients
+    // live in the holder for the process lifetime, torn down at exit.
+    var stream_null_sink = core.stream.NullSink.init();
+    var stream_log_sink = core.stream.LogSink.init();
+    var stream_holder = StreamHolder{};
+    defer stream_holder.deinit();
+    loadStreamSinkIfConfigured(
+        &stream_holder,
+        gpa_allocator,
+        io,
+        log_ptr,
+        &stream_null_sink,
+        &stream_log_sink,
+    ) catch |err| {
+        log_ptr.record(.warn, "boot", "stream sink init failed — using null sink", &.{
+            .{ .k = "err", .v = @errorName(err) },
+        });
+        core.stream.setGlobal(stream_null_sink.sink());
     };
-    {
-        const backend = if (std.c.getenv("STREAM_BACKEND")) |v| std.mem.sliceTo(v, 0) else "null";
-        if (std.mem.eql(u8, backend, "log")) {
-            core.stream.setGlobal(log_sink_state.sink());
-            log_ptr.info("boot", "stream sink: log (in-memory ring)");
-        } else if (std.mem.eql(u8, backend, "kafka")) {
-            if (core.stream.kafka_enabled) {
-                const brokers = if (std.c.getenv("KAFKA_BROKERS")) |b| std.mem.sliceTo(b, 0) else "localhost:9092";
-                if (core.stream.KafkaSink.init(brokers)) |ks| {
-                    kafka_holder = ks;
-                    core.stream.setGlobal(kafka_holder.?.sink());
-                    log_ptr.info("boot", "stream sink: kafka (librdkafka producer)");
-                } else |err| {
-                    log_ptr.record(.warn, "boot", "kafka sink init failed — using null sink", &.{
-                        .{ .k = "err", .v = @errorName(err) },
-                    });
-                }
-            } else {
-                log_ptr.warn("boot", "STREAM_BACKEND=kafka but binary built without -Dkafka — using null sink");
-            }
-        } else {
-            log_ptr.info("boot", "stream sink: null (no external streaming)");
-        }
-    }
 
     // Bind the HTTP client to the protocol plugins so their federation
     // hook trampolines can find it. After this, AP key fetches +

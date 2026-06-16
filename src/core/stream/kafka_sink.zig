@@ -1,139 +1,104 @@
-//! KafkaSink — a real librdkafka producer implementing `core.stream.Sink`.
+//! Kafka streaming sink — produce to a Kafka topic.
 //!
-//! Compiled only under `-Dkafka` (see `build.zig`); `core.stream` gates the
-//! import behind the same flag so the default build never needs librdkafka
-//! headers. Selected at boot with `STREAM_BACKEND=kafka` + `KAFKA_BROKERS`.
+//! Backed by the vendored PURE-ZIG `Ugbot/zig-kafka` driver (no librdkafka,
+//! no system libs). The sink owns one `KafkaClient` + one `KafkaProducer`
+//! for the whole process lifetime.
 //!
-//! Tiger Style: one `rd_kafka_t` producer built at init. `publish` enqueues
-//! with `RD_KAFKA_MSG_F_COPY` (librdkafka owns its own copy, so our borrowed
-//! payload is never retained) and is non-blocking — it never waits on the
-//! broker. librdkafka's producer handle is internally thread-safe, so no
-//! extra lock is needed. `flush` drains on shutdown.
+//! Lifetime note (load-bearing): `KafkaProducer` holds a `*BrokerPool`
+//! pointing at a field INSIDE the `KafkaClient` (`&client.broker_pool`), so
+//! the client must live at a stable address before `createProducer` runs.
+//! We therefore heap-pin the client (`gpa.create`) and create the producer
+//! against that stable pointer; the producer (whose other refs are
+//! heap-allocated) is then safe to store by value in the sink.
+//!
+//! `publish(topic, key, payload)` → `producer.produce(topic, key, value)`,
+//! which appends to the producer's record accumulator; a background sender
+//! drains batches to the partition leaders. Best-effort + bounded at the
+//! `stream.Sink` boundary; a broker error returns `error.PublishFailed` so
+//! the publish site logs + swallows.
 
 const std = @import("std");
+const kafka = @import("kafka");
 const stream = @import("../stream.zig");
-
-pub const c = @cImport({
-    @cInclude("librdkafka/rdkafka.h");
-});
-
-pub const Error = error{
-    ConfigFailed,
-    ProducerInitFailed,
-};
-
-pub const max_topic: usize = 249; // Kafka's max topic-name length.
+const core_log = @import("../log.zig");
 
 pub const KafkaSink = struct {
-    rk: *c.rd_kafka_t,
+    gpa: std.mem.Allocator,
+    client: *kafka.KafkaClient,
+    producer: kafka.client.KafkaProducer,
 
-    /// Build a producer connected to `brokers` (a comma-separated
-    /// `host:port` list). The connection itself is established lazily by
-    /// librdkafka in the background; init only fails on bad config.
-    pub fn init(brokers: []const u8) Error!KafkaSink {
-        const conf = c.rd_kafka_conf_new() orelse return error.ConfigFailed;
-        // conf ownership transfers to rd_kafka_new on success; on the
-        // error path before that, destroy it ourselves.
-        errdefer c.rd_kafka_conf_destroy(conf);
+    /// Connect to a single bootstrap broker `host:port` (Kafka discovers
+    /// the rest of the cluster via metadata). Heap-pins the client.
+    pub fn init(gpa: std.mem.Allocator, host: []const u8, port: u16) !KafkaSink {
+        const client = try gpa.create(kafka.KafkaClient);
+        errdefer gpa.destroy(client);
+        // Anonymous-struct coercion builds the (un-exported) ClientConfig +
+        // BrokerAddress for us — a single bootstrap server suffices.
+        client.* = try kafka.KafkaClient.init(.{
+            .bootstrap_servers = &.{.{ .host = host, .port = port }},
+        }, gpa);
+        errdefer client.close();
+        try client.bootstrap();
 
-        var errstr: [512]u8 = undefined;
-        var brokers_z: [1024]u8 = undefined;
-        if (brokers.len >= brokers_z.len) return error.ConfigFailed;
-        @memcpy(brokers_z[0..brokers.len], brokers);
-        brokers_z[brokers.len] = 0;
+        var producer = try client.createProducer(.{});
+        errdefer producer.close();
+        try producer.start();
 
-        if (c.rd_kafka_conf_set(
-            conf,
-            "bootstrap.servers",
-            @ptrCast(&brokers_z),
-            @ptrCast(&errstr),
-            errstr.len,
-        ) != c.RD_KAFKA_CONF_OK) {
-            return error.ConfigFailed;
-        }
-
-        const rk = c.rd_kafka_new(
-            c.RD_KAFKA_PRODUCER,
-            conf,
-            @ptrCast(&errstr),
-            errstr.len,
-        ) orelse return error.ProducerInitFailed;
-        // rd_kafka_new took ownership of conf; cancel the errdefer.
-        return .{ .rk = rk };
+        return .{ .gpa = gpa, .client = client, .producer = producer };
     }
 
     pub fn deinit(self: *KafkaSink) void {
-        // Best-effort drain, then tear down.
-        _ = c.rd_kafka_flush(self.rk, 2000);
-        c.rd_kafka_destroy(self.rk);
-        self.* = undefined;
+        self.producer.close();
+        self.client.close();
+        self.gpa.destroy(self.client);
+    }
+
+    fn doPublish(ptr: *anyopaque, topic: []const u8, key: ?[]const u8, payload: []const u8) stream.Error!void {
+        const self: *KafkaSink = @ptrCast(@alignCast(ptr));
+        self.producer.produce(topic, key, payload) catch return error.PublishFailed;
+    }
+
+    fn doFlush(ptr: *anyopaque) stream.Error!void {
+        const self: *KafkaSink = @ptrCast(@alignCast(ptr));
+        self.producer.flush(5000) catch return error.PublishFailed;
+    }
+
+    fn doClose(ptr: *anyopaque) void {
+        const self: *KafkaSink = @ptrCast(@alignCast(ptr));
+        self.deinit();
     }
 
     pub fn sink(self: *KafkaSink) stream.Sink {
-        return .{ .ctx = self, .vtable = &vtable };
-    }
-
-    const vtable: stream.Sink.VTable = .{
-        .publish = publishImpl,
-        .flush = flushImpl,
-        .close = closeImpl,
-    };
-
-    fn publishImpl(ctx: *anyopaque, topic: []const u8, key: []const u8, payload: []const u8) void {
-        const self: *KafkaSink = @ptrCast(@alignCast(ctx));
-        if (topic.len == 0 or topic.len > max_topic) return;
-        var topic_z: [max_topic + 1]u8 = undefined;
-        @memcpy(topic_z[0..topic.len], topic);
-        topic_z[topic.len] = 0;
-
-        // RD_KAFKA_MSG_F_COPY → librdkafka copies the value immediately, so
-        // the borrowed `payload` need not outlive this call. The key is
-        // always copied by librdkafka internally.
-        _ = c.rd_kafka_producev(
-            self.rk,
-            c.RD_KAFKA_VTYPE_TOPIC,
-            @as([*c]const u8, @ptrCast(&topic_z)),
-            c.RD_KAFKA_VTYPE_MSGFLAGS,
-            @as(c_int, c.RD_KAFKA_MSG_F_COPY),
-            c.RD_KAFKA_VTYPE_KEY,
-            @as(?*const anyopaque, if (key.len > 0) key.ptr else null),
-            @as(usize, key.len),
-            c.RD_KAFKA_VTYPE_VALUE,
-            @as(?*const anyopaque, if (payload.len > 0) payload.ptr else null),
-            @as(usize, payload.len),
-            c.RD_KAFKA_VTYPE_END,
-        );
-        // Serve delivery-report / error callbacks without blocking.
-        _ = c.rd_kafka_poll(self.rk, 0);
-    }
-
-    fn flushImpl(ctx: *anyopaque) void {
-        const self: *KafkaSink = @ptrCast(@alignCast(ctx));
-        _ = c.rd_kafka_flush(self.rk, 5000);
-    }
-
-    fn closeImpl(ctx: *anyopaque) void {
-        const self: *KafkaSink = @ptrCast(@alignCast(ctx));
-        _ = c.rd_kafka_flush(self.rk, 2000);
+        return .{ .ptr = self, .vtable = &.{ .publish = doPublish, .flush = doFlush, .close = doClose } };
     }
 };
 
-// ── Tests ────────────────────────────────────────────────────────────────
-//
-// A real round-trip needs a broker and is a label-gated integration test
-// (see docs/ci). Here we only assert the sink builds against a (typically
-// unreachable) broker address — init succeeds because librdkafka connects
-// lazily — and that the vtable shape matches. These run only when the
-// binary is compiled with -Dkafka.
+// ──────────────────────────────────────────────────────────────────────
+// Live round-trip test — skips when no broker on 127.0.0.1:9092.
+// ──────────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
 
-test "KafkaSink: init builds a producer and exposes a conforming Sink" {
-    var ks = KafkaSink.init("localhost:9092") catch return error.SkipZigTest;
+test "KafkaSink live produce (skips if no broker)" {
+    const gpa = testing.allocator;
+    var ks = KafkaSink.init(gpa, "127.0.0.1", 9092) catch return error.SkipZigTest;
     defer ks.deinit();
     const s = ks.sink();
-    try testing.expectEqual(stream.Sink.VTable, @TypeOf(KafkaSink.vtable));
-    // Publishing to a (likely down) broker must not block or crash; the
-    // message buffers locally and is dropped on deinit's flush timeout.
-    s.publish("firehose", "did:plc:test", "{\"x\":1}");
+
+    var prng = std.Random.DefaultPrng.init(0x4A_F0_05_1);
+    const rand = prng.random();
+    var i: usize = 0;
+    while (i < 5) : (i += 1) {
+        var key_buf: [16]u8 = undefined;
+        var pay_buf: [64]u8 = undefined;
+        const key = std.fmt.bufPrint(&key_buf, "k{d}", .{i}) catch unreachable;
+        const payload = std.fmt.bufPrint(&pay_buf, "kafka-{x}-{d}", .{ rand.int(u32), i }) catch unreachable;
+        // A produce to an auto-creatable topic; broker config dependent.
+        s.publish("speedy.test.kafka", key, payload) catch return error.SkipZigTest;
+    }
+    s.flush() catch return error.SkipZigTest;
+}
+
+test {
+    _ = core_log;
 }

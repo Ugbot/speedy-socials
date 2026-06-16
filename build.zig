@@ -5,17 +5,14 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
     // ── optional feature flags ─────────────────────────────────────
-    // Kept off by default so the standard build/test stays dependency-
-    // light. `-Dkafka` links librdkafka and compiles the Kafka stream
-    // sink; `-Dpostgres` links libpq and compiles the Postgres storage
-    // backend. Both are surfaced to the code through a `build_options`
-    // module.
-    const enable_kafka = b.option(bool, "kafka", "Compile + link the librdkafka stream sink") orelse false;
+    // The streaming backends (kafka/redis/nats) are now PURE-ZIG vendored
+    // modules wired unconditionally (no flag) — see below. `-Dpostgres`
+    // remains only until the pg.zig provider lands. `-Dtrace` compiles in
+    // Chrome-format span tracing.
     const enable_postgres = b.option(bool, "postgres", "Compile + link the libpq storage backend") orelse false;
     const enable_trace = b.option(bool, "trace", "Compile in Chrome-format span tracing (off = zero hot-path cost)") orelse false;
 
     const build_opts = b.addOptions();
-    build_opts.addOption(bool, "kafka", enable_kafka);
     build_opts.addOption(bool, "postgres", enable_postgres);
     build_opts.addOption(bool, "trace", enable_trace);
     const build_options_mod = build_opts.createModule();
@@ -85,6 +82,48 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // ── third-party: streaming sink drivers (vendored submodules) ──
+    // Pure-Zig (std.Io-based, no system libs), wired as plain modules +
+    // imported into `core` UNCONDITIONALLY — no `-D` gate. They back the
+    // runtime-selected STREAM_BACKEND={kafka,redis,nats} options.
+    const redis_mod = b.addModule("redis", .{
+        .root_source_file = b.path("third_party/redis.zig/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const nats_options = b.addOptions();
+    nats_options.addOption(bool, "enable_debug", false);
+    nats_options.addOption([]const u8, "io_backend", "threaded");
+    const nats_mod = b.addModule("nats", .{
+        .root_source_file = b.path("third_party/nats.zig/src/nats.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "build_options", .module = nats_options.createModule() },
+        },
+    });
+    // Kafka: Ugbot/zig-kafka (branch zig-0.16, ported to this std). The
+    // SDK module depends on `kafka_generated` + the `ztime` 0.16 shim.
+    const kafka_generated_mod = b.addModule("kafka_generated", .{
+        .root_source_file = b.path("third_party/zig-kafka/sdk/src/generated_index.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const kafka_ztime_mod = b.addModule("ztime", .{
+        .root_source_file = b.path("third_party/zig-kafka/sdk/src/compat.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const kafka_mod = b.addModule("kafka", .{
+        .root_source_file = b.path("third_party/zig-kafka/sdk/src/lib.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "kafka_generated", .module = kafka_generated_mod },
+            .{ .name = "ztime", .module = kafka_ztime_mod },
+        },
+    });
+
     // ── core module ────────────────────────────────────────────────
     const core_mod = b.addModule("core", .{
         .root_source_file = b.path("src/core/root.zig"),
@@ -100,15 +139,15 @@ pub fn build(b: *std.Build) void {
             .{ .name = "tb_stdx", .module = tb_stdx_mod },
             .{ .name = "tls", .module = ianic_tls_mod },
             .{ .name = "build_options", .module = build_options_mod },
+            .{ .name = "redis", .module = redis_mod },
+            .{ .name = "nats", .module = nats_mod },
+            .{ .name = "kafka", .module = kafka_mod },
         },
     });
 
-    // Optional native libs for the pluggable backends. Linked into `core`
-    // only when the corresponding flag is set; the cImports in
-    // `stream/kafka_sink.zig` / `storage/postgres_backend.zig` are
-    // comptime-gated behind the same flags so the default build never
-    // needs the headers.
-    if (enable_kafka) linkSystemLibByPrefix(core_mod, target, "librdkafka", "rdkafka");
+    // Optional native lib for the Postgres backend (until pg.zig lands).
+    // The cImport in `storage/postgres_backend.zig` is comptime-gated
+    // behind `-Dpostgres` so the default build needs no libpq headers.
     if (enable_postgres) linkLibpq(b, core_mod);
 
     // ── system OpenSSL link (W3.1) ─────────────────────────────────
