@@ -48,6 +48,18 @@ pub const boring_inbound = @import("tls/boring_inbound.zig");
 /// See `src/core/tls/ianic_inbound.zig`.
 pub const ianic_inbound = @import("tls/ianic_inbound.zig");
 
+/// Cert hot-reload admin surface (C4) — env-var paths + `POST
+/// /admin/tls/reload`. See `src/core/tls/cert_admin.zig`.
+pub const cert_admin = @import("tls/cert_admin.zig");
+
+/// Admin route registration for cert hot-reload (C4).
+/// See `src/core/tls/admin_routes.zig`.
+pub const admin_routes = @import("tls/admin_routes.zig");
+
+/// SNI cert dispatch — peek the plaintext ClientHello, pick a cert by
+/// server_name (C2). See `src/core/tls/sni.zig`.
+pub const sni = @import("tls/sni.zig");
+
 pub const TlsBackend = struct {
     ptr: *anyopaque,
     vtable: *const VTable,

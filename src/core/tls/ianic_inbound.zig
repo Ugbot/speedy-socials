@@ -35,7 +35,25 @@ const tls = @import("tls");
 
 const limits = @import("../limits.zig");
 const core_tls = @import("../tls.zig");
+const sni_mod = @import("sni.zig");
 const TlsBackend = core_tls.TlsBackend;
+
+/// Maximum number of per-SNI certificates a single backend can host. The
+/// default cert (used when SNI is absent / unmatched) is separate, so
+/// this bounds only the named virtual hosts.
+pub const max_sni_certs: usize = 16;
+
+/// One SNI-keyed certificate. The host string is stored inline so the
+/// table needs no allocator on the lookup path.
+pub const SniCert = struct {
+    host_buf: [128]u8 = undefined,
+    host_len: u8 = 0,
+    auth: tls.config.CertKeyPair = undefined,
+
+    pub fn host(self: *const SniCert) []const u8 {
+        return self.host_buf[0..self.host_len];
+    }
+};
 
 pub const Error = error{
     InitFailed,
@@ -87,6 +105,12 @@ pub const IanicInboundBackend = struct {
     /// composition root's allocator. Holding by pointer so slot
     /// addresses are stable across moves of the backend struct itself.
     slots: []Slot,
+
+    /// C2: per-SNI certificate table. Populated at boot from
+    /// `TLS_SNI_CERTS`; empty by default (single-cert behaviour). Lookup
+    /// is a bounded linear scan keyed on the ClientHello `server_name`.
+    sni_certs: [max_sni_certs]SniCert = undefined,
+    sni_count: u8 = 0,
 
     /// Coarse spinlock guarding the slot table. Contention here is
     /// rare (twice per connection: alloc + release). The TLS read /
@@ -146,6 +170,44 @@ pub const IanicInboundBackend = struct {
         old.deinit(self.auth_allocator);
     }
 
+    /// C2: register a certificate for a specific SNI host. Built once at
+    /// boot from `TLS_SNI_CERTS`. Returns `error.Full` past the table
+    /// cap. The host string is truncated to `SniCert.host_buf.len`.
+    pub fn addSniCert(
+        self: *IanicInboundBackend,
+        host: []const u8,
+        cert_pem: []const u8,
+        key_pem: []const u8,
+    ) !void {
+        if (self.sni_count >= max_sni_certs) return error.Full;
+        const auth = tls.config.CertKeyPair.fromSlice(self.auth_allocator, self.io, cert_pem, key_pem) catch |err| switch (err) {
+            error.OutOfMemory => return error.InitFailed,
+            else => return error.CertLoadFailed,
+        };
+        var slot: SniCert = .{ .auth = auth };
+        const n = @min(host.len, slot.host_buf.len);
+        @memcpy(slot.host_buf[0..n], host[0..n]);
+        slot.host_len = @intCast(n);
+        self.sni_certs[self.sni_count] = slot;
+        self.sni_count += 1;
+    }
+
+    /// Pick the certificate for a handshake. When the ClientHello carried
+    /// a `server_name` that matches a registered SNI cert, use it;
+    /// otherwise fall back to the default cert. Case-insensitive match
+    /// (DNS names are case-insensitive).
+    fn selectAuth(self: *IanicInboundBackend, server_name: ?[]const u8) *tls.config.CertKeyPair {
+        if (server_name) |sn| {
+            var i: u8 = 0;
+            while (i < self.sni_count) : (i += 1) {
+                if (std.ascii.eqlIgnoreCase(self.sni_certs[i].host(), sn)) {
+                    return &self.sni_certs[i].auth;
+                }
+            }
+        }
+        return &self.auth;
+    }
+
     pub fn deinit(self: *IanicInboundBackend) void {
         // Tear down any in-flight TLS sessions. In a clean shutdown
         // this should be a no-op — the server stops accepting before
@@ -160,6 +222,10 @@ pub const IanicInboundBackend = struct {
         }
         self.auth_allocator.free(self.slots);
         self.auth.deinit(self.auth_allocator);
+        var i: u8 = 0;
+        while (i < self.sni_count) : (i += 1) {
+            self.sni_certs[i].auth.deinit(self.auth_allocator);
+        }
     }
 
     pub fn backend(self: *IanicInboundBackend) TlsBackend {
@@ -184,12 +250,25 @@ pub const IanicInboundBackend = struct {
 
         slot.io = io;
         slot.raw_stream = raw;
+
+        // C2: when SNI certs are configured, peek the (plaintext)
+        // ClientHello to pick the matching cert before the handshake.
+        // The peeked bytes stay in the socket buffer for `tls.server` to
+        // re-read. Skip the syscall entirely in the common single-cert
+        // case so we don't pay for a peek nobody uses.
+        var auth = &self.auth;
+        if (self.sni_count > 0) {
+            var peek_buf: [sni_mod.max_peek]u8 = undefined;
+            const server_name = sni_mod.peekServerName(fd, &peek_buf);
+            auth = self.selectAuth(server_name);
+        }
+
         slot.r = raw.reader(io, &slot.reader_buf);
         slot.w = raw.writer(io, &slot.writer_buf);
 
         const now = Io.Clock.real.now(io);
         slot.conn = tls.server(&slot.r.interface, &slot.w.interface, .{
-            .auth = &self.auth,
+            .auth = auth,
             .now = now,
             .rng = self.rng_source.interface(),
         }) catch return error.HandshakeFailed;
@@ -341,6 +420,60 @@ test "ianic_inbound: vtable shape matches core.tls.TlsBackend.VTable" {
     try testing.expect(IanicInboundBackend.vtable.read_some != null);
     try testing.expect(IanicInboundBackend.vtable.write_all != null);
     try testing.expect(IanicInboundBackend.vtable.close_conn != null);
+}
+
+test "ianic_inbound: SNI selection picks the named cert, falls back to default" {
+    const cert = readFixture(fixture_cert_path, testing.allocator) catch |e| switch (e) {
+        error.FileNotFound => return error.SkipZigTest,
+        else => return e,
+    };
+    defer testing.allocator.free(cert);
+    const key = try readFixture(fixture_key_path, testing.allocator);
+    defer testing.allocator.free(key);
+
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    var be = try IanicInboundBackend.init(testing.allocator, threaded.io(), cert, key);
+    defer be.deinit();
+
+    // No SNI certs yet: everything resolves to the default.
+    try testing.expect(be.selectAuth("anything") == &be.auth);
+    try testing.expect(be.selectAuth(null) == &be.auth);
+
+    try be.addSniCert("host-b.example.com", cert, key);
+    try be.addSniCert("host-c.example.com", cert, key);
+    try testing.expectEqual(@as(u8, 2), be.sni_count);
+
+    // Exact + case-insensitive match returns the SNI slot, not default.
+    try testing.expect(be.selectAuth("host-b.example.com") == &be.sni_certs[0].auth);
+    try testing.expect(be.selectAuth("HOST-B.EXAMPLE.COM") == &be.sni_certs[0].auth);
+    try testing.expect(be.selectAuth("host-c.example.com") == &be.sni_certs[1].auth);
+    // Unknown host / no SNI → default.
+    try testing.expect(be.selectAuth("unknown.example.com") == &be.auth);
+    try testing.expect(be.selectAuth(null) == &be.auth);
+}
+
+test "ianic_inbound: SNI table enforces its capacity bound" {
+    const cert = readFixture(fixture_cert_path, testing.allocator) catch |e| switch (e) {
+        error.FileNotFound => return error.SkipZigTest,
+        else => return e,
+    };
+    defer testing.allocator.free(cert);
+    const key = try readFixture(fixture_key_path, testing.allocator);
+    defer testing.allocator.free(key);
+
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    var be = try IanicInboundBackend.init(testing.allocator, threaded.io(), cert, key);
+    defer be.deinit();
+
+    var host_buf: [32]u8 = undefined;
+    var i: usize = 0;
+    while (i < max_sni_certs) : (i += 1) {
+        const h = std.fmt.bufPrint(&host_buf, "h{d}.example.com", .{i}) catch unreachable;
+        try be.addSniCert(h, cert, key);
+    }
+    try testing.expectError(error.Full, be.addSniCert("overflow.example.com", cert, key));
 }
 
 test "ianic_inbound: read/write on an unknown fd surface SlotMissing" {

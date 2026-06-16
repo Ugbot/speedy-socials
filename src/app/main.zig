@@ -107,6 +107,38 @@ fn loadInboundTlsIfConfigured(
     holder.backend = ptr;
     holder.allocator = allocator;
     log_ptr.info("boot", "inbound TLS backend initialised (IanicInboundBackend, pure-Zig TLS 1.3)");
+
+    // C2: optional per-SNI certificates. Format (same as cert_admin's
+    // CertTable env parser):
+    //   TLS_SNI_CERTS=host1=cert1.pem:key1.pem,host2=cert2.pem:key2.pem
+    // Each named host gets its own cert; unmatched / SNI-less handshakes
+    // use the default cert above.
+    if (std.c.getenv("TLS_SNI_CERTS")) |sni_c| {
+        var table: core.tls.cert_admin.CertTable = .{};
+        table.parseEnv(std.mem.sliceTo(sni_c, 0)) catch {
+            log_ptr.warn("boot", "TLS_SNI_CERTS failed to parse — ignoring SNI cert table");
+            return ptr.backend();
+        };
+        var i: u8 = 0;
+        while (i < table.count) : (i += 1) {
+            const e = &table.entries[i];
+            const sni_cert = std.Io.Dir.cwd().readFileAlloc(io, e.certPath(), allocator, .limited(256 * 1024)) catch {
+                log_ptr.warn("boot", "TLS_SNI_CERTS: cert read failed for an entry — skipping");
+                continue;
+            };
+            defer allocator.free(sni_cert);
+            const sni_key = std.Io.Dir.cwd().readFileAlloc(io, e.keyPath(), allocator, .limited(256 * 1024)) catch {
+                log_ptr.warn("boot", "TLS_SNI_CERTS: key read failed for an entry — skipping");
+                continue;
+            };
+            defer allocator.free(sni_key);
+            ptr.addSniCert(e.sni(), sni_cert, sni_key) catch {
+                log_ptr.warn("boot", "TLS_SNI_CERTS: addSniCert failed for an entry — skipping");
+                continue;
+            };
+            log_ptr.info("boot", "registered an SNI certificate");
+        }
+    }
     return ptr.backend();
 }
 
@@ -651,6 +683,11 @@ pub fn main() !void {
     try core.metrics.registerMetricsRoute(&router, std.math.maxInt(u16));
     log_ptr.info("boot", "metrics registry initialised; /metrics serving");
 
+    // C4: TLS cert hot-reload admin route. Always registered; the handler
+    // reports 503 until `configure` runs (after the inbound TLS backend
+    // loads, below) and 403 unless ADMIN_TOKEN is set.
+    try core.tls.admin_routes.registerRoutes(&router, std.math.maxInt(u16));
+
     // G3: rate-limiting. Off by default; configured via env. Format:
     // RATE_LIMIT=<capacity>:<refill_per_sec>  (e.g. "60:30").
     if (std.c.getenv("RATE_LIMIT")) |env_c| {
@@ -705,6 +742,23 @@ pub fn main() !void {
     var inbound_tls_holder = InboundTlsHolder{};
     defer inbound_tls_holder.deinit();
     const inbound_tls_backend = try loadInboundTlsIfConfigured(&inbound_tls_holder, gpa_allocator, io, log_ptr);
+
+    // C4: when inbound TLS is live, register the backend with the cert
+    // admin surface and wire the hot-reload route's dependencies. The
+    // audit handle reuses the writer connection (same documented
+    // rare/admin/synchronous tradeoff as the relay admin routes above).
+    if (inbound_tls_holder.backend) |be| {
+        core.tls.cert_admin.registerBackend(be);
+        const tok: []const u8 = if (std.c.getenv("ADMIN_TOKEN")) |t| std.mem.sliceTo(t, 0) else "";
+        const cert_p: []const u8 = if (std.c.getenv("TLS_CERT_PATH")) |p| std.mem.sliceTo(p, 0) else "";
+        const key_p: []const u8 = if (std.c.getenv("TLS_KEY_PATH")) |p| std.mem.sliceTo(p, 0) else "";
+        core.tls.admin_routes.configure(tok, cert_p, key_p, db, real_clock.clock());
+        if (tok.len == 0) {
+            log_ptr.warn("boot", "inbound TLS live but ADMIN_TOKEN unset — POST /admin/tls/reload is disabled");
+        } else {
+            log_ptr.info("boot", "TLS cert hot-reload route enabled (POST /admin/tls/reload)");
+        }
+    }
 
     var server = try core.server.Server.init(
         .{
