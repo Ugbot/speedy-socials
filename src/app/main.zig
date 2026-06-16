@@ -510,6 +510,8 @@ pub fn main() !void {
     // AT-8..11: durable account tables (atp_accounts / email tokens /
     // app passwords / invites) backing `core.account.SqliteBackend`.
     try schema.register(core.account.sqlite_migration);
+    // P5: durable job-queue table backing the default DbQueue provider.
+    try schema.register(core.queue.DbQueue.migration);
     try registry.registerAllSchemas(&ctx, &schema);
 
     // ── pluggable DB provider (owns migration + per-tenant routing) ──
@@ -535,6 +537,14 @@ pub fn main() !void {
     // Migration ownership: the provider applies the schema (replaces the
     // previous direct schema.applyAll(db)).
     try sqlite_provider.dbProvider().migrate(&schema);
+
+    // P5: install the default durable job-queue provider (DbQueue) over the
+    // writer handle. Available process-wide via core.queue.global(); the AP
+    // delivery outbox can be routed onto it (follow-on) so a Redis/NATS/
+    // Kafka queue becomes a drop-in. QUEUE_BACKEND defaults to this.
+    var db_queue = core.queue.DbQueue.init(db);
+    core.queue.setGlobal(db_queue.provider());
+    defer core.queue.resetGlobal();
 
     // ── prepared statements + writer thread ────────────────────────
     try stmt_table.prepareAll(db);

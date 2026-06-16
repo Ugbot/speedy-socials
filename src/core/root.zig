@@ -36,8 +36,11 @@ pub const trace = @import("trace.zig");
 pub const cert_probe = @import("cert_probe.zig");
 pub const tenancy = @import("tenancy.zig");
 
-/// Pluggable event-stream sink (Null / Log / Kafka). See `stream.zig`.
+/// Pluggable event-stream sink (Null / Log / Kafka / Redis / NATS). See `stream.zig`.
 pub const stream = @import("stream.zig");
+
+/// Pluggable durable job queue (QueueProvider + DbQueue). See `queue.zig`.
+pub const queue = @import("queue.zig");
 
 /// W4: vendored TigerBeetle stdx primitives — `BoundedArrayType`,
 /// `RingBufferType`, `IOPSType`, `BitSetType`, plus the local
@@ -126,6 +129,7 @@ test {
     _ = cert_probe;
     _ = tenancy;
     _ = stream;
+    _ = queue;
     _ = crypto.ed25519;
     _ = crypto.multibase;
     _ = crypto.multicodec;
