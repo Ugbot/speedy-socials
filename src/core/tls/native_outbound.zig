@@ -185,7 +185,6 @@ pub const NativeOutboundBackend = struct {
     };
 
     fn connect_impl(ctx: *anyopaque, host: []const u8, port: u16, timeout_ms: u32) NetError!*anyopaque {
-        _ = timeout_ms; // TODO: wire socket-level timeouts when std exposes them on Io.
         const self: *NativeOutboundBackend = @ptrCast(@alignCast(ctx));
         if (!self.bundle_loaded) return error.TlsUnavailable;
         const slot = self.acquireSlot() orelse return error.ConnectFailed;
@@ -197,6 +196,12 @@ pub const NativeOutboundBackend = struct {
         slot.io = self.io;
         slot.stream = stream;
         slot.open = true;
+
+        // C3: bound slow-peer read/write hangs with SO_RCVTIMEO/SNDTIMEO on
+        // the connected fd (best-effort; the fd is owned here). Connect-timeout
+        // (non-blocking connect + poll) is a follow-up — net.IpAddress.connect
+        // is blocking in this Io model.
+        if (timeout_ms > 0) setSocketTimeouts(stream.socket.handle, timeout_ms);
         errdefer {
             stream.close(self.io);
             slot.open = false;
@@ -254,9 +259,50 @@ pub const NativeOutboundBackend = struct {
     }
 };
 
+/// C3: apply `SO_RCVTIMEO`/`SO_SNDTIMEO` to a connected socket so a slow or
+/// silent peer can't hang a worker thread indefinitely on a blocking
+/// read/write. Best-effort — a kernel that rejects the option leaves the
+/// socket in its default (blocking, no deadline) state rather than failing
+/// the connection. Split into `timevalFromMs` so the conversion is testable
+/// without a live socket.
+pub fn timevalFromMs(timeout_ms: u32) std.posix.timeval {
+    return .{
+        .sec = @intCast(timeout_ms / 1000),
+        .usec = @intCast((timeout_ms % 1000) * 1000),
+    };
+}
+
+fn setSocketTimeouts(fd: std.posix.socket_t, timeout_ms: u32) void {
+    const tv = timevalFromMs(timeout_ms);
+    const bytes = std.mem.asBytes(&tv);
+    std.posix.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, bytes) catch {};
+    std.posix.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, bytes) catch {};
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────
 
 const testing = std.testing;
+
+test "timevalFromMs: splits milliseconds into whole seconds + microseconds" {
+    // Randomized inputs over the plausible timeout range.
+    var prng = std.Random.DefaultPrng.init(0xC3_5_0_C_4);
+    const rand = prng.random();
+    var i: usize = 0;
+    while (i < 256) : (i += 1) {
+        const ms = rand.intRangeAtMost(u32, 0, 600_000);
+        const tv = timevalFromMs(ms);
+        const recombined: u64 = @as(u64, @intCast(tv.sec)) * 1000 +
+            @as(u64, @intCast(tv.usec)) / 1000;
+        try testing.expectEqual(@as(u64, ms), recombined);
+        try testing.expect(tv.usec < 1_000_000);
+    }
+}
+
+test "timevalFromMs: 1000ms is exactly one second, no remainder" {
+    const tv = timevalFromMs(1000);
+    try testing.expectEqual(@as(@TypeOf(tv.sec), 1), tv.sec);
+    try testing.expectEqual(@as(@TypeOf(tv.usec), 0), tv.usec);
+}
 
 test "NativeOutboundBackend: vtable conforms to http_client.TlsBackend.Vtable" {
     const T = @TypeOf(NativeOutboundBackend.vtable);
