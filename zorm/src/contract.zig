@@ -29,12 +29,13 @@ pub const Error = error{
 pub const Dialect = enum {
     sqlite,
     postgres,
+    mysql,
 
     /// Positional parameter placeholder for the n-th (1-based) bind.
-    /// SQLite uses `?`; Postgres uses `$N`.
+    /// SQLite and MySQL use `?`; Postgres uses `$N`.
     pub fn placeholder(self: Dialect, comptime n: usize) []const u8 {
         return switch (self) {
-            .sqlite => "?",
+            .sqlite, .mysql => "?",
             .postgres => std.fmt.comptimePrint("${d}", .{n}),
         };
     }

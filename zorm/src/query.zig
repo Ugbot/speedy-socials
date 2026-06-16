@@ -62,7 +62,7 @@ pub fn Query(comptime T: type) type {
 
         fn appendPlaceholder(self: *Self) void {
             switch (self.dialect) {
-                .sqlite => self.append("?"),
+                .sqlite, .mysql => self.append("?"),
                 .postgres => {
                     var tmp: [16]u8 = undefined;
                     const s = std.fmt.bufPrint(&tmp, "${d}", .{self.arg_count + 1}) catch unreachable;

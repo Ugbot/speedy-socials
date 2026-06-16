@@ -34,7 +34,9 @@ pub fn insert(comptime T: type, backend: Backend, value: *T) Error!void {
                 if (!try backend.queryOne(stmt, args[0..n], &row)) return Error.StepFailed;
                 setAutoPk(T, value, row.columns[0].int_val);
             },
-            .sqlite => {
+            // MySQL 8 has no RETURNING; like SQLite it reads the assigned id
+            // from the connection (LAST_INSERT_ID()).
+            .sqlite, .mysql => {
                 try backend.exec(stmt, args[0..n]);
                 setAutoPk(T, value, backend.lastInsertId());
             },

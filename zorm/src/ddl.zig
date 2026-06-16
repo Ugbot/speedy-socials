@@ -20,21 +20,29 @@ fn sqlType(comptime col: reflect.ColumnSpec, comptime dialect: Dialect) []const 
         return switch (dialect) {
             .sqlite => "INTEGER PRIMARY KEY AUTOINCREMENT",
             .postgres => "BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY",
+            .mysql => "BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY",
         };
     }
     return switch (col.col_type) {
-        .text => "TEXT",
+        // MySQL can't index/PK a TEXT column without a key length, but zorm
+        // knows the field's capacity — so emit VARCHAR(N) there.
+        .text => switch (dialect) {
+            .sqlite, .postgres => "TEXT",
+            .mysql => std.fmt.comptimePrint("VARCHAR({d})", .{col.byte_cap}),
+        },
         .integer => switch (dialect) {
             .sqlite => "INTEGER",
-            .postgres => "BIGINT",
+            .postgres, .mysql => "BIGINT",
         },
         .real => switch (dialect) {
             .sqlite => "REAL",
             .postgres => "DOUBLE PRECISION",
+            .mysql => "DOUBLE",
         },
         .blob => switch (dialect) {
             .sqlite => "BLOB",
             .postgres => "BYTEA",
+            .mysql => std.fmt.comptimePrint("VARBINARY({d})", .{col.byte_cap}),
         },
     };
 }
@@ -64,6 +72,7 @@ pub fn createTable(comptime T: type, dialect: Dialect) []const u8 {
     return switch (dialect) {
         .sqlite => comptime buildCreateTable(T, .sqlite),
         .postgres => comptime buildCreateTable(T, .postgres),
+        .mysql => comptime buildCreateTable(T, .mysql),
     };
 }
 
@@ -112,6 +121,34 @@ test "createTable: autoincrement PK differs by dialect" {
     const p = createTable(AutoEntity, .postgres);
     try testing.expect(std.mem.indexOf(u8, p, "id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY") != null);
     try testing.expect(std.mem.indexOf(u8, p, "name TEXT NOT NULL") != null);
+}
+
+test "createTable: MySQL dialect — VARCHAR(N), BIGINT, TINYINT-free integers, AUTO_INCREMENT" {
+    const a = createTable(Account, .mysql);
+    // Text columns become VARCHAR(capacity) (MySQL can't PK/index a TEXT).
+    try testing.expect(std.mem.indexOf(u8, a, "id VARCHAR(64) PRIMARY KEY") != null);
+    try testing.expect(std.mem.indexOf(u8, a, "handle VARCHAR(253) NOT NULL") != null);
+    try testing.expect(std.mem.indexOf(u8, a, "email VARCHAR(320)") != null);
+    try testing.expect(std.mem.indexOf(u8, a, "email VARCHAR(320) NOT NULL") == null); // nullable
+    try testing.expect(std.mem.indexOf(u8, a, "role VARCHAR") != null); // enum stored as text
+    try testing.expect(std.mem.indexOf(u8, a, "confirmed BIGINT NOT NULL") != null); // bool -> integer family
+    try testing.expect(std.mem.indexOf(u8, a, "created_at BIGINT NOT NULL") != null);
+
+    const e = createTable(AutoEntity, .mysql);
+    try testing.expect(std.mem.indexOf(u8, e, "id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY") != null);
+    try testing.expect(std.mem.indexOf(u8, e, "name VARCHAR(32) NOT NULL") != null);
+}
+
+const BlobEntity = struct {
+    pub const zorm_table = "blobs";
+    id: fields.Pk(36) = .{},
+    data: fields.Bytes(512) = .{},
+};
+
+test "createTable: blob type per dialect" {
+    try testing.expect(std.mem.indexOf(u8, createTable(BlobEntity, .sqlite), "data BLOB NOT NULL") != null);
+    try testing.expect(std.mem.indexOf(u8, createTable(BlobEntity, .postgres), "data BYTEA NOT NULL") != null);
+    try testing.expect(std.mem.indexOf(u8, createTable(BlobEntity, .mysql), "data VARBINARY(512) NOT NULL") != null);
 }
 
 test "dropTable" {

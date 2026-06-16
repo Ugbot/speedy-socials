@@ -94,6 +94,7 @@ pub fn insert(comptime T: type, dialect: Dialect) []const u8 {
     return switch (dialect) {
         .sqlite => comptime buildInsert(T, .sqlite),
         .postgres => comptime buildInsert(T, .postgres),
+        .mysql => comptime buildInsert(T, .mysql),
     };
 }
 
@@ -114,6 +115,7 @@ pub fn selectByPk(comptime T: type, dialect: Dialect) []const u8 {
     return switch (dialect) {
         .sqlite => comptime buildSelectByPk(T, .sqlite),
         .postgres => comptime buildSelectByPk(T, .postgres),
+        .mysql => comptime buildSelectByPk(T, .mysql),
     };
 }
 
@@ -122,6 +124,7 @@ pub fn update(comptime T: type, dialect: Dialect) []const u8 {
     return switch (dialect) {
         .sqlite => comptime buildUpdate(T, .sqlite),
         .postgres => comptime buildUpdate(T, .postgres),
+        .mysql => comptime buildUpdate(T, .mysql),
     };
 }
 
@@ -130,6 +133,7 @@ pub fn deleteByPk(comptime T: type, dialect: Dialect) []const u8 {
     return switch (dialect) {
         .sqlite => comptime buildDeleteByPk(T, .sqlite),
         .postgres => comptime buildDeleteByPk(T, .postgres),
+        .mysql => comptime buildDeleteByPk(T, .mysql),
     };
 }
 
@@ -175,6 +179,30 @@ test "INSERT: auto PK is omitted; Postgres appends RETURNING, SQLite does not" {
     try testing.expectEqualStrings(
         "INSERT INTO things (name) VALUES ($1) RETURNING id",
         insert(AutoEntity, .postgres),
+    );
+}
+
+test "MySQL: ? placeholders, no RETURNING (auto PK via lastInsertId)" {
+    try testing.expectEqualStrings(
+        "INSERT INTO atp_accounts (id, handle, email, role) VALUES (?, ?, ?, ?)",
+        insert(Account, .mysql),
+    );
+    // Auto-PK INSERT omits the id and does NOT append RETURNING on MySQL.
+    try testing.expectEqualStrings(
+        "INSERT INTO things (name) VALUES (?)",
+        insert(AutoEntity, .mysql),
+    );
+    try testing.expectEqualStrings(
+        "SELECT id, handle, email, role FROM atp_accounts WHERE id = ?",
+        selectByPk(Account, .mysql),
+    );
+    try testing.expectEqualStrings(
+        "UPDATE atp_accounts SET handle = ?, email = ?, role = ? WHERE id = ?",
+        update(Account, .mysql),
+    );
+    try testing.expectEqualStrings(
+        "DELETE FROM things WHERE id = ?",
+        deleteByPk(AutoEntity, .mysql),
     );
 }
 
