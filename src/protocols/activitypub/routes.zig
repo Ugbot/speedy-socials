@@ -522,7 +522,6 @@ fn dispatchInbox(hc: *HandlerContext, st: *state_mod.State, db: *c.sqlite3, _: [
         if (replay.seenBefore(parsed.key_id, parsed.signature_b64, now_unix)) {
             return writeJson(hc, .unauthorized, "{\"error\":\"signature replay\"}");
         }
-        const pk = key_cache.resolve(&st.keys, pool, st.clock, parsed.key_id) catch break :sig_block;
         const pq = hc.request.pathAndQuery();
         const req_view: sig.RequestView = .{
             .method = hc.request.method_raw,
@@ -533,7 +532,17 @@ fn dispatchInbox(hc: *HandlerContext, st: *state_mod.State, db: *c.sqlite3, _: [
             .digest_legacy = hc.request.header("Digest") orelse "",
             .content_digest = hc.request.header("Content-Digest") orelse "",
         };
-        sig.verify(&parsed, &req_view, &pk) catch break :sig_block;
+        // AP-15: verify against the resolved main key; on failure, try
+        // any published extra keys (FEP-d36d Multikey rotation) whose
+        // keyId matches — "tries each key in turn".
+        var ok = false;
+        if (key_cache.resolve(&st.keys, pool, st.clock, parsed.key_id)) |pk| {
+            if (sig.verify(&parsed, &req_view, &pk)) |_| ok = true else |_| {}
+        } else |_| {}
+        if (!ok) {
+            if (st.db) |xdb| ok = verifyWithExtraKey(xdb, &parsed, &req_view);
+        }
+        if (!ok) break :sig_block;
         replay.record(parsed.key_id, parsed.signature_b64, now_unix);
         verified = true;
     }
@@ -652,6 +661,27 @@ fn recordAttachment(db: *c.sqlite3, object_iri: []const u8, url: []const u8, med
     _ = c.sqlite3_bind_text(stmt, 3, media_type.ptr, @intCast(media_type.len), c.sqliteTransientAsDestructor());
     _ = c.sqlite3_bind_text(stmt, 4, name.ptr, @intCast(name.len), c.sqliteTransientAsDestructor());
     _ = c.sqlite3_step(stmt.?);
+}
+
+// AP-15: try every published extra key whose `key_id` matches the
+// signature's keyId (FEP-d36d Multikey rotation). Returns true on the
+// first key that verifies.
+fn verifyWithExtraKey(db: *c.sqlite3, parsed: *const sig.Parsed, req_view: *const sig.RequestView) bool {
+    var stmt: ?*c.sqlite3_stmt = null;
+    if (c.sqlite3_prepare_v2(db, "SELECT public_pem FROM ap_actor_extra_keys WHERE key_id = ?", -1, &stmt, null) != c.SQLITE_OK) return false;
+    defer _ = c.sqlite3_finalize(stmt);
+    _ = c.sqlite3_bind_text(stmt, 1, parsed.key_id.ptr, @intCast(parsed.key_id.len), c.sqliteTransientAsDestructor());
+    const kid = keys.KeyId.fromSlice(parsed.key_id) catch return false;
+    var guard: u32 = 0;
+    while (c.sqlite3_step(stmt.?) == c.SQLITE_ROW and guard < 16) : (guard += 1) {
+        const p = c.sqlite3_column_text(stmt, 0);
+        const n: usize = @intCast(c.sqlite3_column_bytes(stmt, 0));
+        if (p == null or n == 0) continue;
+        const pem = p[0..n];
+        const pk = keys.parsePublicKeyPem(pem, kid) catch continue;
+        if (sig.verify(parsed, req_view, &pk)) |_| return true else |_| {}
+    }
+    return false;
 }
 
 // AP-25: check whether any local actor has blocked `actor`. Used by
@@ -1510,4 +1540,46 @@ test "AP-15: actor advertises a Multikey assertionMethod (FEP-d36d)" {
     try testing.expect(std.mem.indexOf(u8, out, "\"assertionMethod\":[") != null);
     try testing.expect(std.mem.indexOf(u8, out, "\"type\":\"Multikey\"") != null);
     try testing.expect(std.mem.indexOf(u8, out, "\"publicKeyMultibase\":\"z") != null);
+}
+
+test "AP-15: verifyWithExtraKey accepts a signature from a published rotation key" {
+    const sqlite_mod = core.storage.sqlite;
+    const db = try sqlite_mod.openWriter(":memory:");
+    defer sqlite_mod.closeDb(db);
+    try @import("schema.zig").applyAllForTests(db);
+
+    const kid = try keys.KeyId.fromSlice("kid");
+    const pair = try keys.generateEd25519FromSeed(kid, keys.testSeed(2));
+    var pem_buf: [256]u8 = undefined;
+    const pem_len = try keys.writeEd25519PublicPem(pair.public.ed25519Bytes(), &pem_buf);
+    const pem = pem_buf[0..pem_len];
+
+    // Publish the key as an extra key keyed on "kid".
+    {
+        var stmt: ?*c.sqlite3_stmt = null;
+        try testing.expect(c.sqlite3_prepare_v2(db, "INSERT INTO ap_actor_extra_keys(username, key_id, key_type, public_pem, created_at) VALUES ('alice','kid','ed25519',?,0)", -1, &stmt, null) == c.SQLITE_OK);
+        defer _ = c.sqlite3_finalize(stmt);
+        _ = c.sqlite3_bind_text(stmt, 1, pem.ptr, @intCast(pem.len), c.sqliteTransientAsDestructor());
+        try testing.expect(c.sqlite3_step(stmt.?) == c.SQLITE_DONE);
+    }
+
+    // Sign a request with that key and confirm the extra-key path verifies it.
+    const hdr = "keyId=\"kid\",algorithm=\"ed25519\",headers=\"(request-target) host date\",signature=\"AAAA\"";
+    var p = try sig.parseCavage(hdr);
+    p.algorithm = .ed25519;
+    const req: sig.RequestView = .{
+        .method = "POST",
+        .path = "/inbox",
+        .target_uri = "https://example.com/inbox",
+        .host = "example.com",
+        .date = "Thu, 19 Mar 2026 12:00:00 GMT",
+    };
+    var sig_buf: [128]u8 = undefined;
+    p.signature_b64 = try sig.signEd25519(&p, &req, pair.private.ed25519SecretBytes(), &sig_buf);
+
+    try testing.expect(verifyWithExtraKey(db, &p, &req));
+    // A different keyId finds no extra key → false.
+    var p2 = p;
+    p2.key_id = "other";
+    try testing.expect(!verifyWithExtraKey(db, &p2, &req));
 }

@@ -523,7 +523,7 @@ seams.
       returns OrderedCollection of Like activities created by the
       actor. Storage already has likes in `ap_activities`.
 
-- [~] **AP-15. Multikey support (FEP-d36d).**
+- [x] **AP-15. Multikey support (FEP-d36d).**
       **Effort: M.** *Touches: `actor.zig` (emit `assertionMethod`),
       `keys.zig` (per-actor multi-key index), schema.*
       Acceptance: an actor advertises `assertionMethod` array of
