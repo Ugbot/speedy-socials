@@ -284,4 +284,6 @@ test "global set/get/reset" {
 
 test {
     _ = @import("queue/db_queue.zig");
+    // zorm messaging bridges (stream.Sink -> zorm.Sink, this -> zorm.Queue).
+    _ = @import("zorm_messaging.zig");
 }
