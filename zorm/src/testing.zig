@@ -140,8 +140,13 @@ pub const MockBackend = struct {
             try self.doUpdate(sql, args);
         } else if (std.mem.startsWith(u8, sql, "DELETE FROM ")) {
             try self.doDelete(sql, args);
-        } else if (std.mem.startsWith(u8, sql, "CREATE TABLE") or std.mem.startsWith(u8, sql, "DROP TABLE")) {
-            // DDL is a no-op for the mock (schema is implicit).
+        } else if (std.mem.startsWith(u8, sql, "CREATE ") or
+            std.mem.startsWith(u8, sql, "DROP ") or
+            std.mem.startsWith(u8, sql, "ALTER "))
+        {
+            // DDL (CREATE TABLE/INDEX, DROP …, ALTER …) is a no-op for the
+            // mock — its schema is implicit. Migration `up` statements pass
+            // through here; their effect is verified against a real engine.
         } else return Error.BadStatement;
     }
 

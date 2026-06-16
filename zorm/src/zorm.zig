@@ -34,6 +34,7 @@ const session = @import("session.zig");
 const repository = @import("repository.zig");
 const query = @import("query.zig");
 const relations = @import("relations.zig");
+const migrate = @import("migrate.zig");
 const messaging = @import("messaging.zig");
 pub const testing = @import("testing.zig");
 
@@ -62,9 +63,16 @@ pub const createTable = ddl.createTable;
 pub const dropTable = ddl.dropTable;
 pub const createIndex = ddl.createIndex;
 pub const dropIndex = ddl.dropIndex;
+pub const addColumn = ddl.addColumn;
+pub const dropColumn = ddl.dropColumn;
 pub const foreignKeyIndexes = ddl.foreignKeyIndexes;
 pub const foreignKeys = reflect.foreignKeys;
 pub const FkSpec = reflect.FkSpec;
+
+// ── Migrations (M3) ────────────────────────────────────────────────────
+pub const Migration = migrate.Migration;
+pub const Migrator = migrate.Migrator;
+pub const initialMigration = migrate.initialMigration;
 
 // ── Marshaling + CRUD (S2) ─────────────────────────────────────────────
 pub const PkValue = bind.PkValue;
@@ -124,6 +132,7 @@ test {
     _ = repository;
     _ = query;
     _ = relations;
+    _ = migrate;
     _ = messaging;
     _ = testing;
 }

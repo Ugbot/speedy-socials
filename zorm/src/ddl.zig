@@ -133,6 +133,36 @@ pub fn dropIndex(comptime T: type, comptime cols: []const []const u8, dialect: D
     };
 }
 
+/// `ALTER TABLE … ADD COLUMN <col> <type>` for an existing entity field
+/// (a hand-authored evolution step). Emitted WITHOUT `NOT NULL` — adding a
+/// non-null column to a populated table needs a default, which the caller
+/// supplies in a follow-up step if required (kept explicit, not faked).
+pub fn addColumn(comptime T: type, comptime field_name: []const u8, dialect: Dialect) []const u8 {
+    return switch (dialect) {
+        inline else => |d| comptime buildAddColumn(T, field_name, d),
+    };
+}
+
+fn buildAddColumn(comptime T: type, comptime field_name: []const u8, comptime dialect: Dialect) []const u8 {
+    return comptime blk: {
+        const info = reflect.TableInfo(T);
+        for (info.columns) |col| {
+            if (std.mem.eql(u8, col.name, field_name)) {
+                if (col.pk_auto) @compileError("zorm: cannot ADD COLUMN an auto-increment PK ('" ++ field_name ++ "')");
+                break :blk "ALTER TABLE " ++ info.table ++ " ADD COLUMN " ++ col.name ++ " " ++ sqlType(col, dialect);
+            }
+        }
+        @compileError("zorm: ADD COLUMN field '" ++ field_name ++ "' is not a column of " ++ @typeName(T));
+    };
+}
+
+/// `ALTER TABLE <table> DROP COLUMN <col>` — string-based, since a dropped
+/// column no longer exists on the (new) struct. Dialect-independent
+/// (SQLite ≥3.35, Postgres, MySQL).
+pub fn dropColumn(comptime table: []const u8, comptime col: []const u8) []const u8 {
+    return "ALTER TABLE " ++ table ++ " DROP COLUMN " ++ col;
+}
+
 /// `CREATE INDEX` for every foreign-key column of `T` (one per BelongsTo).
 /// Returns a comptime list of statements — the natural companion to an
 /// entity's initial migration so FK lookups (and `HasMany`) stay fast.
