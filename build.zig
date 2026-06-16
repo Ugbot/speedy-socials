@@ -5,15 +5,12 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
     // ── optional feature flags ─────────────────────────────────────
-    // The streaming backends (kafka/redis/nats) are now PURE-ZIG vendored
-    // modules wired unconditionally (no flag) — see below. `-Dpostgres`
-    // remains only until the pg.zig provider lands. `-Dtrace` compiles in
-    // Chrome-format span tracing.
-    const enable_postgres = b.option(bool, "postgres", "Compile + link the libpq storage backend") orelse false;
+    // All backend drivers (kafka/redis/nats/pg) are now PURE-ZIG vendored
+    // modules wired unconditionally (no flag) — see below. `-Dtrace`
+    // compiles in Chrome-format span tracing.
     const enable_trace = b.option(bool, "trace", "Compile in Chrome-format span tracing (off = zero hot-path cost)") orelse false;
 
     const build_opts = b.addOptions();
-    build_opts.addOption(bool, "postgres", enable_postgres);
     build_opts.addOption(bool, "trace", enable_trace);
     const build_options_mod = build_opts.createModule();
 
@@ -124,6 +121,40 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    // ── third-party: pg.zig (pure-Zig Postgres driver) ──────────────
+    // karlseguin/pg.zig (std.Io-based) + its buffer/metrics deps; the
+    // openssl dep is stubbed (no TLS) and `config` carries pg.zig's two
+    // build knobs. Backs STORAGE_BACKEND=postgres (no libpq).
+    const pg_buffer_mod = b.addModule("buffer", .{
+        .root_source_file = b.path("third_party/buffer/src/buffer.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const pg_metrics_mod = b.addModule("metrics", .{
+        .root_source_file = b.path("third_party/metrics/src/metrics.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const pg_openssl_mod = b.addModule("openssl", .{
+        .root_source_file = b.path("third_party/pg.zig/src/openssl_stub.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const pg_config_opts = b.addOptions();
+    pg_config_opts.addOption(bool, "openssl", false);
+    pg_config_opts.addOption(bool, "column_names", false);
+    const pg_mod = b.addModule("pg", .{
+        .root_source_file = b.path("third_party/pg.zig/src/pg.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "buffer", .module = pg_buffer_mod },
+            .{ .name = "metrics", .module = pg_metrics_mod },
+            .{ .name = "openssl", .module = pg_openssl_mod },
+            .{ .name = "config", .module = pg_config_opts.createModule() },
+        },
+    });
+
     // ── core module ────────────────────────────────────────────────
     const core_mod = b.addModule("core", .{
         .root_source_file = b.path("src/core/root.zig"),
@@ -142,13 +173,9 @@ pub fn build(b: *std.Build) void {
             .{ .name = "redis", .module = redis_mod },
             .{ .name = "nats", .module = nats_mod },
             .{ .name = "kafka", .module = kafka_mod },
+            .{ .name = "pg", .module = pg_mod },
         },
     });
-
-    // Optional native lib for the Postgres backend (until pg.zig lands).
-    // The cImport in `storage/postgres_backend.zig` is comptime-gated
-    // behind `-Dpostgres` so the default build needs no libpq headers.
-    if (enable_postgres) linkLibpq(b, core_mod);
 
     // ── system OpenSSL link (W3.1) ─────────────────────────────────
     // Wired via Homebrew on macOS aarch64, system pkg-config on Linux.

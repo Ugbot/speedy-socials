@@ -14,6 +14,8 @@ pub const SqliteBackend = backend.SqliteBackend;
 pub const provider = @import("storage/provider.zig");
 pub const DbProvider = provider.DbProvider;
 pub const SqliteProvider = provider.SqliteProvider;
+/// Pure-Zig Postgres DbProvider (over pg.zig). See `storage/postgres_provider.zig`.
+pub const PostgresProvider = @import("storage/postgres_provider.zig").PostgresProvider;
 pub const setProvider = provider.setProvider;
 pub const dbProvider = provider.provider;
 pub const setCurrentTenant = provider.setCurrentTenant;
@@ -45,4 +47,5 @@ test {
     _ = handle;
     _ = backend;
     _ = provider;
+    _ = PostgresProvider;
 }

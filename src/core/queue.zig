@@ -234,8 +234,9 @@ pub fn resetGlobal() void {
     global_provider = null;
 }
 
-// Re-export the default DB-backed implementation.
+// Re-export the default DB-backed implementation + its schema migration.
 pub const DbQueue = @import("queue/db_queue.zig").DbQueue;
+pub const db_queue_migration = @import("queue/db_queue.zig").migration;
 
 // ──────────────────────────────────────────────────────────────────────
 // Tests

@@ -511,7 +511,7 @@ pub fn main() !void {
     // app passwords / invites) backing `core.account.SqliteBackend`.
     try schema.register(core.account.sqlite_migration);
     // P5: durable job-queue table backing the default DbQueue provider.
-    try schema.register(core.queue.DbQueue.migration);
+    try schema.register(core.queue.db_queue_migration);
     try registry.registerAllSchemas(&ctx, &schema);
 
     // ── pluggable DB provider (owns migration + per-tenant routing) ──
@@ -557,44 +557,35 @@ pub fn main() !void {
     // rare, admin-bound, and synchronous (good enough for Phase 5).
     relay.state.attachDb(db);
 
-    // ── Pluggable storage backend (Phase G) ────────────────────────
-    // Install the process-wide `core.storage.Backend` used by migrated
-    // query sites. Default is SQLite wrapping the writer connection;
-    // STORAGE_BACKEND=postgres (binary built with -Dpostgres) connects
-    // to DATABASE_URL instead. Backends not yet consulted by the hot
-    // path keep using their direct `*c.sqlite3` handle — this is the
-    // seam that lets sites migrate incrementally.
+    // ── Pluggable storage backend selection (Phase G + P3) ─────────
+    // The default DbProvider (SqliteProvider) was installed above. When
+    // STORAGE_BACKEND=postgres, override it with a pure-Zig PostgresProvider
+    // (pg.zig) over DATABASE_URL — no libpq. Also install the legacy
+    // dialect-neutral storage.Backend global (SQLite over the writer
+    // handle); the per-tenant seam is `currentHandle()` (Phase 2).
     var storage_be_sqlite = core.storage.backend.SqliteBackend.init(db);
-    var pg_backend_holder: ?core.storage.backend.PostgresBackend = null;
+    core.storage.backend.setGlobal(storage_be_sqlite.backend());
     defer core.storage.backend.setGlobal(null);
-    defer if (core.storage.backend.postgres_enabled) {
-        if (pg_backend_holder) |*pg| pg.deinit();
-    };
+    var pg_provider_holder: ?core.storage.PostgresProvider = null;
+    defer if (pg_provider_holder) |*p| p.deinit();
     {
         const sb = if (std.c.getenv("STORAGE_BACKEND")) |v| std.mem.sliceTo(v, 0) else "sqlite";
         if (std.mem.eql(u8, sb, "postgres")) {
-            if (core.storage.backend.postgres_enabled) {
-                const url = if (std.c.getenv("DATABASE_URL")) |u| std.mem.sliceTo(u, 0) else "";
-                if (url.len == 0) {
-                    log_ptr.warn("boot", "STORAGE_BACKEND=postgres but DATABASE_URL unset — falling back to sqlite");
-                    core.storage.backend.setGlobal(storage_be_sqlite.backend());
-                } else if (core.storage.backend.PostgresBackend.init(url)) |pg| {
-                    pg_backend_holder = pg;
-                    core.storage.backend.setGlobal(pg_backend_holder.?.backend());
-                    log_ptr.info("boot", "storage backend: postgres (libpq)");
-                } else |err| {
-                    log_ptr.record(.warn, "boot", "postgres connect failed — falling back to sqlite", &.{
-                        .{ .k = "err", .v = @errorName(err) },
-                    });
-                    core.storage.backend.setGlobal(storage_be_sqlite.backend());
-                }
-            } else {
-                log_ptr.warn("boot", "STORAGE_BACKEND=postgres but binary built without -Dpostgres — using sqlite");
-                core.storage.backend.setGlobal(storage_be_sqlite.backend());
+            const url = if (std.c.getenv("DATABASE_URL")) |u| std.mem.sliceTo(u, 0) else "";
+            if (url.len == 0) {
+                log_ptr.warn("boot", "STORAGE_BACKEND=postgres but DATABASE_URL unset — using sqlite");
+            } else if (core.storage.PostgresProvider.init(io, gpa_allocator, url)) |pp| {
+                pg_provider_holder = pp;
+                core.storage.setProvider(pg_provider_holder.?.dbProvider());
+                core.storage.backend.setGlobal(pg_provider_holder.?.pg_backend.backend());
+                log_ptr.info("boot", "storage provider: postgres (pure-Zig pg.zig)");
+            } else |err| {
+                log_ptr.record(.warn, "boot", "postgres connect failed — using sqlite", &.{
+                    .{ .k = "err", .v = @errorName(err) },
+                });
             }
         } else {
-            core.storage.backend.setGlobal(storage_be_sqlite.backend());
-            log_ptr.info("boot", "storage backend: sqlite");
+            log_ptr.info("boot", "storage provider: sqlite");
         }
     }
 

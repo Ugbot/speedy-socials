@@ -16,18 +16,10 @@
 
 const std = @import("std");
 const c = @import("sqlite").c;
-const build_options = @import("build_options");
 
-/// Whether the Postgres backend was compiled in (`-Dpostgres`).
-pub const postgres_enabled = build_options.postgres;
-
-/// The libpq-backed Postgres backend, present only under `-Dpostgres`.
-/// The import is comptime-gated so the default build never analyses its
-/// cImport (which needs libpq headers).
-pub const PostgresBackend = if (build_options.postgres)
-    @import("postgres_backend.zig").PostgresBackend
-else
-    struct {};
+/// Pure-Zig Postgres backend over the vendored `pg.zig` (always compiled —
+/// no system libpq). See `storage/postgres_backend.zig`.
+pub const PostgresBackend = @import("postgres_backend.zig").PostgresBackend;
 
 pub const Error = error{
     NotFound,
@@ -338,7 +330,7 @@ test "INFRA-1: SqliteBackend transaction rolls back on error" {
 
 test {
     // Pull the Postgres backend's tests in only when it is compiled.
-    if (build_options.postgres) _ = @import("postgres_backend.zig");
+    _ = @import("postgres_backend.zig");
 }
 
 test "Phase G: a non-SQLite backend satisfies the same vtable + global routing" {
