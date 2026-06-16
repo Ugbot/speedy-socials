@@ -337,6 +337,24 @@ pub fn build(b: *std.Build) void {
     const bench_step = b.step("bench-storage", "Run the storage layer benchmark");
     bench_step.dependOn(&run_bench_storage.step);
 
+    // D3: firehose throughput — direct insert vs ring+batched drain.
+    const bench_firehose = b.addExecutable(.{
+        .name = "firehose-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("bench/firehose_bench.zig"),
+            .target = target,
+            .optimize = bench_optimize,
+            .imports = &.{
+                .{ .name = "core", .module = core_mod },
+                .{ .name = "sqlite", .module = sqlite_mod },
+                .{ .name = "protocol_atproto", .module = atproto_mod },
+            },
+        }),
+    });
+    const run_bench_firehose = b.addRunArtifact(bench_firehose);
+    const bench_fh_step = b.step("bench-firehose", "Run the firehose throughput benchmark (D3)");
+    bench_fh_step.dependOn(&run_bench_firehose.step);
+
     // ── simulation harness ─────────────────────────────────────────
     // `zig build sim` runs the federation scenario(s) in tests/sim/.
     // They link against `core` (which re-exports the TB-derived TimeSim /

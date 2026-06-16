@@ -34,6 +34,7 @@ pub const state = @import("state.zig");
 pub const auth = @import("auth.zig");
 pub const repo = @import("repo.zig");
 pub const firehose = @import("firehose.zig");
+pub const firehose_buffer = @import("firehose_buffer.zig");
 pub const routes = @import("routes.zig");
 pub const xrpc = @import("xrpc.zig");
 pub const did_resolver = @import("did_resolver.zig");
