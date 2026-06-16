@@ -163,10 +163,7 @@ pub const MockBackend = struct {
     fn queryImpl(ptr: *anyopaque, sql: []const u8, args: []const BindValue, ctx: *anyopaque, cb: contract.RowCallback) Error!void {
         const self: *MockBackend = @ptrCast(@alignCast(ptr));
         if (!std.mem.startsWith(u8, sql, "SELECT ")) return Error.BadStatement;
-        var out: contract.Row = .{};
-        if (try self.doSelect(sql, args, &out)) {
-            _ = cb(ctx, &out);
-        }
+        try self.doSelectAll(sql, args, ctx, cb);
     }
 
     fn lastInsertIdImpl(ptr: *anyopaque) i64 {
@@ -229,15 +226,41 @@ pub const MockBackend = struct {
 
     fn doSelect(self: *MockBackend, sql: []const u8, args: []const BindValue, out: *contract.Row) Error!bool {
         const proj = between(sql, "SELECT ", " FROM ") orelse return Error.BadStatement;
-        const rest = sliceAfter(sql, " FROM ") orelse return Error.BadStatement;
-        const tname = between(rest, "", " WHERE ") orelse return Error.BadStatement;
-        const where_col = between(sql, " WHERE ", " = ") orelse return Error.BadStatement;
-        if (args.len < 1) return Error.BadBinding;
+        const tname = tableName(sql) orelse return Error.BadStatement;
+        const where = whereClause(sql);
 
         const t = self.table(tname);
-        const match = self.findRow(t, where_col, args[0]) orelse return false;
-        projectRow(match, proj, out);
-        return true;
+        var i: usize = 0;
+        while (i < t.row_count) : (i += 1) {
+            if (!t.rows[i].present) continue;
+            if (rowMatches(&t.rows[i], where, args)) {
+                projectRow(&t.rows[i], proj, out);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Stream every matching row to `cb` (respecting LIMIT and cb's stop
+    /// signal). The query() path — multiple rows, unlike queryOne.
+    fn doSelectAll(self: *MockBackend, sql: []const u8, args: []const BindValue, ctx: *anyopaque, cb: contract.RowCallback) Error!void {
+        const proj = between(sql, "SELECT ", " FROM ") orelse return Error.BadStatement;
+        const tname = tableName(sql) orelse return Error.BadStatement;
+        const where = whereClause(sql);
+        const lim = limitOf(sql);
+
+        const t = self.table(tname);
+        var emitted: usize = 0;
+        var i: usize = 0;
+        while (i < t.row_count) : (i += 1) {
+            if (!t.rows[i].present) continue;
+            if (!rowMatches(&t.rows[i], where, args)) continue;
+            if (lim) |l| if (emitted >= l) break;
+            var out: contract.Row = .{};
+            projectRow(&t.rows[i], proj, &out);
+            emitted += 1;
+            if (!cb(ctx, &out)) break;
+        }
     }
 
     fn doUpdate(self: *MockBackend, sql: []const u8, args: []const BindValue) Error!void {
@@ -369,6 +392,45 @@ fn between(s: []const u8, a: []const u8, b: []const u8) ?[]const u8 {
 fn sliceAfter(s: []const u8, a: []const u8) ?[]const u8 {
     const idx = std.mem.indexOf(u8, s, a) orelse return null;
     return s[idx + a.len ..];
+}
+
+/// Table name following `FROM` (first token up to a space or end).
+fn tableName(sql: []const u8) ?[]const u8 {
+    const rest = sliceAfter(sql, " FROM ") orelse return null;
+    const end = std.mem.indexOfScalar(u8, rest, ' ') orelse rest.len;
+    return rest[0..end];
+}
+
+/// The WHERE predicate text (between `WHERE` and ORDER BY / LIMIT / end),
+/// or null if the statement has no WHERE.
+fn whereClause(sql: []const u8) ?[]const u8 {
+    const start_idx = std.mem.indexOf(u8, sql, " WHERE ") orelse return null;
+    const start = start_idx + " WHERE ".len;
+    var end = sql.len;
+    if (std.mem.indexOf(u8, sql[start..], " ORDER BY ")) |o| end = @min(end, start + o);
+    if (std.mem.indexOf(u8, sql[start..], " LIMIT ")) |l| end = @min(end, start + l);
+    return sql[start..end];
+}
+
+fn limitOf(sql: []const u8) ?usize {
+    const rest = sliceAfter(sql, " LIMIT ") orelse return null;
+    var end: usize = 0;
+    while (end < rest.len and rest[end] >= '0' and rest[end] <= '9') : (end += 1) {}
+    return std.fmt.parseInt(usize, rest[0..end], 10) catch null;
+}
+
+/// Does `row` satisfy every `col = ?` predicate in `where`? Predicates are
+/// AND-joined and bind args positionally (predicate i → args[i]).
+fn rowMatches(row: *Row, where: ?[]const u8, args: []const BindValue) bool {
+    const clause = where orelse return true;
+    var it = std.mem.splitSequence(u8, clause, " AND ");
+    var i: usize = 0;
+    while (it.next()) |pred| : (i += 1) {
+        const col = between(pred, "", " = ") orelse return false;
+        if (i >= args.len) return false;
+        if (!cellForKey(row, col).matchesBind(args[i])) return false;
+    }
+    return true;
 }
 
 // ── Tests (exercise the mock directly; CRUD-level tests live in crud.zig) ─

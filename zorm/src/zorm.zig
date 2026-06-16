@@ -33,6 +33,7 @@ const schema_desc = @import("schema_desc.zig");
 const session = @import("session.zig");
 const repository = @import("repository.zig");
 const query = @import("query.zig");
+const relations = @import("relations.zig");
 const messaging = @import("messaging.zig");
 pub const testing = @import("testing.zig");
 
@@ -86,6 +87,11 @@ pub const entityEql = session.entityEql;
 pub const Query = query.Query;
 pub const Dir = query.Dir;
 
+// ── Relations (S5) ─────────────────────────────────────────────────────
+pub const BelongsTo = relations.BelongsTo;
+pub const HasMany = relations.HasMany;
+pub const HasOne = relations.HasOne;
+
 // ── Typed messaging over Sink / Queue (S8) ─────────────────────────────
 pub const Sink = messaging.Sink;
 pub const Queue = messaging.Queue;
@@ -110,6 +116,7 @@ test {
     _ = session;
     _ = repository;
     _ = query;
+    _ = relations;
     _ = messaging;
     _ = testing;
 }
