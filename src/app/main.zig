@@ -575,6 +575,43 @@ pub fn main() !void {
         log_ptr.info("boot", "tls backend wired (native outbound)");
     }
 
+    // ── Pluggable event-stream sink (Phase H) ──────────────────────
+    // Mirrors AT firehose events + relay translations to an external
+    // stream. STREAM_BACKEND=null (default) | log | kafka. Kafka needs a
+    // binary built with -Dkafka and KAFKA_BROKERS set.
+    var log_sink_state: core.stream.LogSink = .{};
+    var kafka_holder: ?core.stream.KafkaSink = null;
+    // Clear the global sink before tearing down its backing storage on
+    // shutdown (LIFO defers: this runs before the kafka deinit below).
+    defer core.stream.setGlobal(null);
+    defer if (core.stream.kafka_enabled) {
+        if (kafka_holder) |*k| k.deinit();
+    };
+    {
+        const backend = if (std.c.getenv("STREAM_BACKEND")) |v| std.mem.sliceTo(v, 0) else "null";
+        if (std.mem.eql(u8, backend, "log")) {
+            core.stream.setGlobal(log_sink_state.sink());
+            log_ptr.info("boot", "stream sink: log (in-memory ring)");
+        } else if (std.mem.eql(u8, backend, "kafka")) {
+            if (core.stream.kafka_enabled) {
+                const brokers = if (std.c.getenv("KAFKA_BROKERS")) |b| std.mem.sliceTo(b, 0) else "localhost:9092";
+                if (core.stream.KafkaSink.init(brokers)) |ks| {
+                    kafka_holder = ks;
+                    core.stream.setGlobal(kafka_holder.?.sink());
+                    log_ptr.info("boot", "stream sink: kafka (librdkafka producer)");
+                } else |err| {
+                    log_ptr.record(.warn, "boot", "kafka sink init failed — using null sink", &.{
+                        .{ .k = "err", .v = @errorName(err) },
+                    });
+                }
+            } else {
+                log_ptr.warn("boot", "STREAM_BACKEND=kafka but binary built without -Dkafka — using null sink");
+            }
+        } else {
+            log_ptr.info("boot", "stream sink: null (no external streaming)");
+        }
+    }
+
     // Bind the HTTP client to the protocol plugins so their federation
     // hook trampolines can find it. After this, AP key fetches +
     // outbox deliveries and AT DID resolutions hit the wire for real.

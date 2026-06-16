@@ -278,7 +278,16 @@ pub fn appendLog(
     }
     if (c.sqlite3_bind_int64(stmt, 6, now) != c.SQLITE_OK) return error.BadSubscriptionState;
     if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return error.BadSubscriptionState;
-    return c.sqlite3_column_int64(stmt, 0);
+    const log_id = c.sqlite3_column_int64(stmt, 0);
+
+    // Phase H: publish successful translations to the pluggable stream
+    // sink so external consumers (Kafka) see the AT↔AP bridge activity.
+    // Keyed by source id; payload is the translated id. Best-effort.
+    if (success) {
+        core.stream.publish("relay.events", source_id, translated_id);
+    }
+
+    return log_id;
 }
 
 /// Paginated log read, newest first.

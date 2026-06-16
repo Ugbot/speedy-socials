@@ -102,6 +102,12 @@ pub fn appendKind(
     }
 
     if (local_sink) |sink| sink(seq, did, commit_cid, body, ts);
+
+    // Phase H: mirror every firehose event to the pluggable stream sink
+    // (Kafka/log/null). Keyed by repo DID so a topic stays per-repo
+    // ordered. Best-effort + non-blocking; a null sink is a no-op.
+    core.stream.publish("firehose", did, body);
+
     return seq;
 }
 
@@ -320,6 +326,40 @@ test "firehose: append + readSince" {
     try testing.expectEqual(@as(u32, 2), n);
     try testing.expectEqualStrings("did:plc:b", out[0].did());
     try testing.expectEqualStrings("bafy3", out[1].commitCid());
+}
+
+test "Phase H: firehose append publishes each event to the stream sink" {
+    const db = try setupDb();
+    defer core.storage.sqlite.closeDb(db);
+
+    var ls: core.stream.LogSink = .{};
+    core.stream.setGlobal(ls.sink());
+    defer core.stream.setGlobal(null);
+
+    // Randomized DIDs/bodies so we're not asserting on a hardcoded path.
+    var prng = std.Random.DefaultPrng.init(0xF1_4E_05_E);
+    const rand = prng.random();
+    const n: usize = 16;
+    var last_did_buf: [32]u8 = undefined;
+    var last_did_len: usize = 0;
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        var did_buf: [32]u8 = undefined;
+        const dlen = 10 + rand.intRangeAtMost(usize, 0, 20);
+        @memcpy(did_buf[0..8], "did:plc:");
+        for (did_buf[8..dlen]) |*ch| ch.* = "abcdefghijklmnop"[rand.intRangeLessThan(usize, 0, 16)];
+        @memcpy(last_did_buf[0..dlen], did_buf[0..dlen]);
+        last_did_len = dlen;
+        _ = try append(db, did_buf[0..dlen], "bafycid", "event-body", @intCast(1000 + i));
+    }
+
+    // Every append published exactly once, to the firehose topic, keyed
+    // by the repo DID.
+    try testing.expectEqual(@as(u64, n), ls.publishedCount());
+    const rec = ls.last() orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings("firehose", rec.topic());
+    try testing.expectEqualStrings(last_did_buf[0..last_did_len], rec.key());
+    try testing.expectEqualStrings("event-body", rec.payloadPrefix());
 }
 
 test "firehose: latestSeq tracks last append" {

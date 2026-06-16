@@ -36,6 +36,9 @@ pub const trace = @import("trace.zig");
 pub const cert_probe = @import("cert_probe.zig");
 pub const tenancy = @import("tenancy.zig");
 
+/// Pluggable event-stream sink (Null / Log / Kafka). See `stream.zig`.
+pub const stream = @import("stream.zig");
+
 /// W4: vendored TigerBeetle stdx primitives — `BoundedArrayType`,
 /// `RingBufferType`, `IOPSType`, `BitSetType`, plus the local
 /// `copy_disjoint`/`copy_left`/`copy_right` helpers and a re-export
@@ -122,6 +125,7 @@ test {
     _ = trace;
     _ = cert_probe;
     _ = tenancy;
+    _ = stream;
     _ = crypto.ed25519;
     _ = crypto.multibase;
     _ = crypto.multicodec;

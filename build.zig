@@ -4,6 +4,20 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // ── optional feature flags ─────────────────────────────────────
+    // Kept off by default so the standard build/test stays dependency-
+    // light. `-Dkafka` links librdkafka and compiles the Kafka stream
+    // sink; `-Dpostgres` links libpq and compiles the Postgres storage
+    // backend. Both are surfaced to the code through a `build_options`
+    // module.
+    const enable_kafka = b.option(bool, "kafka", "Compile + link the librdkafka stream sink") orelse false;
+    const enable_postgres = b.option(bool, "postgres", "Compile + link the libpq storage backend") orelse false;
+
+    const build_opts = b.addOptions();
+    build_opts.addOption(bool, "kafka", enable_kafka);
+    build_opts.addOption(bool, "postgres", enable_postgres);
+    const build_options_mod = build_opts.createModule();
+
     // ── sqlite (vendored) ──────────────────────────────────────────
     const sqlite_dep = b.dependency("sqlite", .{ .target = target, .optimize = optimize });
     const sqlite_mod = sqlite_dep.module("sqlite");
@@ -83,8 +97,17 @@ pub fn build(b: *std.Build) void {
             .{ .name = "tb_testing", .module = tb_testing_mod },
             .{ .name = "tb_stdx", .module = tb_stdx_mod },
             .{ .name = "tls", .module = ianic_tls_mod },
+            .{ .name = "build_options", .module = build_options_mod },
         },
     });
+
+    // Optional native libs for the pluggable backends. Linked into `core`
+    // only when the corresponding flag is set; the cImports in
+    // `stream/kafka_sink.zig` / `storage/postgres_backend.zig` are
+    // comptime-gated behind the same flags so the default build never
+    // needs the headers.
+    if (enable_kafka) linkSystemLibByPrefix(core_mod, target, "librdkafka", "rdkafka");
+    if (enable_postgres) linkSystemLibByPrefix(core_mod, target, "libpq", "pq");
 
     // ── system OpenSSL link (W3.1) ─────────────────────────────────
     // Wired via Homebrew on macOS aarch64, system pkg-config on Linux.
@@ -478,4 +501,26 @@ fn linkSystemOpenSsl(b: *std.Build, mod: *std.Build.Module, target: std.Build.Re
     }
     mod.linkSystemLibrary("ssl", .{});
     mod.linkSystemLibrary("crypto", .{});
+}
+
+/// Link an optional Homebrew-installed library (librdkafka, libpq, …)
+/// into `mod`. `brew_formula` is the Homebrew cellar name used to locate
+/// headers/libs on macOS; `lib_name` is the linker name (`-l<lib_name>`).
+/// On Linux we rely on system/pkg-config-discoverable paths.
+fn linkSystemLibByPrefix(
+    mod: *std.Build.Module,
+    target: std.Build.ResolvedTarget,
+    brew_formula: []const u8,
+    lib_name: []const u8,
+) void {
+    const os_tag = target.result.os.tag;
+    const arch = target.result.cpu.arch;
+    if (os_tag == .macos) {
+        const brew_root: []const u8 = if (arch == .aarch64) "/opt/homebrew/opt" else "/usr/local/opt";
+        const inc = std.fmt.allocPrint(std.heap.page_allocator, "{s}/{s}/include", .{ brew_root, brew_formula }) catch @panic("OOM");
+        const lib = std.fmt.allocPrint(std.heap.page_allocator, "{s}/{s}/lib", .{ brew_root, brew_formula }) catch @panic("OOM");
+        mod.addIncludePath(.{ .cwd_relative = inc });
+        mod.addLibraryPath(.{ .cwd_relative = lib });
+    }
+    mod.linkSystemLibrary(lib_name, .{});
 }
