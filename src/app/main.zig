@@ -806,10 +806,23 @@ pub fn main() !void {
     try core.metrics.registerMetricsRoute(&router, std.math.maxInt(u16));
     log_ptr.info("boot", "metrics registry initialised; /metrics serving");
 
-    // C4: TLS cert hot-reload admin route. Always registered; the handler
-    // reports 503 until `configure` runs (after the inbound TLS backend
-    // loads, below) and 403 unless ADMIN_TOKEN is set.
+    // C4 + E3: admin/debug routes (POST /admin/tls/reload, GET /debug/trace).
+    // Always registered; gated on ADMIN_TOKEN. Set the token now so the
+    // routes work regardless of whether inbound TLS is configured.
     try core.tls.admin_routes.registerRoutes(&router, std.math.maxInt(u16));
+    if (std.c.getenv("ADMIN_TOKEN")) |t| core.tls.admin_routes.setToken(std.mem.sliceTo(t, 0));
+
+    // E3: enable Chrome-trace span recording at runtime (only has effect
+    // in a binary built with -Dtrace). Spans cover the request dispatch
+    // path; dump via GET /debug/trace.
+    if (core.trace.compiled_in) {
+        if (std.c.getenv("TRACE_ENABLE")) |v| {
+            if (std.mem.eql(u8, std.mem.sliceTo(v, 0), "1")) {
+                core.trace.setEnabled(true);
+                log_ptr.info("boot", "tracing enabled (Chrome-format; GET /debug/trace)");
+            }
+        }
+    }
 
     // G3: rate-limiting. Off by default; configured via env. Format:
     // RATE_LIMIT=<capacity>:<refill_per_sec>  (e.g. "60:30").

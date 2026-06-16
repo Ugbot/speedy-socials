@@ -23,6 +23,7 @@ const std = @import("std");
 const cert_admin = @import("cert_admin.zig");
 const router_mod = @import("../http/router.zig");
 const audit = @import("../audit.zig");
+const trace = @import("../trace.zig");
 const c = @import("sqlite").c;
 
 const HandlerContext = router_mod.HandlerContext;
@@ -59,6 +60,13 @@ pub fn configure(
     audit_db = db;
     audit_clock = clock;
     configured = true;
+}
+
+/// Set just the admin bearer token, independent of TLS cert-reload setup.
+/// Used so admin/debug routes (e.g. `GET /debug/trace`) are usable even
+/// when inbound TLS isn't configured. An empty token leaves them disabled.
+pub fn setToken(token: []const u8) void {
+    admin_token = token;
 }
 
 /// Reset module state (tests only).
@@ -142,10 +150,25 @@ fn handleReload(hc: *HandlerContext) anyerror!void {
     return hc.response.simple(.ok, "application/json", "{\"reloaded\":true}");
 }
 
-/// Register `POST /admin/tls/reload`. Slot is the sentinel plugin index
-/// (core route, no owning plugin).
+/// E3: `GET /debug/trace` — dump accumulated spans as Chrome-trace JSON
+/// (open in chrome://tracing / Perfetto). Admin-token gated. Returns an
+/// empty array when tracing is compiled out (`-Dtrace` off) or disabled.
+fn handleTrace(hc: *HandlerContext) anyerror!void {
+    const presented = presentedToken(hc) orelse {
+        return hc.response.simple(.forbidden, "application/json", "{\"error\":\"admin auth required\"}");
+    };
+    if (!tokenMatches(presented)) {
+        return hc.response.simple(.forbidden, "application/json", "{\"error\":\"admin auth required\"}");
+    }
+    const json = trace.dumpJson();
+    return hc.response.simple(.ok, "application/json", json);
+}
+
+/// Register the admin/debug routes. Slot is the sentinel plugin index
+/// (core routes, no owning plugin).
 pub fn registerRoutes(router: *Router, plugin_index: u16) !void {
     try router.register(.post, "/admin/tls/reload", handleReload, plugin_index);
+    try router.register(.get, "/debug/trace", handleTrace, plugin_index);
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────

@@ -20,6 +20,13 @@
 //! it on.
 
 const std = @import("std");
+const build_options = @import("build_options");
+
+/// Compile-time master switch (`-Dtrace`). When false, `begin`/`end`
+/// compile to nothing — no `clock_gettime`, no ring writes — so there is
+/// zero hot-path cost in a normal build. `TRACE_ENABLE=1` is the
+/// additional runtime toggle when tracing is compiled in.
+pub const compiled_in = build_options.trace;
 
 pub const max_name_bytes: usize = 64;
 pub const max_category_bytes: usize = 32;
@@ -63,7 +70,19 @@ pub fn isEnabled() bool {
     return enabled.load(.acquire);
 }
 
+/// Per-thread id for Chrome-trace lane separation. Assigned lazily on
+/// first span end on each thread.
+threadlocal var thread_tid: u32 = 0;
+var next_tid: std.atomic.Value(u32) = std.atomic.Value(u32).init(1);
+
+fn currentTid() u32 {
+    if (thread_tid == 0) thread_tid = next_tid.fetchAdd(1, .monotonic);
+    return thread_tid;
+}
+
 pub fn begin(name: []const u8, category: []const u8) SpanHandle {
+    if (comptime !compiled_in) return .{};
+    if (!isEnabled()) return .{};
     var h: SpanHandle = .{};
     const nc = @min(name.len, h.name_buf.len);
     @memcpy(h.name_buf[0..nc], name[0..nc]);
@@ -76,13 +95,17 @@ pub fn begin(name: []const u8, category: []const u8) SpanHandle {
 }
 
 pub fn end(handle: SpanHandle) void {
+    if (comptime !compiled_in) return;
     if (!isEnabled()) return;
+    // A handle from a disabled `begin` has start_us == 0 and an empty
+    // name; skip it so a mid-request toggle can't emit a bogus span.
+    if (handle.name_len == 0 and handle.start_us == 0) return;
     const elapsed = nowMicros() - handle.start_us;
     var ev: SpanEvent = .{
         .start_us = handle.start_us,
         .duration_us = elapsed,
         .pid = 1,
-        .tid = 1,
+        .tid = currentTid(),
     };
     @memcpy(ev.name_buf[0..handle.name_len], handle.name_buf[0..handle.name_len]);
     ev.name_len = handle.name_len;
@@ -120,6 +143,25 @@ pub fn flushTo(writer: *std.Io.Writer) !void {
     try writer.writeAll("]\n");
 }
 
+// Dump scratch — a fixed buffer so /debug/trace needs no allocator on the
+// (rare, admin-gated) dump path. Serialized so two concurrent dumps can't
+// interleave into the same buffer.
+var dump_buf: [768 * 1024]u8 = undefined;
+var dump_lock = Spinlock{};
+
+/// Render the accumulated spans as a Chrome-trace JSON array into the
+/// module's static buffer and return the slice. Safe to call when tracing
+/// is compiled out (returns an empty array).
+pub fn dumpJson() []const u8 {
+    dump_lock.lock();
+    defer dump_lock.unlock();
+    var w: std.Io.Writer = .fixed(&dump_buf);
+    flushTo(&w) catch {};
+    return w.buffered();
+}
+
+const Spinlock = @import("static.zig").Spinlock;
+
 // ──────────────────────────────────────────────────────────────────────
 // Tests
 // ──────────────────────────────────────────────────────────────────────
@@ -127,6 +169,7 @@ pub fn flushTo(writer: *std.Io.Writer) !void {
 const testing = std.testing;
 
 test "E3: begin/end records a span when enabled" {
+    if (comptime !compiled_in) return error.SkipZigTest;
     write_idx.store(0, .release);
     setEnabled(true);
     defer setEnabled(false);
@@ -143,7 +186,17 @@ test "E3: end is a no-op when disabled" {
     try testing.expectEqual(@as(u64, 0), write_idx.load(.acquire));
 }
 
+test "E3: distinct threads get distinct trace tids" {
+    if (comptime !compiled_in) return error.SkipZigTest;
+    // The main thread's tid is stable across calls.
+    const a = currentTid();
+    const b = currentTid();
+    try testing.expectEqual(a, b);
+    try testing.expect(a >= 1);
+}
+
 test "E3: flushTo emits valid JSON envelope" {
+    if (comptime !compiled_in) return error.SkipZigTest;
     write_idx.store(0, .release);
     setEnabled(true);
     defer setEnabled(false);

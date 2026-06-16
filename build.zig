@@ -12,10 +12,12 @@ pub fn build(b: *std.Build) void {
     // module.
     const enable_kafka = b.option(bool, "kafka", "Compile + link the librdkafka stream sink") orelse false;
     const enable_postgres = b.option(bool, "postgres", "Compile + link the libpq storage backend") orelse false;
+    const enable_trace = b.option(bool, "trace", "Compile in Chrome-format span tracing (off = zero hot-path cost)") orelse false;
 
     const build_opts = b.addOptions();
     build_opts.addOption(bool, "kafka", enable_kafka);
     build_opts.addOption(bool, "postgres", enable_postgres);
+    build_opts.addOption(bool, "trace", enable_trace);
     const build_options_mod = build_opts.createModule();
 
     // ── sqlite (vendored) ──────────────────────────────────────────

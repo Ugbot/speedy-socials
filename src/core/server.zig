@@ -40,6 +40,7 @@ const response = @import("http/response.zig");
 const router_mod = @import("http/router.zig");
 const metrics_mod = @import("metrics.zig");
 const log_mod = @import("log.zig");
+const trace_mod = @import("trace.zig");
 const rate_limit_mod = @import("rate_limit.zig");
 
 /// Monotonic nanosecond timestamp. Std's `nanoTimestamp` was removed
@@ -441,6 +442,9 @@ pub const Server = struct {
                 // request-latency histogram via posix CLOCK_MONOTONIC
                 // (std.time lost nanoTimestamp in Zig 0.16).
                 const t0_ns = monotonicNow();
+                // E3: Chrome-trace span around handler dispatch (compiled
+                // out entirely without -Dtrace; a no-op when disabled).
+                const span = trace_mod.begin(hit.pattern, "handler");
                 hit.handler(&hc) catch |err| {
                     // G6: opaque body to the client; the real error name
                     // goes to the ring log so operators can investigate.
@@ -448,6 +452,7 @@ pub const Server = struct {
                     rb = response.Builder.init(&conn.write_buf);
                     try rb.simple(.internal, "text/plain", "internal error");
                 };
+                trace_mod.end(span);
                 const t1_ns = monotonicNow();
                 const dur_ns: i64 = if (t1_ns > t0_ns) t1_ns - t0_ns else 0;
                 const dur_s: f64 = @as(f64, @floatFromInt(dur_ns)) / @as(f64, std.time.ns_per_s);
