@@ -60,6 +60,11 @@ pub const TableInfo = reflect.TableInfo;
 pub const ColumnSpec = reflect.ColumnSpec;
 pub const createTable = ddl.createTable;
 pub const dropTable = ddl.dropTable;
+pub const createIndex = ddl.createIndex;
+pub const dropIndex = ddl.dropIndex;
+pub const foreignKeyIndexes = ddl.foreignKeyIndexes;
+pub const foreignKeys = reflect.foreignKeys;
+pub const FkSpec = reflect.FkSpec;
 
 // ── Marshaling + CRUD (S2) ─────────────────────────────────────────────
 pub const PkValue = bind.PkValue;
@@ -91,6 +96,8 @@ pub const Dir = query.Dir;
 pub const BelongsTo = relations.BelongsTo;
 pub const HasMany = relations.HasMany;
 pub const HasOne = relations.HasOne;
+pub const Action = relations.Action;
+pub const FkOpts = relations.FkOpts;
 
 // ── Typed messaging over Sink / Queue (S8) ─────────────────────────────
 pub const Sink = messaging.Sink;

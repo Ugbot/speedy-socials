@@ -16,7 +16,7 @@
 //!   const Post = struct {
 //!       pub const zorm_table = "posts";
 //!       id: zorm.Pk(64) = .{}, author_id: zorm.Text(64) = .{},
-//!       author: zorm.BelongsTo(User, "author_id") = .{},
+//!       author: zorm.BelongsTo(User, "author_id", .{ .on_delete = .cascade }) = .{},
 //!   };
 
 const std = @import("std");
@@ -26,12 +26,41 @@ const fields = @import("fields.zig");
 const bind = @import("bind.zig");
 const crud = @import("crud.zig");
 const query = @import("query.zig");
+const ddl = @import("ddl.zig");
 
 const Backend = contract.Backend;
 const BindValue = contract.BindValue;
 const Error = contract.Error;
 
 pub const Kind = enum { belongs_to, has_many, has_one };
+
+/// Referential action for a foreign key's ON DELETE / ON UPDATE clause.
+pub const Action = enum {
+    no_action,
+    restrict,
+    cascade,
+    set_null,
+    set_default,
+
+    /// SQL clause text (empty for the default `no_action`, which needs no
+    /// clause). Valid on SQLite, Postgres, and MySQL alike.
+    pub fn sql(self: Action) []const u8 {
+        return switch (self) {
+            .no_action => "",
+            .restrict => "RESTRICT",
+            .cascade => "CASCADE",
+            .set_null => "SET NULL",
+            .set_default => "SET DEFAULT",
+        };
+    }
+};
+
+/// Foreign-key policy carried by a `BelongsTo` relation. Drives the DDL
+/// `FOREIGN KEY … ON DELETE/UPDATE …` clause that `ddl.createTable` emits.
+pub const FkOpts = struct {
+    on_delete: Action = .no_action,
+    on_update: Action = .no_action,
+};
 
 /// Resolve a child's foreign-key field (BY POINTER — a text FK's slice must
 /// reference the owner's stable field, not a temporary copy) to the parent's
@@ -48,13 +77,15 @@ fn ownerPkBind(owner: anytype) BindValue {
 
 /// A child→parent reference. `fk_field` is the child's foreign-key column
 /// (a `Text(N)`/`Pk(N)` for a text parent PK, or an `i64` for an auto PK).
-pub fn BelongsTo(comptime Parent: type, comptime fk_field: []const u8) type {
+/// `opts` sets the ON DELETE / ON UPDATE policy emitted into the table DDL.
+pub fn BelongsTo(comptime Parent: type, comptime fk_field: []const u8, comptime opts: FkOpts) type {
     return struct {
         const Self = @This();
         pub const zorm_relation = {};
         pub const kind: Kind = .belongs_to;
         pub const Target = Parent;
         pub const foreign_key = fk_field;
+        pub const fk_opts: FkOpts = opts;
 
         cached: Parent = .{},
         state: enum { unloaded, present, absent } = .unloaded,
@@ -160,7 +191,7 @@ const Post = struct {
     id: fields.Pk(64) = .{},
     author_id: fields.Text(64) = .{},
     title: fields.Text(64) = .{},
-    author: BelongsTo(User, "author_id") = .{},
+    author: BelongsTo(User, "author_id", .{ .on_delete = .cascade }) = .{},
 };
 
 const Profile = struct {
@@ -268,4 +299,42 @@ test "HasOne loads the single related child" {
     var none = User{ .id = fields.Pk(64).from("nobody") };
     var got2: Profile = .{};
     try testing.expect(!try none.profile.load(&none, backend, &got2));
+}
+
+test "foreignKeys: BelongsTo yields an FkSpec; HasMany/HasOne do not" {
+    const fks = reflect.foreignKeys(Post);
+    try testing.expectEqual(@as(usize, 1), fks.len);
+    try testing.expectEqualStrings("author_id", fks[0].local_col);
+    try testing.expectEqualStrings("users", fks[0].ref_table);
+    try testing.expectEqualStrings("id", fks[0].ref_col);
+    try testing.expectEqualStrings("CASCADE", fks[0].on_delete_sql);
+    try testing.expectEqualStrings("", fks[0].on_update_sql);
+
+    // The parent's HasMany/HasOne are not foreign keys on the parent table.
+    try testing.expectEqual(@as(usize, 0), reflect.foreignKeys(User).len);
+}
+
+test "createTable emits the FOREIGN KEY clause for every dialect" {
+    inline for (.{ .sqlite, .postgres, .mysql }) |d| {
+        const sql = ddl.createTable(Post, d);
+        try testing.expect(std.mem.indexOf(u8, sql, "FOREIGN KEY (author_id) REFERENCES users (id) ON DELETE CASCADE") != null);
+    }
+}
+
+test "createIndex + foreignKeyIndexes" {
+    try testing.expectEqualStrings(
+        "CREATE INDEX IF NOT EXISTS ix_posts_author_id ON posts (author_id)",
+        ddl.createIndex(Post, &.{"author_id"}, false),
+    );
+    try testing.expectEqualStrings(
+        "CREATE UNIQUE INDEX IF NOT EXISTS ix_profiles_user_id ON profiles (user_id)",
+        ddl.createIndex(Profile, &.{"user_id"}, true),
+    );
+    const ix = ddl.foreignKeyIndexes(Post);
+    try testing.expectEqual(@as(usize, 1), ix.len);
+    try testing.expectEqualStrings("CREATE INDEX IF NOT EXISTS ix_posts_author_id ON posts (author_id)", ix[0]);
+
+    // MySQL drop-index form names the table.
+    try testing.expectEqualStrings("DROP INDEX ix_posts_author_id ON posts", ddl.dropIndex(Post, &.{"author_id"}, .mysql));
+    try testing.expectEqualStrings("DROP INDEX IF EXISTS ix_posts_author_id", ddl.dropIndex(Post, &.{"author_id"}, .sqlite));
 }

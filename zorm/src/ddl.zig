@@ -61,6 +61,14 @@ fn buildCreateTable(comptime T: type, comptime dialect: Dialect) []const u8 {
                 sql = sql ++ " NOT NULL";
             }
         }
+        // Table-level FOREIGN KEY clauses derived from BelongsTo relations.
+        // (Table-level form works identically on SQLite, Postgres, MySQL.)
+        for (reflect.foreignKeys(T)) |fk| {
+            sql = sql ++ ", FOREIGN KEY (" ++ fk.local_col ++ ") REFERENCES " ++
+                fk.ref_table ++ " (" ++ fk.ref_col ++ ")";
+            if (fk.on_delete_sql.len > 0) sql = sql ++ " ON DELETE " ++ fk.on_delete_sql;
+            if (fk.on_update_sql.len > 0) sql = sql ++ " ON UPDATE " ++ fk.on_update_sql;
+        }
         sql = sql ++ ")";
         return sql;
     }
@@ -79,6 +87,65 @@ pub fn createTable(comptime T: type, dialect: Dialect) []const u8 {
 /// `DROP TABLE` DDL (for a migration's down step).
 pub fn dropTable(comptime T: type) []const u8 {
     return "DROP TABLE IF EXISTS " ++ reflect.TableInfo(T).table;
+}
+
+/// Index name for `T(cols…)`: `ix_<table>_<col0>[_<col1>…]`.
+fn indexName(comptime T: type, comptime cols: []const []const u8) []const u8 {
+    comptime {
+        var name: []const u8 = "ix_" ++ reflect.TableInfo(T).table;
+        for (cols) |c| name = name ++ "_" ++ c;
+        return name;
+    }
+}
+
+/// `CREATE [UNIQUE] INDEX IF NOT EXISTS ix_<table>_<cols> ON <table>(<cols>)`.
+/// Columns are comptime-validated against the entity. Dialect-independent
+/// (SQLite/Postgres/MySQL share this form).
+pub fn createIndex(comptime T: type, comptime cols: []const []const u8, comptime unique: bool) []const u8 {
+    return comptime blk: {
+        const info = reflect.TableInfo(T);
+        if (cols.len == 0) @compileError("zorm: createIndex needs at least one column");
+        for (cols) |c| {
+            var found = false;
+            for (info.columns) |col| {
+                if (std.mem.eql(u8, col.name, c)) found = true;
+            }
+            if (!found) @compileError("zorm: index column '" ++ c ++ "' is not a column of " ++ @typeName(T));
+        }
+        var list: []const u8 = "";
+        for (cols, 0..) |c, i| {
+            if (i > 0) list = list ++ ", ";
+            list = list ++ c;
+        }
+        const kw = if (unique) "CREATE UNIQUE INDEX IF NOT EXISTS " else "CREATE INDEX IF NOT EXISTS ";
+        break :blk kw ++ indexName(T, cols) ++ " ON " ++ info.table ++ " (" ++ list ++ ")";
+    };
+}
+
+/// `DROP INDEX` for an index created by `createIndex`. Postgres/SQLite take
+/// a bare index name; MySQL needs the table (`DROP INDEX … ON <table>`).
+pub fn dropIndex(comptime T: type, comptime cols: []const []const u8, dialect: Dialect) []const u8 {
+    const name = comptime indexName(T, cols);
+    const table = comptime reflect.TableInfo(T).table;
+    return switch (dialect) {
+        .sqlite, .postgres => "DROP INDEX IF EXISTS " ++ name,
+        .mysql => "DROP INDEX " ++ name ++ " ON " ++ table,
+    };
+}
+
+/// `CREATE INDEX` for every foreign-key column of `T` (one per BelongsTo).
+/// Returns a comptime list of statements — the natural companion to an
+/// entity's initial migration so FK lookups (and `HasMany`) stay fast.
+pub fn foreignKeyIndexes(comptime T: type) []const []const u8 {
+    const out = comptime blk: {
+        const fks = reflect.foreignKeys(T);
+        var stmts: [fks.len][]const u8 = undefined;
+        for (fks, 0..) |fk, i| {
+            stmts[i] = createIndex(T, &.{fk.local_col}, false);
+        }
+        break :blk stmts;
+    };
+    return &out;
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────

@@ -162,6 +162,59 @@ pub fn TableInfo(comptime T: type) type {
     }
 }
 
+/// One foreign-key constraint derived from a `BelongsTo` relation field.
+/// The ON DELETE / ON UPDATE actions are pre-resolved to their SQL clause
+/// text so this layer needs no dependency on `relations`.
+pub const FkSpec = struct {
+    /// FK column on THIS table (the relation's `foreign_key`).
+    local_col: []const u8,
+    /// Referenced table (the parent entity's `zorm_table`).
+    ref_table: []const u8,
+    /// Referenced column (the parent's primary key).
+    ref_col: []const u8,
+    /// "" (default) or "CASCADE" / "RESTRICT" / "SET NULL" / "SET DEFAULT".
+    on_delete_sql: []const u8,
+    on_update_sql: []const u8,
+};
+
+/// Foreign keys for entity `T`, derived from its `BelongsTo` relation fields.
+/// A relation is recognised structurally (the `zorm_relation` marker + a
+/// `belongs_to` `kind`), so `reflect` stays independent of `relations`.
+pub fn foreignKeys(comptime T: type) []const FkSpec {
+    const out = comptime blk: {
+        const all = std.meta.fields(T);
+        var specs: [all.len]FkSpec = undefined;
+        var n: usize = 0;
+        for (all) |f| {
+            const F = f.type;
+            if (@typeInfo(F) != .@"struct") continue;
+            if (!@hasDecl(F, "zorm_relation")) continue;
+            if (!@hasDecl(F, "kind")) continue;
+            if (!std.mem.eql(u8, @tagName(F.kind), "belongs_to")) continue;
+
+            // The FK column must be a real column of T.
+            const info = TableInfo(T);
+            var found = false;
+            for (info.columns) |c| {
+                if (std.mem.eql(u8, c.name, F.foreign_key)) found = true;
+            }
+            if (!found) @compileError("zorm: BelongsTo foreign key '" ++ F.foreign_key ++ "' is not a column of " ++ @typeName(T));
+
+            const pinfo = TableInfo(F.Target);
+            specs[n] = .{
+                .local_col = F.foreign_key,
+                .ref_table = pinfo.table,
+                .ref_col = pinfo.pk_column.name,
+                .on_delete_sql = F.fk_opts.on_delete.sql(),
+                .on_update_sql = F.fk_opts.on_update.sql(),
+            };
+            n += 1;
+        }
+        break :blk specs[0..n].*;
+    };
+    return &out;
+}
+
 // ── Tests ──────────────────────────────────────────────────────────────
 
 const testing = std.testing;
