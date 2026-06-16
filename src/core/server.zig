@@ -41,6 +41,7 @@ const router_mod = @import("http/router.zig");
 const metrics_mod = @import("metrics.zig");
 const log_mod = @import("log.zig");
 const trace_mod = @import("trace.zig");
+const tenancy_mod = @import("tenancy.zig");
 const rate_limit_mod = @import("rate_limit.zig");
 
 /// Monotonic nanosecond timestamp. Std's `nanoTimestamp` was removed
@@ -401,6 +402,25 @@ pub const Server = struct {
         const match = self.router.matchOrCode(request.method, path_query.path, &params);
 
         var rb = response.Builder.init(&conn.write_buf);
+
+        // H3: multi-tenant lifecycle. Resolve the Host header to a tenant
+        // (also stamps the thread-local current tenant for plugins).
+        // Suspended tenants get 503, deleted ones 404. Inert when no
+        // tenant table is configured — resolveTenant returns .active.
+        tenancy_mod.resetCurrent();
+        if (request.header("Host")) |host_hdr| {
+            switch (tenancy_mod.resolveTenant(host_hdr)) {
+                .active => {},
+                .suspended => {
+                    try writeStatusResponseTls(self.cfg.tls, stream, self.io, conn, .service_unavailable);
+                    return;
+                },
+                .deleted => {
+                    try writeStatusResponseTls(self.cfg.tls, stream, self.io, conn, .not_found);
+                    return;
+                },
+            }
+        }
 
         // G3: per-IP rate limit. Inert when not configured.
         const limiter = rate_limit_mod.global();

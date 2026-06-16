@@ -812,6 +812,19 @@ pub fn main() !void {
     try core.tls.admin_routes.registerRoutes(&router, std.math.maxInt(u16));
     if (std.c.getenv("ADMIN_TOKEN")) |t| core.tls.admin_routes.setToken(std.mem.sliceTo(t, 0));
 
+    // H1/H3: static Host→tenant table from TENANTS=host1=t1,host2=t2.
+    // Unconfigured => single default tenant (resolveTenant returns active
+    // for every Host). Lifecycle flips via POST /admin/tenants/:id/*.
+    if (std.c.getenv("TENANTS")) |tn| {
+        var tbl = core.tenancy.Table.init();
+        if (tbl.parseEnv(std.mem.sliceTo(tn, 0))) {
+            core.tenancy.setGlobalTable(tbl);
+            log_ptr.info("boot", "multi-tenant Host routing configured (TENANTS)");
+        } else |_| {
+            log_ptr.warn("boot", "TENANTS failed to parse — multi-tenancy disabled");
+        }
+    }
+
     // E3: enable Chrome-trace span recording at runtime (only has effect
     // in a binary built with -Dtrace). Spans cover the request dispatch
     // path; dump via GET /debug/trace.

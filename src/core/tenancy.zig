@@ -227,3 +227,32 @@ test "Op-F: resolveTenant honours table state" {
     resetCurrent();
     global_table = .{};
 }
+
+test "H3: full lifecycle drives the dispatch decision (active→suspend→delete→activate)" {
+    // Mirrors what the server's dispatcher does: resolveTenant(host) and
+    // branch on the returned State. We assert each admin transition flips
+    // the resolved state a request would see.
+    global_table = .{};
+    defer global_table = .{};
+    try globalTable().parseEnv("t.example=tenant-t");
+
+    // Active by default → request proceeds.
+    try testing.expectEqual(State.active, resolveTenant("t.example:8080"));
+
+    // Suspend → request would 503.
+    try globalTable().setState("tenant-t", .suspended);
+    try testing.expectEqual(State.suspended, resolveTenant("t.example"));
+
+    // Delete → request would 404.
+    try globalTable().setState("tenant-t", .deleted);
+    try testing.expectEqual(State.deleted, resolveTenant("t.example"));
+
+    // Reactivate → request proceeds again.
+    try globalTable().setState("tenant-t", .active);
+    try testing.expectEqual(State.active, resolveTenant("t.example"));
+
+    // setState on an unknown tenant is the NotFound the admin route maps
+    // to 404.
+    try testing.expectError(error.NotFound, globalTable().setState("nope", .suspended));
+    resetCurrent();
+}

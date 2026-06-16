@@ -24,6 +24,7 @@ const cert_admin = @import("cert_admin.zig");
 const router_mod = @import("../http/router.zig");
 const audit = @import("../audit.zig");
 const trace = @import("../trace.zig");
+const tenancy = @import("../tenancy.zig");
 const c = @import("sqlite").c;
 
 const HandlerContext = router_mod.HandlerContext;
@@ -164,11 +165,48 @@ fn handleTrace(hc: *HandlerContext) anyerror!void {
     return hc.response.simple(.ok, "application/json", json);
 }
 
+// ── H3: tenant lifecycle ────────────────────────────────────────────────
+
+fn setTenantState(hc: *HandlerContext, new_state: tenancy.State) anyerror!void {
+    const presented = presentedToken(hc) orelse {
+        return hc.response.simple(.forbidden, "application/json", "{\"error\":\"admin auth required\"}");
+    };
+    if (!tokenMatches(presented)) {
+        return hc.response.simple(.forbidden, "application/json", "{\"error\":\"admin auth required\"}");
+    }
+    const id = hc.params.get("id") orelse {
+        return hc.response.simple(.bad_request, "application/json", "{\"error\":\"missing tenant id\"}");
+    };
+    tenancy.globalTable().setState(id, new_state) catch {
+        return hc.response.simple(.not_found, "application/json", "{\"error\":\"unknown tenant\"}");
+    };
+    if (audit_db) |db| {
+        audit.append(db, audit_clock, "admin", "tenant.setstate", id, new_state.toString(), true) catch {};
+    }
+    var buf: [96]u8 = undefined;
+    const body = std.fmt.bufPrint(&buf, "{{\"id\":\"{s}\",\"state\":\"{s}\"}}", .{ id, new_state.toString() }) catch "{}";
+    return hc.response.simple(.ok, "application/json", body);
+}
+
+fn handleTenantSuspend(hc: *HandlerContext) anyerror!void {
+    return setTenantState(hc, .suspended);
+}
+fn handleTenantActivate(hc: *HandlerContext) anyerror!void {
+    return setTenantState(hc, .active);
+}
+fn handleTenantDelete(hc: *HandlerContext) anyerror!void {
+    return setTenantState(hc, .deleted);
+}
+
 /// Register the admin/debug routes. Slot is the sentinel plugin index
 /// (core routes, no owning plugin).
 pub fn registerRoutes(router: *Router, plugin_index: u16) !void {
     try router.register(.post, "/admin/tls/reload", handleReload, plugin_index);
     try router.register(.get, "/debug/trace", handleTrace, plugin_index);
+    // H3: tenant lifecycle transitions.
+    try router.register(.post, "/admin/tenants/:id/suspend", handleTenantSuspend, plugin_index);
+    try router.register(.post, "/admin/tenants/:id/activate", handleTenantActivate, plugin_index);
+    try router.register(.post, "/admin/tenants/:id/delete", handleTenantDelete, plugin_index);
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────
