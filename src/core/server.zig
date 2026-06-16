@@ -416,6 +416,21 @@ pub const Server = struct {
         }
         switch (match) {
             .ok => |hit| {
+                // G5: per-route body cap. `matchMeta` carries the route's
+                // `max_body_bytes`; reject (413) when the declared
+                // Content-Length exceeds it. 0 = fall back to the global
+                // 16 KiB parser ceiling (the physical hard limit).
+                if (self.router.matchMeta(request.method, path_query.path)) |meta| {
+                    if (meta.max_body_bytes > 0) {
+                        if (request.header("Content-Length")) |cl| {
+                            const declared = std.fmt.parseInt(u64, std.mem.trim(u8, cl, " \t"), 10) catch 0;
+                            if (declared > meta.max_body_bytes) {
+                                try writeStatusResponseTls(self.cfg.tls, stream, self.io, conn, .payload_too_large);
+                                return;
+                            }
+                        }
+                    }
+                }
                 var hc = router_mod.HandlerContext{
                     .plugin_ctx = self.ctx,
                     .request = request,

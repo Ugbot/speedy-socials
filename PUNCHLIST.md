@@ -445,7 +445,7 @@ _Last refreshed: 2026-05-19._
       accepts unverified activities with a soft-warn). Default
       stays soft for compatibility.
 
-- [~] **G5. Request-body size cap.**
+- [x] **G5. Request-body size cap.**
       Global cap is `limits.conn_read_buffer_bytes` (16 KiB) —
       enforced by the HTTP parser; oversize headers/bodies get 413.
       `Router.RouteMeta` + `registerWithMeta` + `matchMeta` (carrying
