@@ -412,6 +412,47 @@ pub fn main() !void {
     // rare, admin-bound, and synchronous (good enough for Phase 5).
     relay.state.attachDb(db);
 
+    // ── Pluggable storage backend (Phase G) ────────────────────────
+    // Install the process-wide `core.storage.Backend` used by migrated
+    // query sites. Default is SQLite wrapping the writer connection;
+    // STORAGE_BACKEND=postgres (binary built with -Dpostgres) connects
+    // to DATABASE_URL instead. Backends not yet consulted by the hot
+    // path keep using their direct `*c.sqlite3` handle — this is the
+    // seam that lets sites migrate incrementally.
+    var storage_be_sqlite = core.storage.backend.SqliteBackend.init(db);
+    var pg_backend_holder: ?core.storage.backend.PostgresBackend = null;
+    defer core.storage.backend.setGlobal(null);
+    defer if (core.storage.backend.postgres_enabled) {
+        if (pg_backend_holder) |*pg| pg.deinit();
+    };
+    {
+        const sb = if (std.c.getenv("STORAGE_BACKEND")) |v| std.mem.sliceTo(v, 0) else "sqlite";
+        if (std.mem.eql(u8, sb, "postgres")) {
+            if (core.storage.backend.postgres_enabled) {
+                const url = if (std.c.getenv("DATABASE_URL")) |u| std.mem.sliceTo(u, 0) else "";
+                if (url.len == 0) {
+                    log_ptr.warn("boot", "STORAGE_BACKEND=postgres but DATABASE_URL unset — falling back to sqlite");
+                    core.storage.backend.setGlobal(storage_be_sqlite.backend());
+                } else if (core.storage.backend.PostgresBackend.init(url)) |pg| {
+                    pg_backend_holder = pg;
+                    core.storage.backend.setGlobal(pg_backend_holder.?.backend());
+                    log_ptr.info("boot", "storage backend: postgres (libpq)");
+                } else |err| {
+                    log_ptr.record(.warn, "boot", "postgres connect failed — falling back to sqlite", &.{
+                        .{ .k = "err", .v = @errorName(err) },
+                    });
+                    core.storage.backend.setGlobal(storage_be_sqlite.backend());
+                }
+            } else {
+                log_ptr.warn("boot", "STORAGE_BACKEND=postgres but binary built without -Dpostgres — using sqlite");
+                core.storage.backend.setGlobal(storage_be_sqlite.backend());
+            }
+        } else {
+            core.storage.backend.setGlobal(storage_be_sqlite.backend());
+            log_ptr.info("boot", "storage backend: sqlite");
+        }
+    }
+
     // W5.1: spin the AT→AP firehose consumer. Registers an in-process
     // sink against `atproto.firehose.append` and drains a bounded
     // ring on a dedicated thread, calling `relay.handleFirehoseEvent`

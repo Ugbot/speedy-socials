@@ -107,7 +107,7 @@ pub fn build(b: *std.Build) void {
     // comptime-gated behind the same flags so the default build never
     // needs the headers.
     if (enable_kafka) linkSystemLibByPrefix(core_mod, target, "librdkafka", "rdkafka");
-    if (enable_postgres) linkSystemLibByPrefix(core_mod, target, "libpq", "pq");
+    if (enable_postgres) linkLibpq(b, core_mod);
 
     // ── system OpenSSL link (W3.1) ─────────────────────────────────
     // Wired via Homebrew on macOS aarch64, system pkg-config on Linux.
@@ -523,4 +523,25 @@ fn linkSystemLibByPrefix(
         mod.addLibraryPath(.{ .cwd_relative = lib });
     }
     mod.linkSystemLibrary(lib_name, .{});
+}
+
+/// Link libpq (Postgres client). Homebrew installs the headers/libs under
+/// a versioned `postgresql@NN` prefix rather than a bare `libpq/` dir, so
+/// we ask `pg_config` for the exact paths (the canonical, portable way).
+/// If `pg_config` isn't on PATH we fall back to the system search path.
+fn linkLibpq(b: *std.Build, mod: *std.Build.Module) void {
+    if (pgConfig(b, "--includedir")) |inc| mod.addIncludePath(.{ .cwd_relative = inc });
+    if (pgConfig(b, "--libdir")) |lib| mod.addLibraryPath(.{ .cwd_relative = lib });
+    mod.linkSystemLibrary("pq", .{});
+}
+
+/// Run `pg_config <flag>` and return the trimmed first line, or null if
+/// pg_config is unavailable / fails.
+fn pgConfig(b: *std.Build, flag: []const u8) ?[]const u8 {
+    var code: u8 = 0;
+    const stdout = b.runAllowFail(&.{ "pg_config", flag }, &code, .ignore) catch return null;
+    if (code != 0) return null;
+    const trimmed = std.mem.trim(u8, stdout, " \t\r\n");
+    if (trimmed.len == 0) return null;
+    return b.allocator.dupe(u8, trimmed) catch null;
 }

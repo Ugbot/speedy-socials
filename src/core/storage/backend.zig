@@ -16,6 +16,18 @@
 
 const std = @import("std");
 const c = @import("sqlite").c;
+const build_options = @import("build_options");
+
+/// Whether the Postgres backend was compiled in (`-Dpostgres`).
+pub const postgres_enabled = build_options.postgres;
+
+/// The libpq-backed Postgres backend, present only under `-Dpostgres`.
+/// The import is comptime-gated so the default build never analyses its
+/// cImport (which needs libpq headers).
+pub const PostgresBackend = if (build_options.postgres)
+    @import("postgres_backend.zig").PostgresBackend
+else
+    struct {};
 
 pub const Error = error{
     NotFound,
@@ -108,6 +120,23 @@ pub const Backend = struct {
         return self.vtable.transaction(self.ptr, ctx, body);
     }
 };
+
+// ──────────────────────────────────────────────────────────────────────
+// Global backend selection.
+// ──────────────────────────────────────────────────────────────────────
+
+var global_backend: ?Backend = null;
+
+/// Install the process-wide storage backend (SQLite by default, Postgres
+/// under `-Dpostgres` + `STORAGE_BACKEND=postgres`). Code that has been
+/// migrated off raw `*c.sqlite3` reaches storage through `global()`.
+pub fn setGlobal(b: ?Backend) void {
+    global_backend = b;
+}
+
+pub fn global() ?Backend {
+    return global_backend;
+}
 
 // ──────────────────────────────────────────────────────────────────────
 // SqliteBackend — default impl wrapping a `*c.sqlite3`.
@@ -305,6 +334,80 @@ test "INFRA-1: SqliteBackend transaction rolls back on error" {
     const found = try b.queryOne("SELECT COUNT(*) FROM t", &.{}, &row);
     try testing.expect(found);
     try testing.expectEqual(@as(i64, 0), row.columns[0].int_val);
+}
+
+test {
+    // Pull the Postgres backend's tests in only when it is compiled.
+    if (build_options.postgres) _ = @import("postgres_backend.zig");
+}
+
+test "Phase G: a non-SQLite backend satisfies the same vtable + global routing" {
+    // MockBackend records calls without any SQL engine, proving the
+    // Backend interface is engine-agnostic — the same seam a Postgres /
+    // remote backend plugs into.
+    const Mock = struct {
+        exec_calls: u32 = 0,
+        last_sql_buf: [128]u8 = undefined,
+        last_sql_len: usize = 0,
+        last_int_arg: i64 = 0,
+        next_row_int: i64 = 0,
+
+        fn doExec(ptr: *anyopaque, sql: []const u8, args: []const BindValue) Error!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.exec_calls += 1;
+            const n = @min(sql.len, self.last_sql_buf.len);
+            @memcpy(self.last_sql_buf[0..n], sql[0..n]);
+            self.last_sql_len = n;
+            for (args) |a| switch (a) {
+                .int => |v| self.last_int_arg = v,
+                else => {},
+            };
+        }
+        fn doQuery(_: *anyopaque, _: []const u8, _: []const BindValue, _: *anyopaque, _: RowCallback) Error!void {}
+        fn doQueryOne(ptr: *anyopaque, _: []const u8, _: []const BindValue, out: *Row) Error!bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            out.column_count = 1;
+            out.columns[0] = .{ .kind = .int, .int_val = self.next_row_int };
+            return true;
+        }
+        fn doLastId(_: *anyopaque) i64 {
+            return 99;
+        }
+        fn doChanges(_: *anyopaque) i64 {
+            return 1;
+        }
+        fn doTx(ptr: *anyopaque, ctx: *anyopaque, body: *const fn (ctx: *anyopaque) Error!void) Error!void {
+            _ = ptr;
+            return body(ctx);
+        }
+        fn backend(self: *@This()) Backend {
+            return .{ .ptr = self, .vtable = &.{
+                .exec = doExec,
+                .query = doQuery,
+                .queryOne = doQueryOne,
+                .lastInsertId = doLastId,
+                .changes = doChanges,
+                .transaction = doTx,
+            } };
+        }
+    };
+
+    var mock: Mock = .{ .next_row_int = 7 };
+    const b = mock.backend();
+
+    // Route via the global seam, exactly as migrated code would.
+    setGlobal(b);
+    defer setGlobal(null);
+    const g = global() orelse return error.TestUnexpectedResult;
+
+    try g.exec("INSERT INTO t (a) VALUES (?)", &.{.{ .int = 1234 }});
+    try testing.expectEqual(@as(u32, 1), mock.exec_calls);
+    try testing.expectEqual(@as(i64, 1234), mock.last_int_arg);
+    try testing.expectEqual(@as(i64, 99), g.lastInsertId());
+
+    var row: Row = .{};
+    try testing.expect(try g.queryOne("SELECT a FROM t", &.{}, &row));
+    try testing.expectEqual(@as(i64, 7), row.columns[0].int_val);
 }
 
 test "INFRA-1: SqliteBackend query streams rows" {
