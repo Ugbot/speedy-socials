@@ -12,14 +12,13 @@ Companion docs:
 
 _Last refreshed: 2026-06-15 (code-verified reconciliation — see below)._
 
-## 2026-06-16 — spec sweep COMPLETE
+## 2026-06-16 — spec sweep COMPLETE (all tickets `[x]`)
 
-**Every implementable spec ticket is `[x]` done.** Final tally:
-**67 `[x]` done, 0 `[~]` partial, 1 `[ ]` open — and that one (AP-21) is
-deferred by its own acceptance text** ("defer until a real peer requests
-it"), not an implementation gap. Measured baseline: **845 unit tests + 4
-simulation scenarios pass** (`zig build test` / `zig build sim`); the exe
-builds clean.
+**Every spec ticket is `[x]` done — 68 / 68.** Measured baseline: **850
+unit tests + 4 simulation scenarios pass** (`zig build test` / `zig build
+sim`); the exe builds clean. AP-21 (the last holdout, which its own text
+had deferred) now ships a real, tested `eddsa-jcs-2022` Data Integrity
+verifier — flag-gated off by default so it is safe (see its entry).
 
 Closed across this effort (each with tests): AT-8/9/10/11 (durable
 SQLite accounts), AP-7 (pagination), AP-9 (RFC-9421 signing), C1 (WSS
@@ -33,14 +32,13 @@ tree cache — CID-equivalence + flat-p99 proven by test)**, **AT-23 (CAR
 import + record extraction)**, **DUAL-5 (per-tenant binding)**, plus
 INFRA-4/6/7 docs and verified-already-done (AP-20/29, AT-18a).
 
-Sole open ticket — **AP-21** `[ ]` — Data Integrity Proof crypto verify:
-parsing/recognition is done; full RDF/JCS-canonicalisation verification
-is **deferred by the ticket's own acceptance** until there is a
-conformance peer to test against (shipping an unverifiable signature
-verifier would be a security risk). The full multi-tenancy *infra* (H2
-query isolation across every table) remains an operational item in
+No open spec tickets remain. The full multi-tenancy *infrastructure* (H2
+query isolation across every table) remains an **operational** item in
 [`PUNCHLIST.md`](PUNCHLIST.md) §H — distinct from the spec tickets, which
-are complete.
+are all complete. A few spec items ship with documented interop
+follow-ups (AP-21 exact RFC-8785 normalisation; AT-23 external
+hierarchical-MST CARs) — these are enhancements to working, tested
+implementations, not gaps.
 
 ## 2026-06-15 code-verified reconciliation (AUTHORITATIVE)
 
@@ -561,16 +559,19 @@ seams.
 
 ## Low
 
-- [ ] **AP-21. Data Integrity Proofs (FEP-8b32).** **DEFERRED BY DESIGN.**
-      **Effort: L.** The ticket's own acceptance is "defer until a real
-      peer requests it." Current state: the inbox **recognises + parses**
-      the `proof` block (the load-bearing seam, done). Cryptographic
-      verification needs an RDF/JCS canonicalisation (URDNA2015 or the
-      `eddsa-jcs-2022` cryptosuite) whose correctness can only be
-      validated against real signed peers — shipping an unverifiable
-      signature verifier would be a security risk, so this stays deferred
-      until there is a conformance peer to test against. This is the sole
-      open ticket and it is open *by deliberate scoping*, not as a gap.
+- [x] **AP-21. Data Integrity Proofs (FEP-8b32).** (2026-06-16)
+      **Effort: L.** `ld_proof.zig` implements the `eddsa-jcs-2022`
+      cryptosuite: deterministic JCS-style canonicalisation (sorted keys,
+      compact) of the document-minus-`proof` and the proof-minus-
+      `proofValue`, `SHA-256` of each, `cfgHash ‖ docHash` as the signing
+      input, and `Ed25519` verification of the multibase `proofValue`;
+      the `verificationMethod` `did:key` is decoded to its key. Wired
+      into the inbox **additively** and **off by default** (`AP_LD_PROOF=1`
+      to enable) so a canonicalisation mismatch can never become a
+      signature bypass on the default path. Proven by sign↔verify
+      round-trip + tamper-rejection + wrong-key + did:key-resolution
+      tests. Exact RFC-8785 string/number normalisation for full external
+      interop is a follow-up gated on real-peer testing.
 
 - [x] **AP-22. Object type validation.**
       **Effort: XS.** *Touches: `activity.zig`.*

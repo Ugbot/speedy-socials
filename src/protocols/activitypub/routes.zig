@@ -35,6 +35,7 @@ const actor_mod = @import("actor.zig");
 const collections = @import("collections.zig");
 const activity_mod = @import("activity.zig");
 const inbox = @import("inbox.zig");
+const ld_proof = @import("ld_proof.zig");
 const sig = @import("sig.zig");
 const keys = @import("keys.zig");
 const key_cache = @import("key_cache.zig");
@@ -545,6 +546,15 @@ fn dispatchInbox(hc: *HandlerContext, st: *state_mod.State, db: *c.sqlite3, _: [
         if (!ok) break :sig_block;
         replay.record(parsed.key_id, parsed.signature_b64, now_unix);
         verified = true;
+    }
+
+    // AP-21: optional Data Integrity (LD-proof) verification. Strictly
+    // additive — it can only raise confidence, never bypass. Off unless
+    // AP_LD_PROOF=1; resolves the proof's did:key verificationMethod and
+    // verifies the eddsa-jcs-2022 signature over the raw body.
+    if (!verified and ld_proof.enabled() and hc.request.body.len > 0) {
+        var ld_scratch: [32 * 1024]u8 = undefined;
+        if (ld_proof.verifyDocument(hc.request.body, &ld_scratch)) verified = true;
     }
 
     // G4: strict signature mode rejects unverified activities.
