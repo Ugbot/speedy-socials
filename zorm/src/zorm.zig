@@ -30,6 +30,9 @@ const bind = @import("bind.zig");
 const crud = @import("crud.zig");
 const codec = @import("codec.zig");
 const schema_desc = @import("schema_desc.zig");
+const session = @import("session.zig");
+const repository = @import("repository.zig");
+const messaging = @import("messaging.zig");
 pub const testing = @import("testing.zig");
 
 // ── Storage contract (S0) ──────────────────────────────────────────────
@@ -73,6 +76,22 @@ pub const Schema = schema_desc.Schema;
 pub const schemaToJson = schema_desc.toJson;
 pub const WireType = schema_desc.WireType;
 
+// ── Session / identity map / unit-of-work + Repository (S3) ────────────
+pub const Session = session.Session;
+pub const Repository = repository.Repository;
+pub const entityEql = session.entityEql;
+
+// ── Typed messaging over Sink / Queue (S8) ─────────────────────────────
+pub const Sink = messaging.Sink;
+pub const Queue = messaging.Queue;
+pub const QueueItem = messaging.QueueItem;
+pub const publish = messaging.publish;
+pub const publishSchema = messaging.publishSchema;
+pub const consume = messaging.consume;
+pub const enqueue = messaging.enqueue;
+pub const claim = messaging.claim;
+pub const keyFor = messaging.keyFor;
+
 test {
     _ = contract;
     _ = fields;
@@ -83,5 +102,8 @@ test {
     _ = crud;
     _ = codec;
     _ = schema_desc;
+    _ = session;
+    _ = repository;
+    _ = messaging;
     _ = testing;
 }
