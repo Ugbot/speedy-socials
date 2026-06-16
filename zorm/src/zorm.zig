@@ -22,6 +22,9 @@
 //!   messaging.zig — typed publish/consume/enqueue over Sink/Queue              (S8)
 
 const contract = @import("contract.zig");
+const fields = @import("fields.zig");
+const reflect = @import("reflect.zig");
+const ddl = @import("ddl.zig");
 
 // ── Storage contract (S0) ──────────────────────────────────────────────
 pub const Backend = contract.Backend;
@@ -34,6 +37,22 @@ pub const Error = contract.Error;
 pub const max_columns = contract.max_columns;
 pub const max_inline_bytes = contract.max_inline_bytes;
 
+// ── Field types (S1) ───────────────────────────────────────────────────
+pub const Text = fields.Text;
+pub const Bytes = fields.Bytes;
+pub const Pk = fields.Pk;
+pub const AutoPk = fields.AutoPk;
+pub const Timestamp = fields.Timestamp;
+
+// ── Reflection + DDL (S1) ──────────────────────────────────────────────
+pub const TableInfo = reflect.TableInfo;
+pub const ColumnSpec = reflect.ColumnSpec;
+pub const createTable = ddl.createTable;
+pub const dropTable = ddl.dropTable;
+
 test {
     _ = contract;
+    _ = fields;
+    _ = reflect;
+    _ = ddl;
 }
