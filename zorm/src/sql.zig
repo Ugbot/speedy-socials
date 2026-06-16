@@ -97,6 +97,18 @@ pub fn insert(comptime T: type, dialect: Dialect) []const u8 {
     };
 }
 
+/// `SELECT <all columns> FROM <table>` with no clauses — the base a query
+/// builder appends WHERE/ORDER BY/LIMIT onto. Dialect-independent (only the
+/// value placeholders in a WHERE differ, which the builder adds).
+pub fn selectAll(comptime T: type) []const u8 {
+    return comptime "SELECT " ++ columnList(T) ++ " FROM " ++ reflect.TableInfo(T).table;
+}
+
+/// The comma-joined projection column list (full row, `TableInfo` order).
+pub fn projection(comptime T: type) []const u8 {
+    return comptime columnList(T);
+}
+
 /// `SELECT … WHERE pk = ?` (full projection, `TableInfo` column order).
 pub fn selectByPk(comptime T: type, dialect: Dialect) []const u8 {
     return switch (dialect) {

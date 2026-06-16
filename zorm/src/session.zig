@@ -86,6 +86,16 @@ pub fn Session(comptime T: type, comptime capacity: usize) type {
             var loaded: T = .{};
             if (!try crud.findByPk(T, self.backend, pk, &loaded)) return null;
 
+            return self.materialize(loaded);
+        }
+
+        /// Merge a freshly-fetched row into the identity map: if its PK is
+        /// already managed, return the existing pointer (preserving any
+        /// in-flight edits — the DB copy is discarded); otherwise adopt it
+        /// as a clean managed entity. This is how the query builder dedups
+        /// results against already-loaded entities.
+        pub fn materialize(self: *Self, loaded: T) Error!*T {
+            if (self.findSlot(pkValue(&loaded))) |s| return &s.live;
             const slot = try self.freeSlot();
             slot.live = loaded;
             slot.snapshot = loaded;

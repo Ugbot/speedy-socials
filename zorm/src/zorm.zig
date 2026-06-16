@@ -32,6 +32,7 @@ const codec = @import("codec.zig");
 const schema_desc = @import("schema_desc.zig");
 const session = @import("session.zig");
 const repository = @import("repository.zig");
+const query = @import("query.zig");
 const messaging = @import("messaging.zig");
 pub const testing = @import("testing.zig");
 
@@ -81,6 +82,10 @@ pub const Session = session.Session;
 pub const Repository = repository.Repository;
 pub const entityEql = session.entityEql;
 
+// ── Query builder (S4) ─────────────────────────────────────────────────
+pub const Query = query.Query;
+pub const Dir = query.Dir;
+
 // ── Typed messaging over Sink / Queue (S8) ─────────────────────────────
 pub const Sink = messaging.Sink;
 pub const Queue = messaging.Queue;
@@ -104,6 +109,7 @@ test {
     _ = schema_desc;
     _ = session;
     _ = repository;
+    _ = query;
     _ = messaging;
     _ = testing;
 }
