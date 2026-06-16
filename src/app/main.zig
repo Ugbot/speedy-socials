@@ -539,13 +539,41 @@ pub fn main() !void {
     var http_client = core.http_client.Client.init(io);
     _ = &http_client;
 
-    // Wire the native outbound TLS backend (Zig 0.16 std.crypto.tls).
-    // Server-side TLS is not implemented in 0.16 stdlib; see
-    // `src/core/tls/README.md` for the BoringSSL follow-up.
+    // Outbound TLS backend selection. Default: native (Zig 0.16
+    // std.crypto.tls, TLS 1.3). `TLS_OUTBOUND=openssl` switches to the
+    // OpenSSL backend (C5), which adds TLS 1.2 + certificate pinning.
     var tls_backend_state = try core.tls.native_outbound.NativeOutboundBackend.init(allocator, io);
     defer tls_backend_state.deinit();
-    core.http_client.setTlsBackend(tls_backend_state.backend());
-    log_ptr.info("boot", "tls backend wired (native outbound)");
+
+    const use_openssl_outbound = if (std.c.getenv("TLS_OUTBOUND")) |v|
+        std.mem.eql(u8, std.mem.sliceTo(v, 0), "openssl")
+    else
+        false;
+
+    var boring_outbound_state: ?core.tls.boring_outbound.BoringOutboundBackend = null;
+    defer if (boring_outbound_state) |*b| b.deinit();
+
+    if (use_openssl_outbound) {
+        boring_outbound_state = try core.tls.boring_outbound.BoringOutboundBackend.init(true);
+        // C5: opt-in per-host cert pinning via TLS_PINS.
+        if (std.c.getenv("TLS_PINS")) |pins_c| {
+            const pins = std.mem.sliceTo(pins_c, 0);
+            if (pins.len > 0) {
+                core.tls.cert_admin.loadPins(pins) catch {
+                    log_ptr.warn("boot", "TLS_PINS failed to parse — pinning disabled");
+                };
+                if (core.tls.cert_admin.pinCount() > 0) {
+                    core.tls.cert_admin.setPinHook(core.tls.cert_admin.defaultPinHook);
+                    log_ptr.info("boot", "outbound cert pinning enabled (TLS_PINS)");
+                }
+            }
+        }
+        core.http_client.setTlsBackend(boring_outbound_state.?.backend());
+        log_ptr.info("boot", "tls backend wired (openssl outbound, TLS 1.2+, pinning available)");
+    } else {
+        core.http_client.setTlsBackend(tls_backend_state.backend());
+        log_ptr.info("boot", "tls backend wired (native outbound)");
+    }
 
     // Bind the HTTP client to the protocol plugins so their federation
     // hook trampolines can find it. After this, AP key fetches +

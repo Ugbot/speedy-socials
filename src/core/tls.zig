@@ -33,6 +33,11 @@ const TlsError = @import("errors.zig").TlsError;
 /// See `src/core/tls/native_outbound.zig`.
 pub const native_outbound = @import("tls/native_outbound.zig");
 
+/// Outbound TLS client backed by system OpenSSL, with cert pinning and
+/// TLS 1.2 support (C5). Selected via `TLS_OUTBOUND=openssl`.
+/// See `src/core/tls/boring_outbound.zig`.
+pub const boring_outbound = @import("tls/boring_outbound.zig");
+
 /// Inbound TLS backend stub. Zig 0.16's stdlib has no server-side TLS;
 /// see `src/core/tls/native_inbound.zig` and `tls/README.md`.
 pub const native_inbound = @import("tls/native_inbound.zig");
@@ -170,6 +175,10 @@ test {
     _ = native_inbound;
     _ = boring_inbound;
     _ = ianic_inbound;
+    _ = boring_outbound;
+    _ = cert_admin;
+    _ = admin_routes;
+    _ = sni;
 }
 
 test "PlainBackend.wrap_stream is the identity function" {
