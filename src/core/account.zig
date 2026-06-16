@@ -313,6 +313,8 @@ pub const sqlite_migration = @import("account_sqlite.zig").sqlite_migration;
 test {
     // Pull the sibling's tests into the core test binary.
     _ = @import("account_sqlite.zig");
+    // zorm proof: the account row through the full ORM on real engines.
+    _ = @import("account_zorm.zig");
 }
 
 // ──────────────────────────────────────────────────────────────────────
