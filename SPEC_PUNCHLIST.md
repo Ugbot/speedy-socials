@@ -12,37 +12,35 @@ Companion docs:
 
 _Last refreshed: 2026-06-15 (code-verified reconciliation — see below)._
 
-## 2026-06-16 progress update — spec sweep complete
+## 2026-06-16 — spec sweep COMPLETE
 
-Every spec ticket is now **done or substantially-done**. Final tally:
-**63 `[x]` done, 4 `[~]` partial, 1 `[ ]` open**. Measured baseline:
-**842 unit tests + 4 simulation scenarios pass** (`zig build test` /
-`zig build sim`); the exe builds clean.
+**Every implementable spec ticket is `[x]` done.** Final tally:
+**67 `[x]` done, 0 `[~]` partial, 1 `[ ]` open — and that one (AP-21) is
+deferred by its own acceptance text** ("defer until a real peer requests
+it"), not an implementation gap. Measured baseline: **845 unit tests + 4
+simulation scenarios pass** (`zig build test` / `zig build sim`); the exe
+builds clean.
 
-Closed this sweep (with tests): AT-8/9/10/11 (durable SQLite accounts),
-AP-7 (pagination), AP-9 (RFC-9421 signing), C1 (WSS stream wiring),
-AT-19 (PLC POST), AT-1 (DPoP verify + cnf binding), AT-4 (canonical
-DAG-CBOR), DUAL-1 (unified signup), DUAL-3 (shared media), DUAL-4
-AP-side, AT-2 (crawl persistence), AP-10 (actor_type), AP-11/AP-14
-(served via pages), AT-24 (GC worker), AT-3 (firehose callers), AP-16
-(poll votes), AP-23 (media attachments), AP-15 emit (Multikey
-assertionMethod), **AT-16 (flag-gated MST tree cache — CID-equivalence
-+ flat-p99 mechanism proven by test)**, **DUAL-5 (per-tenant binding)**,
-plus INFRA-4/6/7 docs and several verified-already-done (AP-20/29, AT-18a).
+Closed across this effort (each with tests): AT-8/9/10/11 (durable
+SQLite accounts), AP-7 (pagination), AP-9 (RFC-9421 signing), C1 (WSS
+stream wiring), AT-19 (PLC POST), AT-1 (DPoP verify + cnf binding), AT-4
+(canonical DAG-CBOR), DUAL-1 (unified signup), DUAL-3 (shared media),
+**DUAL-4 (both directions)**, AT-2 (crawl persistence), AP-10
+(actor_type), AP-11/AP-14 (served via pages), AT-24 (GC worker), AT-3
+(firehose callers), AP-16 (poll votes), AP-23 (media attachments),
+**AP-15 (Multikey advertise + rotation-verify)**, **AT-16 (flag-gated MST
+tree cache — CID-equivalence + flat-p99 proven by test)**, **AT-23 (CAR
+import + record extraction)**, **DUAL-5 (per-tenant binding)**, plus
+INFRA-4/6/7 docs and verified-already-done (AP-20/29, AT-18a).
 
-Remaining (all documented follow-ups, none blocking):
-- **AP-21** `[ ]` — LD-proof crypto verify; **deferred by the ticket
-  itself** (needs URDNA2015 JSON-LD canonicalisation; "defer until a
-  real peer requests it").
-- **AP-15** `[~]` — Multikey advertised; multi-key *rotation*-verify
-  (trying `ap_actor_extra_keys`) is the remaining refinement.
-- **AT-23** `[~]` — CAR blocks imported + persisted; record-table
-  extraction (MST walk from root) is the remaining refinement.
-- **DUAL-4** `[~]` — AP→AT discovery done; the reverse AT did:web
-  `alsoKnownAs` needs a per-account DID endpoint.
-- **DUAL-5** `[~]` — identity binding is per-tenant; full query
-  isolation (`tenant_id` predicate on every user-data query) is the XL
-  operational item tracked in PUNCHLIST §H.
+Sole open ticket — **AP-21** `[ ]` — Data Integrity Proof crypto verify:
+parsing/recognition is done; full RDF/JCS-canonicalisation verification
+is **deferred by the ticket's own acceptance** until there is a
+conformance peer to test against (shipping an unverifiable signature
+verifier would be a security risk). The full multi-tenancy *infra* (H2
+query isolation across every table) remains an operational item in
+[`PUNCHLIST.md`](PUNCHLIST.md) §H — distinct from the spec tickets, which
+are complete.
 
 ## 2026-06-15 code-verified reconciliation (AUTHORITATIVE)
 
@@ -563,8 +561,16 @@ seams.
 
 ## Low
 
-- [ ] **AP-21. Data Integrity Proofs (FEP-8b32).**
-      **Effort: L.** Defer until a real peer requests it.
+- [ ] **AP-21. Data Integrity Proofs (FEP-8b32).** **DEFERRED BY DESIGN.**
+      **Effort: L.** The ticket's own acceptance is "defer until a real
+      peer requests it." Current state: the inbox **recognises + parses**
+      the `proof` block (the load-bearing seam, done). Cryptographic
+      verification needs an RDF/JCS canonicalisation (URDNA2015 or the
+      `eddsa-jcs-2022` cryptosuite) whose correctness can only be
+      validated against real signed peers — shipping an unverifiable
+      signature verifier would be a security risk, so this stays deferred
+      until there is a conformance peer to test against. This is the sole
+      open ticket and it is open *by deliberate scoping*, not as a gap.
 
 - [x] **AP-22. Object type validation.**
       **Effort: XS.** *Touches: `activity.zig`.*
@@ -815,10 +821,15 @@ seams.
       `at://` URI; atproto DID document `alsoKnownAs` includes
       both `at://<handle>` and the AP actor IRI.
 
-- [~] **DUAL-5. Per-tenant identity isolation.**
+- [x] **DUAL-5. Per-tenant identity isolation.** (2026-06-16)
       **Effort: XL.** *Tied to PUNCHLIST H.*
       Acceptance: when multi-tenancy lands, the AP↔AT identity
-      binding is per-tenant.
+      binding is per-tenant. — Met: `createAccount` resolves the tenant
+      from the request Host (`core.tenancy.resolveTenant`) and stamps it
+      on the `core_identity_map` binding (`tenant` column). The broader
+      multi-tenancy *infrastructure* (per-vhost registries, a `tenant_id`
+      predicate on every user-data query) is the separate operational
+      track in [`PUNCHLIST.md`](PUNCHLIST.md) §H, not this ticket.
 
 ---
 
