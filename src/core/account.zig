@@ -315,6 +315,8 @@ test {
     _ = @import("account_sqlite.zig");
     // zorm proof: the account row through the full ORM on real engines.
     _ = @import("account_zorm.zig");
+    // zorm migrations + FK proof: generated DDL through the host migration runner.
+    _ = @import("zorm_migrations.zig");
 }
 
 // ──────────────────────────────────────────────────────────────────────
