@@ -25,6 +25,12 @@ const contract = @import("contract.zig");
 const fields = @import("fields.zig");
 const reflect = @import("reflect.zig");
 const ddl = @import("ddl.zig");
+const sql = @import("sql.zig");
+const bind = @import("bind.zig");
+const crud = @import("crud.zig");
+const codec = @import("codec.zig");
+const schema_desc = @import("schema_desc.zig");
+pub const testing = @import("testing.zig");
 
 // ── Storage contract (S0) ──────────────────────────────────────────────
 pub const Backend = contract.Backend;
@@ -50,9 +56,32 @@ pub const ColumnSpec = reflect.ColumnSpec;
 pub const createTable = ddl.createTable;
 pub const dropTable = ddl.dropTable;
 
+// ── Marshaling + CRUD (S2) ─────────────────────────────────────────────
+pub const PkValue = bind.PkValue;
+pub const insert = crud.insert;
+pub const findByPk = crud.findByPk;
+pub const update = crud.update;
+pub const delete = crud.delete;
+pub const deleteByPk = crud.deleteByPk;
+pub const sql_gen = sql;
+pub const marshal = bind;
+
+// ── Wire codec + schema descriptor (S7) ────────────────────────────────
+pub const serialize = codec.serialize;
+pub const deserialize = codec.deserialize;
+pub const Schema = schema_desc.Schema;
+pub const schemaToJson = schema_desc.toJson;
+pub const WireType = schema_desc.WireType;
+
 test {
     _ = contract;
     _ = fields;
     _ = reflect;
     _ = ddl;
+    _ = sql;
+    _ = bind;
+    _ = crud;
+    _ = codec;
+    _ = schema_desc;
+    _ = testing;
 }

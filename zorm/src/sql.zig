@@ -1,0 +1,200 @@
+//! Comptime SQL statement generation. Each statement is built once per
+//! (entity, dialect) pair as a `comptime`-known string — no runtime string
+//! building, no allocation. Placeholders, autoincrement handling, and the
+//! `RETURNING` clause are dialect-parameterized: zorm NEVER ships one SQL
+//! string to both engines.
+//!
+//! Placeholder numbering matches the bind order the `bind` layer produces:
+//!   INSERT — non-auto-PK columns, in `TableInfo` order (1..k).
+//!   UPDATE — non-PK columns (SET, 1..m) then the PK (WHERE, m+1).
+//!   SELECT/DELETE by PK — the PK is the sole bind ($1 / ?).
+
+const std = @import("std");
+const reflect = @import("reflect.zig");
+const contract = @import("contract.zig");
+
+const Dialect = contract.Dialect;
+
+/// Comma-joined column-name list for every column (SELECT projection).
+fn columnList(comptime T: type) []const u8 {
+    const info = reflect.TableInfo(T);
+    comptime {
+        var s: []const u8 = "";
+        for (info.columns, 0..) |col, i| {
+            if (i > 0) s = s ++ ", ";
+            s = s ++ col.name;
+        }
+        return s;
+    }
+}
+
+fn buildInsert(comptime T: type, comptime dialect: Dialect) []const u8 {
+    const info = reflect.TableInfo(T);
+    comptime {
+        var cols: []const u8 = "";
+        var vals: []const u8 = "";
+        var n: usize = 0;
+        for (info.columns) |col| {
+            if (col.pk_auto) continue; // DB assigns the auto PK.
+            if (n > 0) {
+                cols = cols ++ ", ";
+                vals = vals ++ ", ";
+            }
+            cols = cols ++ col.name;
+            vals = vals ++ dialect.placeholder(n + 1);
+            n += 1;
+        }
+        var sql: []const u8 = "INSERT INTO " ++ info.table ++ " (" ++ cols ++ ") VALUES (" ++ vals ++ ")";
+        // Postgres assigns the auto PK and returns it; SQLite uses
+        // lastInsertId(). Text PKs are supplied by the caller (no RETURNING).
+        if (info.pk_auto and dialect == .postgres) {
+            sql = sql ++ " RETURNING " ++ info.pk_column.name;
+        }
+        return sql;
+    }
+}
+
+fn buildSelectByPk(comptime T: type, comptime dialect: Dialect) []const u8 {
+    const info = reflect.TableInfo(T);
+    comptime {
+        return "SELECT " ++ columnList(T) ++ " FROM " ++ info.table ++
+            " WHERE " ++ info.pk_column.name ++ " = " ++ dialect.placeholder(1);
+    }
+}
+
+fn buildUpdate(comptime T: type, comptime dialect: Dialect) []const u8 {
+    const info = reflect.TableInfo(T);
+    comptime {
+        var sets: []const u8 = "";
+        var n: usize = 0;
+        for (info.columns) |col| {
+            if (col.is_pk) continue;
+            if (n > 0) sets = sets ++ ", ";
+            sets = sets ++ col.name ++ " = " ++ dialect.placeholder(n + 1);
+            n += 1;
+        }
+        return "UPDATE " ++ info.table ++ " SET " ++ sets ++
+            " WHERE " ++ info.pk_column.name ++ " = " ++ dialect.placeholder(n + 1);
+    }
+}
+
+fn buildDeleteByPk(comptime T: type, comptime dialect: Dialect) []const u8 {
+    const info = reflect.TableInfo(T);
+    comptime {
+        return "DELETE FROM " ++ info.table ++
+            " WHERE " ++ info.pk_column.name ++ " = " ++ dialect.placeholder(1);
+    }
+}
+
+// ── Public API (switch runtime dialect → comptime-built string) ─────────
+
+/// `INSERT` for `T`. For an auto-PK entity on Postgres this ends in
+/// `RETURNING <pk>`; on SQLite the caller reads `lastInsertId()`.
+pub fn insert(comptime T: type, dialect: Dialect) []const u8 {
+    return switch (dialect) {
+        .sqlite => comptime buildInsert(T, .sqlite),
+        .postgres => comptime buildInsert(T, .postgres),
+    };
+}
+
+/// `SELECT … WHERE pk = ?` (full projection, `TableInfo` column order).
+pub fn selectByPk(comptime T: type, dialect: Dialect) []const u8 {
+    return switch (dialect) {
+        .sqlite => comptime buildSelectByPk(T, .sqlite),
+        .postgres => comptime buildSelectByPk(T, .postgres),
+    };
+}
+
+/// `UPDATE … SET <all non-PK cols> WHERE pk = ?`.
+pub fn update(comptime T: type, dialect: Dialect) []const u8 {
+    return switch (dialect) {
+        .sqlite => comptime buildUpdate(T, .sqlite),
+        .postgres => comptime buildUpdate(T, .postgres),
+    };
+}
+
+/// `DELETE … WHERE pk = ?`.
+pub fn deleteByPk(comptime T: type, dialect: Dialect) []const u8 {
+    return switch (dialect) {
+        .sqlite => comptime buildDeleteByPk(T, .sqlite),
+        .postgres => comptime buildDeleteByPk(T, .postgres),
+    };
+}
+
+// ── Tests ──────────────────────────────────────────────────────────────
+
+const testing = std.testing;
+const fields = @import("fields.zig");
+
+const Role = enum { member, admin };
+const Account = struct {
+    pub const zorm_table = "atp_accounts";
+    id: fields.Pk(64) = .{},
+    handle: fields.Text(64) = .{},
+    email: ?fields.Text(64) = null,
+    role: Role = .member,
+};
+
+const AutoEntity = struct {
+    pub const zorm_table = "things";
+    id: fields.AutoPk = .{},
+    name: fields.Text(32) = .{},
+};
+
+test "INSERT: text PK, SQLite placeholders, no RETURNING" {
+    try testing.expectEqualStrings(
+        "INSERT INTO atp_accounts (id, handle, email, role) VALUES (?, ?, ?, ?)",
+        insert(Account, .sqlite),
+    );
+}
+
+test "INSERT: Postgres uses $N placeholders" {
+    try testing.expectEqualStrings(
+        "INSERT INTO atp_accounts (id, handle, email, role) VALUES ($1, $2, $3, $4)",
+        insert(Account, .postgres),
+    );
+}
+
+test "INSERT: auto PK is omitted; Postgres appends RETURNING, SQLite does not" {
+    try testing.expectEqualStrings(
+        "INSERT INTO things (name) VALUES (?)",
+        insert(AutoEntity, .sqlite),
+    );
+    try testing.expectEqualStrings(
+        "INSERT INTO things (name) VALUES ($1) RETURNING id",
+        insert(AutoEntity, .postgres),
+    );
+}
+
+test "SELECT by PK projects all columns in order" {
+    try testing.expectEqualStrings(
+        "SELECT id, handle, email, role FROM atp_accounts WHERE id = ?",
+        selectByPk(Account, .sqlite),
+    );
+    try testing.expectEqualStrings(
+        "SELECT id, handle, email, role FROM atp_accounts WHERE id = $1",
+        selectByPk(Account, .postgres),
+    );
+}
+
+test "UPDATE sets non-PK columns then binds PK last" {
+    try testing.expectEqualStrings(
+        "UPDATE atp_accounts SET handle = ?, email = ?, role = ? WHERE id = ?",
+        update(Account, .sqlite),
+    );
+    try testing.expectEqualStrings(
+        "UPDATE atp_accounts SET handle = $1, email = $2, role = $3 WHERE id = $4",
+        update(Account, .postgres),
+    );
+}
+
+test "DELETE by PK" {
+    try testing.expectEqualStrings(
+        "DELETE FROM atp_accounts WHERE id = ?",
+        deleteByPk(Account, .sqlite),
+    );
+    try testing.expectEqualStrings(
+        "DELETE FROM things WHERE id = $1",
+        deleteByPk(AutoEntity, .postgres),
+    );
+}
