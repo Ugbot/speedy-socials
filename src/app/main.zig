@@ -33,6 +33,23 @@ fn writerReadyHook(ud: ?*anyopaque) core.health.Status {
     return .ready;
 }
 
+/// F2: TLS certificate-expiry readiness probe. When inbound TLS is
+/// configured, `/readyz` reports `not_ready` once the serving cert has
+/// expired, so a stale cert pulls the instance out of rotation. The probe
+/// re-reads the cert each call, so a live `POST /admin/tls/reload` is seen
+/// immediately. A transient read/parse failure (e.g. mid-reload) does not
+/// flip readiness — we only fail on a definitively-expired cert.
+const CertHealth = struct {
+    var cert_path: []const u8 = "";
+    var clock: core.clock.Clock = undefined;
+
+    fn hook(_: ?*anyopaque) core.health.Status {
+        if (cert_path.len == 0) return .ready;
+        const r = core.cert_probe.probe(cert_path, clock.wallUnix(), 0) catch return .ready;
+        return if (r.seconds_until_expiry <= 0) .not_ready else .ready;
+    }
+};
+
 /// F2: the AP federation outbox worker drains pending deliveries.
 /// We surface `not_ready` when the worker has not yet been started.
 fn apOutboxReadyHook(_: ?*anyopaque) core.health.Status {
@@ -863,6 +880,17 @@ pub fn main() !void {
             log_ptr.warn("boot", "inbound TLS live but ADMIN_TOKEN unset — POST /admin/tls/reload is disabled");
         } else {
             log_ptr.info("boot", "TLS cert hot-reload route enabled (POST /admin/tls/reload)");
+        }
+
+        // F2: expose cert expiry on /readyz.
+        if (cert_p.len > 0) {
+            CertHealth.cert_path = cert_p;
+            CertHealth.clock = real_clock.clock();
+            health.addHook("tls_cert", CertHealth.hook, null) catch |err| {
+                log_ptr.record(.warn, "boot", "failed to register tls_cert health hook", &.{
+                    .{ .k = "err", .v = @errorName(err) },
+                });
+            };
         }
     }
 

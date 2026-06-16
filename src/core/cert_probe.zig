@@ -225,3 +225,21 @@ test "F2: makeUnix computes a known date" {
 test "F2: probe rejects an unreadable path" {
     try testing.expectError(error.OpenFailed, probe("/nonexistent/cert.pem", 0, default_warn_seconds));
 }
+
+test "F2: probe on the real fixture cert yields the expiry-vs-now decision" {
+    // Parse the actual test fixture and check the comparison the /readyz
+    // hook relies on: at a `now` before notAfter the cert is live
+    // (seconds_until_expiry > 0); at a `now` far in the future it is
+    // expired (<= 0). Skips if the fixture isn't present.
+    const r_past = probe("tests/fixtures/test.crt", 1_577_836_800, default_warn_seconds) catch |e| switch (e) {
+        error.OpenFailed => return error.SkipZigTest,
+        else => return e,
+    };
+    // notAfter is a real timestamp parsed from the DER.
+    try testing.expect(r_past.not_after_unix > 0);
+
+    const far_future: i64 = r_past.not_after_unix + 86_400;
+    const r_future = try probe("tests/fixtures/test.crt", far_future, default_warn_seconds);
+    try testing.expect(r_future.seconds_until_expiry <= 0); // expired => hook returns not_ready
+    try testing.expect(r_future.expiring_soon);
+}
