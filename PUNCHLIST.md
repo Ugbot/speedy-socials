@@ -17,6 +17,33 @@ DUAL-1..DUAL-5), with the underlying audit in
 
 _Last refreshed: 2026-06-15 (code-verified reconciliation)._
 
+## 2026-06-16 reconciliation (current)
+
+Spec conformance is **complete**: all AP/AT/DUAL/INFRA tickets in
+[`SPEC_PUNCHLIST.md`](SPEC_PUNCHLIST.md) are `[x]` (68/68). Baseline:
+**850 unit tests + 4 sims pass**; the exe builds clean.
+
+Operational (this file) checkboxes re-verified against code on 2026-06-16:
+- **A3 / A4 → done.** AT→AP Delete/Update now fires via
+  `relay.at_to_ap_changes.onChange`, wired at `main.zig` through
+  `atproto.repo.setChangeHook` (the bodies below still say "AT→AP open" —
+  that text is stale).
+- **D4 → done**, via the AT-16 MST tree cache (`repo.acquireTree`):
+  commits no longer reload the full record set (flat-p99). D4 ≡ AT-16.
+- **K4 → done** (`docs/design/core-api.md`).
+- **E3 → partial `[~]`.** `core.trace` (Chrome-format ring + JSON
+  exporter) exists + is tested, but the `-Dtrace=true` build flag and the
+  accept→route→handler span instrumentation are **not** wired.
+- **G5 stays `[~]`.** `Router.RouteMeta` + `registerWithMeta` +
+  `matchMeta` exist + are tested (the old "doesn't exist yet" note was
+  stale), but `core.server` does not yet consult `matchMeta` to enforce
+  per-route body caps — the global 16 KiB parser cap is the only active
+  limit.
+
+Genuinely still open — see the per-item list below: **A2, C2, C3, C5,
+D3, E3(partial), H1, H2, H3, I2, I3, J3, J5** (most are upstream-blocked,
+deferred-by-design, or the multi-tenancy infra track).
+
 ## 2026-06-15 reconciliation note
 
 The single source of truth for spec-conformance status (AP/AT/DUAL)
@@ -105,23 +132,21 @@ _Last refreshed: 2026-05-19._
       Bluesky-style relay client validates the commit signature
       against the published key.
 
-- [~] **A3. Delete / Undo translation, both directions.**
-      AP→AT *done* (commit b488d4d follow-up): Delete activities
-      probe each bridged collection and remove the matching
-      `atp_records` row; unknown object_ids become a logged no-op.
-      AT→AP *still open*: the firehose consumer doesn't yet fire on
-      record deletions (no firehose-deletion event today). Split
-      into A3a (done) + A3b (open).
-      Acceptance for A3b: deleting an AT record emits an AP Delete
-      activity into `ap_federation_outbox`.
+- [x] **A3. Delete / Undo translation, both directions.**
+      AP→AT *done*: Delete activities probe each bridged collection and
+      remove the matching `atp_records` row; unknown object_ids become a
+      logged no-op. AT→AP *done* (A3b): `relay.at_to_ap_changes.onChange`
+      (registered via `atproto.repo.setChangeHook` in `main.zig`) fires
+      on record deletion and enqueues an AP Delete into
+      `ap_federation_outbox`.
 
-- [~] **A4. Update translation, both directions.**
+- [x] **A4. Update translation, both directions.**
       AP→AT *done*: `collectionFor` recognises Update + the bridge
       re-commits with the same rkey, INSERT-OR-REPLACE on
       `atp_records`. Content is extracted from the raw inbound body
       via `extractApInnerContent` so the CID changes when content
-      changes. AT→AP *open*: the firehose consumer doesn't yet emit
-      AP Update for AT record mutations.
+      changes. AT→AP *done*: `at_to_ap_changes.onChange` emits an AP
+      Update on `ChangeKind.update`.
 
 - [x] **A5. Move + Block + Flag activity translation.**
       Parser learns `.move` / `.block` / `.flag`; inbox dispatcher
@@ -269,7 +294,7 @@ _Last refreshed: 2026-05-19._
       `atp_firehose_events` becomes the manifest. Bench shows
       ≥10× throughput on firehose append vs the current path.
 
-- [ ] **D4. AT MST persistence (block storage) rather than full reload per commit.**
+- [x] **D4. AT MST persistence (block storage) rather than full reload per commit.**
       Acceptance: `atproto.repo.commit` does not call `loadTree` on
       the full record set every time. Tree blocks live in
       `atp_mst_blocks` and are loaded lazily. p99 commit latency
@@ -302,12 +327,13 @@ _Last refreshed: 2026-05-19._
       `ap_federation_outbox_enqueued_total`. Incremented from the
       relay paths; exposed on `/metrics`.
 
-- [ ] **E3. Chrome-format tracing (vendored `trace.zig`).**
-      Acceptance: `zig build -Dtrace=true` produces a Chrome trace
-      JSON viewable in `chrome://tracing`. Spans cover `accept →
-      route → handler` and `firehose append → consumer translate →
-      outbox enqueue`. Either vendor TB's `trace.zig` with the
-      transitive deps, or write a thin in-tree shim.
+- [~] **E3. Chrome-format tracing (`core.trace`).**
+      `core.trace` exists + is tested: `begin`/`end` spans into a
+      bounded ring + `flushTo` emits chrome://tracing JSON. **Remaining:**
+      the `-Dtrace=true` build flag and the actual span instrumentation
+      around `accept → route → handler` and `firehose append → consumer
+      translate → outbox enqueue` are not yet wired, so no spans are
+      emitted in a normal build.
 
 - [x] **E4. Structured access log.**
       `core/server.zig` emits one ring-log line per request (scope
@@ -421,12 +447,12 @@ _Last refreshed: 2026-05-19._
 
 - [~] **G5. Request-body size cap.**
       Global cap is `limits.conn_read_buffer_bytes` (16 KiB) —
-      enforced by the HTTP parser; oversize headers/bodies get
-      413. Per-route differential caps (AP=256K, media=8M,
-      streaming=0) need a `RouteMeta` extension on the router that
-      doesn't exist yet. The 16 KiB floor is sufficient for the
-      current shape since media uploads handle their own size
-      policy via multipart.
+      enforced by the HTTP parser; oversize headers/bodies get 413.
+      `Router.RouteMeta` + `registerWithMeta` + `matchMeta` (carrying
+      `max_body_bytes`) **exist + are tested**. **Remaining:**
+      `core.server` does not yet call `matchMeta` to enforce per-route
+      caps (AP=256K, media=8M, streaming=0), so only the global 16 KiB
+      floor is active today.
 
 - [x] **G6. Sanitize errors before they leave the process.**
       Acceptance: no stack traces, file paths, or sqlite error
@@ -532,7 +558,7 @@ _Last refreshed: 2026-05-19._
       Tiger Style invariants (no hot-path alloc, bounded buffers,
       no panic), and how the plugin contract works.
 
-- [ ] **K4. Public API surface review.**
+- [x] **K4. Public API surface review.**
       Acceptance: every `pub fn` in `src/core/` has either a doc
       comment or is named obviously enough to forgo one. Run
       `zig build docs` (if/once supported) without warnings.
