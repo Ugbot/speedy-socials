@@ -155,6 +155,15 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    // ── zorm (in-tree, standalone ORM + messaging library) ─────────
+    // Dependency-free by design (extractable to its own repo). `core`
+    // imports it + bridges its concrete backends via thin adapters.
+    const zorm_mod = b.addModule("zorm", .{
+        .root_source_file = b.path("zorm/src/zorm.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     // ── core module ────────────────────────────────────────────────
     const core_mod = b.addModule("core", .{
         .root_source_file = b.path("src/core/root.zig"),
@@ -174,6 +183,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "nats", .module = nats_mod },
             .{ .name = "kafka", .module = kafka_mod },
             .{ .name = "pg", .module = pg_mod },
+            .{ .name = "zorm", .module = zorm_mod },
         },
     });
 
@@ -323,12 +333,18 @@ pub fn build(b: *std.Build) void {
     const tb_stdx_tests = b.addTest(.{ .root_module = tb_stdx_mod });
     const run_tb_stdx_tests = b.addRunArtifact(tb_stdx_tests);
 
+    // zorm's own tests run against its module directly (it is standalone,
+    // so its tests use an in-memory MockBackend — no sqlite/core needed).
+    const zorm_tests = b.addTest(.{ .root_module = zorm_mod });
+    const run_zorm_tests = b.addRunArtifact(zorm_tests);
+
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_core_tests.step);
     test_step.dependOn(&run_app_tests.step);
     test_step.dependOn(&run_tb_testing_tests.step);
     test_step.dependOn(&run_tb_intrusive_tests.step);
     test_step.dependOn(&run_tb_stdx_tests.step);
+    test_step.dependOn(&run_zorm_tests.step);
 
     // Per-plugin test step. Each plugin module's tests run independently
     // so that referenced symbols (cid, mst, dag_cbor, …) get pulled in

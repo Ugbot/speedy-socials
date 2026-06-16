@@ -16,6 +16,10 @@ pub const DbProvider = provider.DbProvider;
 pub const SqliteProvider = provider.SqliteProvider;
 /// Pure-Zig Postgres DbProvider (over pg.zig). See `storage/postgres_provider.zig`.
 pub const PostgresProvider = @import("storage/postgres_provider.zig").PostgresProvider;
+
+/// Zero-cost bridge from `Backend` to the standalone `zorm` library's
+/// storage contract. See `storage/zorm_adapter.zig`.
+pub const zorm_adapter = @import("storage/zorm_adapter.zig");
 pub const setProvider = provider.setProvider;
 pub const dbProvider = provider.provider;
 pub const setCurrentTenant = provider.setCurrentTenant;
@@ -48,4 +52,5 @@ test {
     _ = backend;
     _ = provider;
     _ = PostgresProvider;
+    _ = zorm_adapter;
 }
