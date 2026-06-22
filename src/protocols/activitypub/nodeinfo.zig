@@ -78,8 +78,16 @@ pub fn writeNodeInfo(cfg: Config, stats: Stats, out: []u8) WriteError![]const u8
     );
     try w.writeAll(cfg.software_version);
     try w.writeAll(
-        "\",\"repository\":\"https://github.com/anthropics/speedy-socials\"},\"protocols\":[\"activitypub\"]," ++
-            "\"services\":{\"inbound\":[],\"outbound\":[]},\"openRegistrations\":",
+        "\",\"repository\":\"https://github.com/anthropics/speedy-socials\"},\"protocols\":[\"activitypub\"",
+    );
+    if (cfg.atproto_enabled) {
+        // AP3: when this host also speaks atproto, advertise it in the
+        // top-level protocols array so crawlers see the dual surface
+        // without parsing metadata.
+        try w.writeAll(",\"atproto\"");
+    }
+    try w.writeAll(
+        "],\"services\":{\"inbound\":[],\"outbound\":[]},\"openRegistrations\":",
     );
     try w.writeAll(if (cfg.open_registrations) "true" else "false");
     try w.writeAll(",\"usage\":{\"users\":{\"total\":");
@@ -130,12 +138,16 @@ test "AP-27: atproto block emitted when enabled" {
     }, .{}, &buf);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"atproto\":{\"enabled\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"did\":\"did:web:pds.example\"") != null);
+    // AP3: top-level protocols array advertises both protocols.
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"protocols\":[\"activitypub\",\"atproto\"]") != null);
 }
 
 test "AP-27: atproto block omitted when disabled" {
     var buf: [max_nodeinfo_bytes]u8 = undefined;
     const out = try writeNodeInfo(.{ .hostname = "ap-only.example" }, .{}, &buf);
     try std.testing.expect(std.mem.indexOf(u8, out, "atproto") == null);
+    // AP3: protocols array carries activitypub only.
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"protocols\":[\"activitypub\"]") != null);
 }
 
 test "openRegistrations toggles correctly" {
