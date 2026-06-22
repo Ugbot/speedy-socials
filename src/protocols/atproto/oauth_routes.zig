@@ -40,6 +40,83 @@ const base64url = std.base64.url_safe_no_pad;
 /// window across token requests. Single PDS instance per process.
 var dpop_verifier: oauth_dpop.Verifier = oauth_dpop.Verifier.init();
 
+/// AT-3: DPoP-Nonce (RFC 9449 §8) lifetime. A nonce remains acceptable
+/// for this window; presented later it is treated as stale and a fresh
+/// one is issued. Kept short — DPoP proofs are themselves short-lived.
+const dpop_nonce_ttl_seconds: i64 = 300;
+/// Random byte count for an issued nonce (hex-encoded → 64 chars).
+const dpop_nonce_bytes: usize = 32;
+
+/// AT-3: mint a fresh DPoP nonce, persist it in `atp_dpop_nonces`, and
+/// write the hex value into `out` (must hold `dpop_nonce_bytes * 2`).
+/// Returns the slice written. Nonces are seeded from the atproto state
+/// clock (the same entropy source the PAR/code minters use).
+fn issueDpopNonce(db: *c.sqlite3, st: *State.State, out: []u8) ?[]const u8 {
+    if (out.len < dpop_nonce_bytes * 2) return null;
+    var rng_bytes: [dpop_nonce_bytes]u8 = undefined;
+    var prng = std.Random.DefaultPrng.init(@bitCast(@as(i64, @truncate(st.clock.wallNs() ^ 0xD9_0F_AC_E5))));
+    prng.random().bytes(&rng_bytes);
+    const hex_chars = "0123456789abcdef";
+    for (rng_bytes, 0..) |b, i| {
+        out[i * 2] = hex_chars[b >> 4];
+        out[i * 2 + 1] = hex_chars[b & 0xF];
+    }
+    const nonce = out[0 .. dpop_nonce_bytes * 2];
+
+    var stmt: ?*c.sqlite3_stmt = null;
+    if (c.sqlite3_prepare_v2(db, "INSERT OR REPLACE INTO atp_dpop_nonces (nonce, issued_at, expires_at) VALUES (?,?,?)", -1, &stmt, null) != c.SQLITE_OK) {
+        return null;
+    }
+    defer _ = c.sqlite3_finalize(stmt);
+    const now = st.clock.wallUnix();
+    _ = c.sqlite3_bind_text(stmt, 1, nonce.ptr, @intCast(nonce.len), c.sqliteTransientAsDestructor());
+    _ = c.sqlite3_bind_int64(stmt, 2, now);
+    _ = c.sqlite3_bind_int64(stmt, 3, now + dpop_nonce_ttl_seconds);
+    if (c.sqlite3_step(stmt.?) != c.SQLITE_DONE) return null;
+    return nonce;
+}
+
+/// AT-3: validate + consume a DPoP nonce. Returns true iff `nonce` is
+/// present in the store and not expired; on success the row is deleted
+/// so the nonce cannot be replayed.
+fn consumeDpopNonce(db: *c.sqlite3, st: *State.State, nonce: []const u8) bool {
+    if (nonce.len == 0 or nonce.len > 256) return false;
+    var sel: ?*c.sqlite3_stmt = null;
+    if (c.sqlite3_prepare_v2(db, "SELECT expires_at FROM atp_dpop_nonces WHERE nonce = ?", -1, &sel, null) != c.SQLITE_OK) {
+        return false;
+    }
+    defer _ = c.sqlite3_finalize(sel);
+    _ = c.sqlite3_bind_text(sel, 1, nonce.ptr, @intCast(nonce.len), c.sqliteTransientAsDestructor());
+    if (c.sqlite3_step(sel.?) != c.SQLITE_ROW) return false;
+    const exp = c.sqlite3_column_int64(sel, 0);
+
+    // Delete regardless of expiry so stale rows are reaped on contact.
+    var del: ?*c.sqlite3_stmt = null;
+    if (c.sqlite3_prepare_v2(db, "DELETE FROM atp_dpop_nonces WHERE nonce = ?", -1, &del, null) == c.SQLITE_OK) {
+        _ = c.sqlite3_bind_text(del, 1, nonce.ptr, @intCast(nonce.len), c.sqliteTransientAsDestructor());
+        _ = c.sqlite3_step(del.?);
+        _ = c.sqlite3_finalize(del);
+    }
+    return exp >= st.clock.wallUnix();
+}
+
+/// AT-3: respond with a fresh `DPoP-Nonce` header and the RFC 9449
+/// `use_dpop_nonce` error so the client retries with the nonce echoed
+/// into its proof. Written directly via the response builder because
+/// the shared `xrpc.writeJsonBody` finalizes headers before we could
+/// add `DPoP-Nonce`.
+fn writeUseDpopNonce(hc: *HandlerContext, nonce: []const u8) !void {
+    const body =
+        "{\"error\":\"use_dpop_nonce\",\"error_description\":\"Authorization server requires nonce in DPoP proof\"}";
+    try hc.response.startStatus(.bad_request);
+    try hc.response.header("Content-Type", "application/json");
+    try hc.response.header("DPoP-Nonce", nonce);
+    try hc.response.headerFmt("Content-Length", "{d}", .{body.len});
+    try hc.response.header("Connection", "close");
+    try hc.response.finishHeaders();
+    try hc.response.body(body);
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // AS / RS metadata
 // ──────────────────────────────────────────────────────────────────────
@@ -253,6 +330,19 @@ fn token(hc: *HandlerContext) anyerror!void {
     const jkt = dpop_verifier.verifyDpopHeader(dpop_header, "POST", htu, st.clock.wallUnix(), &jkt_buf) catch
         return xrpc.writeError(hc, .bad_request, "invalid_dpop_proof", "DPoP proof verification failed");
 
+    // AT-3: DPoP-Nonce (RFC 9449 §8). The proof must carry a server-
+    // issued `nonce`. If absent or stale, issue a fresh nonce via the
+    // `DPoP-Nonce` header + `use_dpop_nonce` error so the client retries.
+    var nonce_scratch: [256]u8 = undefined;
+    const proof_nonce = oauth_dpop.extractNonce(dpop_header, &nonce_scratch);
+    const nonce_ok = if (proof_nonce) |n| consumeDpopNonce(db, st, n) else false;
+    if (!nonce_ok) {
+        var issued_buf: [dpop_nonce_bytes * 2]u8 = undefined;
+        const fresh = issueDpopNonce(db, st, &issued_buf) orelse
+            return xrpc.writeError(hc, .internal, "InternalError", "nonce");
+        return writeUseDpopNonce(hc, fresh);
+    }
+
     // Look up + consume the auth code.
     var sel: ?*c.sqlite3_stmt = null;
     if (c.sqlite3_prepare_v2(db, "SELECT did, request_uri, expires_at FROM atp_oauth_codes WHERE code = ?", -1, &sel, null) != c.SQLITE_OK) {
@@ -403,4 +493,97 @@ test "AT-1: PKCE S256 matches reference verifier/challenge" {
     const n = base64url.Encoder.calcSize(32);
     _ = base64url.Encoder.encode(b64[0..n], &h);
     try testing.expectEqualStrings("E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM", b64[0..n]);
+}
+
+// ── AT-3: DPoP-Nonce store ─────────────────────────────────────────
+
+const schema_mod = @import("schema.zig");
+
+fn setupOAuthDb() !*c.sqlite3 {
+    const db = try core.storage.sqlite.openWriter(":memory:");
+    for (schema_mod.all_migrations) |m| {
+        const sql_z = try testing.allocator.dupeZ(u8, m.up);
+        defer testing.allocator.free(sql_z);
+        var em: [*c]u8 = null;
+        _ = c.sqlite3_exec(db, sql_z.ptr, null, null, &em);
+        if (em != null) c.sqlite3_free(em);
+    }
+    return db;
+}
+
+test "AT-3: dpop nonce issue -> consume -> reject reuse" {
+    const db = try setupOAuthDb();
+    defer core.storage.sqlite.closeDb(db);
+
+    State.reset();
+    var rng = core.rng.Rng.init(0xA73);
+    var sc = core.clock.SimClock.init(1_000);
+    State.init(sc.clock(), &rng, "pds.example");
+    defer State.reset();
+    const st = State.get();
+
+    var buf: [dpop_nonce_bytes * 2]u8 = undefined;
+    const nonce = issueDpopNonce(db, st, &buf) orelse return error.IssueFailed;
+    try testing.expectEqual(@as(usize, dpop_nonce_bytes * 2), nonce.len);
+
+    // First consume succeeds.
+    try testing.expect(consumeDpopNonce(db, st, nonce));
+    // Replay (already consumed) is rejected.
+    try testing.expect(!consumeDpopNonce(db, st, nonce));
+    // Unknown nonce is rejected.
+    try testing.expect(!consumeDpopNonce(db, st, "deadbeef"));
+}
+
+test "AT-3: dpop nonce rejected once past its TTL window" {
+    const db = try setupOAuthDb();
+    defer core.storage.sqlite.closeDb(db);
+
+    State.reset();
+    var rng = core.rng.Rng.init(0xB91);
+    var sc = core.clock.SimClock.init(5_000);
+    State.init(sc.clock(), &rng, "pds.example");
+    defer State.reset();
+    const st = State.get();
+
+    var buf: [dpop_nonce_bytes * 2]u8 = undefined;
+    const nonce = issueDpopNonce(db, st, &buf) orelse return error.IssueFailed;
+    // Copy: the consume path deletes the row, so re-insert a stale row by
+    // advancing the clock beyond the TTL before consuming the original.
+    var stale_buf: [dpop_nonce_bytes * 2]u8 = undefined;
+    @memcpy(&stale_buf, nonce);
+
+    // Advance the simulated wall clock past the nonce TTL.
+    sc.advance(@as(u64, @intCast(dpop_nonce_ttl_seconds + 1)) * std.time.ns_per_s);
+    // The row exists but is now expired → consume returns false.
+    try testing.expect(!consumeDpopNonce(db, st, stale_buf[0..]));
+}
+
+test "AT-3: extractNonce recovers the nonce claim from a signed proof" {
+    const oauth_dpop_mod = @import("oauth_dpop.zig");
+    const keypair_mod = @import("keypair.zig");
+    const auth_max = @import("auth.zig").max_jwt_bytes;
+
+    var seed: [32]u8 = undefined;
+    @memset(&seed, 0x77);
+    const kp = keypair_mod.Ed25519KeyPair.fromSeed(seed);
+
+    var pbuf: [auth_max]u8 = undefined;
+    const proof = try oauth_dpop_mod.signProofWithNonce(
+        kp,
+        "POST",
+        "https://pds.example/oauth/token",
+        9000,
+        "nonce-jti-1",
+        "server-issued-nonce-abc123",
+        &pbuf,
+    );
+
+    var nbuf: [256]u8 = undefined;
+    const got = oauth_dpop_mod.extractNonce(proof, &nbuf) orelse return error.NoNonce;
+    try testing.expectEqualStrings("server-issued-nonce-abc123", got);
+
+    // A proof without a nonce claim yields null.
+    var pbuf2: [auth_max]u8 = undefined;
+    const proof2 = try oauth_dpop_mod.signProof(kp, "POST", "https://pds.example/oauth/token", 9000, "no-nonce", &pbuf2);
+    try testing.expect(oauth_dpop_mod.extractNonce(proof2, &nbuf) == null);
 }

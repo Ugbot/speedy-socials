@@ -181,6 +181,23 @@ pub const Verifier = struct {
     }
 };
 
+/// Extract the optional `nonce` claim (RFC 9449 §8) from a DPoP proof
+/// JWT, copying it into `out`. Returns the slice written, or null when
+/// the proof carries no `nonce` claim. The proof is `header.payload.sig`
+/// — we decode the base64url payload segment and pull the string value.
+pub fn extractNonce(proof_jwt: []const u8, out: []u8) ?[]const u8 {
+    const dot1 = std.mem.indexOfScalar(u8, proof_jwt, '.') orelse return null;
+    const rest = proof_jwt[dot1 + 1 ..];
+    const dot2_rel = std.mem.indexOfScalar(u8, rest, '.') orelse return null;
+    const payload_part = rest[0..dot2_rel];
+    var payload_dec: [1024]u8 = undefined;
+    const pn = b64UrlDecode(payload_part, &payload_dec) catch return null;
+    const nonce = extractString(payload_dec[0..pn], "nonce") catch return null;
+    if (nonce.len > out.len) return null;
+    @memcpy(out[0..nonce.len], nonce);
+    return out[0..nonce.len];
+}
+
 fn extractString(body: []const u8, key: []const u8) ![]const u8 {
     var needle_buf: [64]u8 = undefined;
     if (key.len + 4 > needle_buf.len) return error.BadClaims;
@@ -333,6 +350,48 @@ pub fn signProof(
         &payload_buf,
         "{{\"htm\":\"{s}\",\"htu\":\"{s}\",\"iat\":{d},\"jti\":\"{s}\"}}",
         .{ htm, htu, iat, jti },
+    ) catch return error.BufferTooSmall;
+
+    var pos: usize = 0;
+    pos += b64UrlEncodeShim(header_json, out[pos..]);
+    out[pos] = '.';
+    pos += 1;
+    pos += b64UrlEncodeShim(payload_json, out[pos..]);
+    const sig = kp.sign(out[0..pos]);
+    out[pos] = '.';
+    pos += 1;
+    pos += b64UrlEncodeShim(&sig, out[pos..]);
+    return out[0..pos];
+}
+
+/// Sign a DPoP proof (Ed25519) that additionally carries a server-issued
+/// `nonce` claim (RFC 9449 §8). Used after the AS replies with a
+/// `DPoP-Nonce` header + `use_dpop_nonce` error.
+pub fn signProofWithNonce(
+    kp: keypair.Ed25519KeyPair,
+    htm: []const u8,
+    htu: []const u8,
+    iat: i64,
+    jti: []const u8,
+    nonce: []const u8,
+    out: []u8,
+) AtpError![]const u8 {
+    if (out.len < auth.max_jwt_bytes) return error.BufferTooSmall;
+
+    var x_b64: [44]u8 = undefined;
+    const xn = b64UrlEncodeShim(&kp.public_key, &x_b64);
+    var header_buf: [256]u8 = undefined;
+    const header_json = std.fmt.bufPrint(
+        &header_buf,
+        "{{\"alg\":\"EdDSA\",\"typ\":\"dpop+jwt\",\"jwk\":{{\"crv\":\"Ed25519\",\"kty\":\"OKP\",\"x\":\"{s}\"}}}}",
+        .{x_b64[0..xn]},
+    ) catch return error.BufferTooSmall;
+
+    var payload_buf: [640]u8 = undefined;
+    const payload_json = std.fmt.bufPrint(
+        &payload_buf,
+        "{{\"htm\":\"{s}\",\"htu\":\"{s}\",\"iat\":{d},\"jti\":\"{s}\",\"nonce\":\"{s}\"}}",
+        .{ htm, htu, iat, jti, nonce },
     ) catch return error.BufferTooSmall;
 
     var pos: usize = 0;

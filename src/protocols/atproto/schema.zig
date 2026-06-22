@@ -272,6 +272,27 @@ pub const revoked_sessions_migration: Migration = .{
     .down = "DROP TABLE atp_revoked_sessions;",
 };
 
+// AT-3: DPoP-Nonce store (RFC 9449 §8). The token endpoint issues a
+// server-chosen nonce (`DPoP-Nonce` response header) and requires the
+// next DPoP proof to echo it back in the `nonce` claim. Each row is a
+// currently-valid nonce; `expires_at` bounds its lifetime so a proof
+// presented after the window is treated as stale and a fresh nonce is
+// issued. Rows are consumed (deleted) on successful verification so a
+// nonce cannot be replayed.
+pub const dpop_nonces_migration: Migration = .{
+    .id = 2017,
+    .name = "atproto:dpop_nonces",
+    .up =
+    \\CREATE TABLE IF NOT EXISTS atp_dpop_nonces (
+    \\    nonce      TEXT PRIMARY KEY,
+    \\    issued_at  INTEGER NOT NULL,
+    \\    expires_at INTEGER NOT NULL
+    \\) STRICT;
+    \\CREATE INDEX IF NOT EXISTS atp_dpop_nonces_exp_idx ON atp_dpop_nonces (expires_at);
+    ,
+    .down = "DROP TABLE atp_dpop_nonces;",
+};
+
 pub const all_migrations = [_]Migration{
     repos_migration,
     commits_migration,
@@ -289,4 +310,5 @@ pub const all_migrations = [_]Migration{
     oauth_codes_migration,
     crawl_subscriptions_migration,
     revoked_sessions_migration,
+    dpop_nonces_migration,
 };

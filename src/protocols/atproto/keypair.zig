@@ -31,16 +31,26 @@ const core = @import("core");
 const AtpError = core.errors.AtpError;
 const assertLe = core.assert.assertLe;
 
-pub const KeyAlg = enum { ed25519, secp256k1 };
+pub const KeyAlg = enum { ed25519, secp256k1, p256 };
+
+/// P-256 (NIST secp256r1, ES256) ECDSA over SHA-256. did:key public
+/// keys for this curve are 33-byte compressed SEC1 points (0x02/0x03
+/// prefix + 32-byte X). Used by the AT Protocol OAuth/DPoP ES256 path.
+const EcdsaP256 = std.crypto.sign.ecdsa.EcdsaP256Sha256;
 
 pub const ed25519_public_len: usize = 32;
 pub const ed25519_secret_len: usize = 64; // stdlib stores seed+pk
 pub const ed25519_signature_len: usize = 64;
 pub const secp256k1_pubkey_compressed_len: usize = 33;
+pub const p256_pubkey_compressed_len: usize = 33;
 
 // Multicodec varint prefixes.
 const ed25519_multicodec: [2]u8 = .{ 0xed, 0x01 };
 const secp256k1_multicodec: [2]u8 = .{ 0xe7, 0x01 };
+// p256-pub multicodec code is 0x1200; its unsigned-varint encoding is
+// {0x80, 0x24}: low 7 bits of 0x1200 are 0 (continuation set → 0x80),
+// next 7 bits are 0x24 (0x1200 >> 7 = 36).
+const p256_multicodec: [2]u8 = .{ 0x80, 0x24 };
 
 // did:key: prefix string.
 const did_key_prefix = "did:key:";
@@ -109,6 +119,19 @@ pub fn formatDidKeySecp256k1(compressed: [secp256k1_pubkey_compressed_len]u8, ou
     return formatDidKeyFromMulticodec(&mc, out);
 }
 
+/// Build a `did:key:z…` string for a P-256 (ES256) public key. The
+/// input is the 33-byte compressed SEC1 point (0x02/0x03 prefix). The
+/// point is validated via `EcdsaP256.PublicKey.fromSec1` before
+/// encoding so we never emit a did:key for an off-curve point.
+pub fn formatDidKeyP256(compressed: [p256_pubkey_compressed_len]u8, out: []u8) AtpError![]const u8 {
+    _ = EcdsaP256.PublicKey.fromSec1(&compressed) catch return error.BadMulticodec;
+    var mc: [p256_pubkey_compressed_len + 2]u8 = undefined;
+    mc[0] = p256_multicodec[0];
+    mc[1] = p256_multicodec[1];
+    @memcpy(mc[2..], &compressed);
+    return formatDidKeyFromMulticodec(&mc, out);
+}
+
 /// Parsed did:key: yields the algorithm and a borrowed view over the
 /// decoded raw public-key bytes inside `scratch`.
 pub const ParsedDidKey = struct {
@@ -136,6 +159,14 @@ pub fn parseDidKey(s: []const u8, scratch: []u8) AtpError!ParsedDidKey {
     if (decoded[0] == secp256k1_multicodec[0] and decoded[1] == secp256k1_multicodec[1]) {
         if (decoded.len != 2 + secp256k1_pubkey_compressed_len) return error.BadMulticodec;
         return .{ .alg = .secp256k1, .public_key = decoded[2..] };
+    }
+    if (decoded[0] == p256_multicodec[0] and decoded[1] == p256_multicodec[1]) {
+        if (decoded.len != 2 + p256_pubkey_compressed_len) return error.BadMulticodec;
+        // Validate the compressed point is actually on the P-256 curve.
+        var pub_compressed: [p256_pubkey_compressed_len]u8 = undefined;
+        @memcpy(&pub_compressed, decoded[2..]);
+        _ = EcdsaP256.PublicKey.fromSec1(&pub_compressed) catch return error.BadMulticodec;
+        return .{ .alg = .p256, .public_key = decoded[2..] };
     }
     return error.BadMulticodec;
 }
@@ -320,6 +351,36 @@ test "did:key: secp256k1 raw bytes roundtrip" {
     const parsed = try parseDidKey(did, &scratch);
     try std.testing.expectEqual(KeyAlg.secp256k1, parsed.alg);
     try std.testing.expectEqualSlices(u8, pub_compressed[0..], parsed.public_key);
+}
+
+test "did:key: p256 (ES256) compressed key roundtrip" {
+    // Derive a real on-curve P-256 key so fromSec1 validation passes.
+    var seed: [EcdsaP256.KeyPair.seed_length]u8 = undefined;
+    @memset(&seed, 0x6f);
+    const kp = try EcdsaP256.KeyPair.generateDeterministic(seed);
+    const compressed = kp.public_key.toCompressedSec1();
+    try std.testing.expectEqual(@as(usize, p256_pubkey_compressed_len), compressed.len);
+    // Compressed SEC1 prefix is 0x02 or 0x03.
+    try std.testing.expect(compressed[0] == 0x02 or compressed[0] == 0x03);
+
+    var out: [max_did_key_bytes]u8 = undefined;
+    const did = try formatDidKeyP256(compressed, &out);
+    try std.testing.expect(std.mem.startsWith(u8, did, "did:key:z"));
+
+    var scratch: [128]u8 = undefined;
+    const parsed = try parseDidKey(did, &scratch);
+    try std.testing.expectEqual(KeyAlg.p256, parsed.alg);
+    try std.testing.expectEqualSlices(u8, compressed[0..], parsed.public_key);
+}
+
+test "did:key: p256 multicodec varint bytes are {0x80,0x24}" {
+    // Sanity-check the unsigned-varint encoding of p256-pub (0x1200).
+    try std.testing.expectEqual(@as(u8, 0x80), p256_multicodec[0]);
+    try std.testing.expectEqual(@as(u8, 0x24), p256_multicodec[1]);
+    // Decode the varint back to 0x1200 to prove correctness.
+    const lo: u16 = p256_multicodec[0] & 0x7f;
+    const hi: u16 = p256_multicodec[1];
+    try std.testing.expectEqual(@as(u16, 0x1200), lo | (hi << 7));
 }
 
 test "secp256k1: sign + verify roundtrip via core.crypto" {
