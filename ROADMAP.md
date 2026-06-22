@@ -41,10 +41,10 @@ integration, and net-new capability (zorm MS SQL + features)** — not core gaps
 - **AT canonical DAG-CBOR re-encode on ingest** — records are stored as-submitted, not
   re-canonicalized, so our CIDs can diverge from what AppViews compute. One re-encode
   per record at ingest. (`atproto/lexicon.zig`, `routes.zig:186` notes the deferral.)
-- **AP recipient resolution + delivery fanout** — only `to_first` and the first
-  `cc`-followers match are used; parse/honor full `to`/`cc`/`bcc`/`audience`, special-case
-  `as:Public`, and redistribute inbox-forwarding to all cc-followers (AP §7.1.3).
-  (`activitypub/inbox.zig:286-307`, `routes.zig:766-813`.)
+- ~~**AP recipient resolution + delivery fanout**~~ ✅ DONE — full `to`+`cc` lists honored,
+  `as:Public` (+ `as:Public`/`Public` aliases) recognized and skipped, inbox-forwarding
+  redistributed to ALL local-followers collections (deduped), `bto`/`bcc` never captured.
+  (`activitypub/activity.zig`, `inbox.zig`; +8 tests.)
 - **AT external identity resolution wired** — `did:plc`/`did:web` HTTP resolution and
   DNS-TXT handle resolution are skeletons needing the `HttpFetcher`/resolver attached at
   boot; required to resolve real network identities. (`atproto/did_resolver.zig`.)
@@ -54,7 +54,9 @@ integration, and net-new capability (zorm MS SQL + features)** — not core gaps
   `relay/`.)
 
 ## P1 — Spec/client completeness
-- **AT `deleteSession` (logout)** — no route today; clients can only discard tokens.
+- ~~**AT `deleteSession` (logout)**~~ ✅ DONE — `POST /xrpc/com.atproto.server.deleteSession`
+  + an `atp_revoked_sessions` deny-list checked in `refreshSession` (fails closed).
+  (`atproto/routes.zig`, `auth.zig`, `schema.zig` migration 2016.)
 - **AT P-256 `did:key` roundtrip** + **`DPoP-Nonce` response header** (ES256 verify
   itself is done). (`atproto/keypair.zig`, `oauth_dpop.zig`.)
 - **AT sync reads**: `getLatestCommit`, `listBlobs`, `listMissingBlobs`.
@@ -64,8 +66,11 @@ integration, and net-new capability (zorm MS SQL + features)** — not core gaps
   `FEDERATION.md` (FEP-67ff); capability negotiation (FEP-844e).
 - **NodeInfo** — advertise `atproto` in the `protocols` array (currently only in
   `metadata`). (`activitypub/nodeinfo.zig:81-100`.)
-- **Media** — chunked transfer encoding so blobs >4 MiB stream instead of being unserved.
-  (`media/routes.zig:356`.)
+- ~~**Media** — chunked transfer encoding for blobs >4 MiB~~ ✅ DONE — `getBlob` streams
+  large/spilled blobs via HTTP/1.1 `Transfer-Encoding: chunked` (64 KiB passes, no full-file
+  buffer) through a new `BodySink` on the handler context; small inline blobs keep the
+  Content-Length fast path. (Also fixed the latent 16 KiB `ResponseBufferFull` bug — the old
+  path could never serve a large blob.) (`core/http/router.zig`, `server.zig`, `media/routes.zig`.)
 - **Multi-tenancy finish**: tenant lifecycle routes — create/suspend/delete (H3, missing);
   per-vhost plugin-registry isolation (H1, partial — registry is global today). Storage
   is already per-tenant and the request path is tenant-scoped (H2 done,
@@ -109,8 +114,10 @@ mssql:** `[bracket]` identifier quoting (folded into the P1 quoting item).
   and break on reserved words.
 - **Typed constraint-violation errors** (unique / FK / not-null, per-dialect SQLSTATE /
   codes) — needed for clean conflict handling.
-- **Query operators + pagination**: `<,>,<=,>=,!=`, `LIKE`, `IN`, `IS NULL`, `BETWEEN`,
-  `OR`/grouping, `count()`, and **`OFFSET`** (where T-SQL's `OFFSET…FETCH` pays off).
+- **Query operators + pagination** — ✅ MOSTLY DONE: `whereOp` (`= <> < <= > >=`),
+  `whereLike`, `whereIn` (empty → `1=0`), `whereNull`/`whereNotNull`, and `offset()` (dialect-
+  correct incl. T-SQL `OFFSET…FETCH`) shipped in `query.zig` (4 dialects, +9 tests). Remaining:
+  `BETWEEN`, `OR`/grouping, `count()`/aggregates.
 - **Upserts** — `ON CONFLICT … DO UPDATE` (PG/SQLite) · `ON DUPLICATE KEY UPDATE`
   (MySQL) · `MERGE` (MSSQL).
 - **Composite primary keys** — single-column PK is hard-coded today.
