@@ -49,6 +49,17 @@ relay's firehose → translate → ingest, with cursor/reconnect (R1) · zorm qu
 OR-grouping / count() (Z7) · zorm upserts ON CONFLICT/DUPLICATE/MERGE (Z3) · zorm column types
 Decimal/Uuid/Json/Date/DateTime (Z5).
 
+## ✅ Shipped 2026-06-23 — Wave 3 (on `main`, 1132 tests green)
+zorm composite primary keys (Z4) · zorm schema-diff migrations + Migrator.rollback (Z6) ·
+H1 per-vhost plugin-registry isolation — dispatch mechanism (C2; boot-wiring deferred) ·
+hierarchical Merkle Search Tree with per-node block persistence (MST) · deterministic-replay
+sim test for the AT→AP relay path (J3) · gated Mastodon e2e CI job + round-trip test (J5).
+
+**All three ROADMAP waves are now complete and merged to `main`.** Remaining lower-priority
+follow-ups (not in these waves): multi-level firehose storage (D3) for ≥10× hot-path
+throughput; per-tenant registry boot-wiring (H1 composition root); MST incremental
+structural-diff persist; upstream-blocked C2/C5 TLS items.
+
 ---
 
 # Track 1 — Run the node correctly (the original AP/AT target)
