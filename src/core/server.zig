@@ -115,6 +115,12 @@ pub const Server = struct {
     pool: *StaticPool(Connection, limits.max_connections),
     inner: net.Server,
     shutting_down: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// C2 / H1: optional per-tenant plugin-registry set. When null (the
+    /// default — single-tenant deployments), dispatch never stamps a
+    /// per-request registry and the behavior is exactly as before. When
+    /// set, dispatch resolves the active registry by the tenant the Host
+    /// header maps to and stamps it for the request's handlers.
+    registry_set: ?*Plugin.RegistrySet = null,
 
     pub fn init(
         cfg: Config,
@@ -420,6 +426,12 @@ pub const Server = struct {
         // their global handle) until a DbProvider + tenants are configured.
         storage_mod.clearCurrentTenant();
         defer storage_mod.clearCurrentTenant();
+        // C2 / H1: clear any per-tenant registry stamp up front and on the
+        // way out so a pooled thread never serves a request against the
+        // previous request's tenant registry. Inert when registry_set is
+        // null (single-tenant default) — nothing is ever stamped.
+        Plugin.clearCurrentRegistry();
+        defer Plugin.clearCurrentRegistry();
         if (request.header("Host")) |host_hdr| {
             switch (tenancy_mod.resolveTenant(host_hdr)) {
                 .active => {},
@@ -434,6 +446,15 @@ pub const Server = struct {
             }
             // Active: bind storage to this tenant (no-op for the default tenant).
             storage_mod.setCurrentTenant(tenancy_mod.current());
+            // C2 / H1: bind the active plugin registry for this tenant. The
+            // default tenant (empty current()) and any unbound tenant both
+            // resolve to the shared default registry, so RegistrySet.resolve
+            // returns it and the stamp is harmless; we stamp only when a
+            // registry set is configured. Single-tenant servers leave
+            // registry_set null and skip this entirely.
+            if (self.registry_set) |set| {
+                Plugin.setCurrentRegistry(set.resolve(tenancy_mod.current()));
+            }
         }
 
         // G3: per-IP rate limit. Inert when not configured.
@@ -1219,4 +1240,152 @@ test "Server.init accepts a TLS backend; PlainBackend wrap is identity at the ca
     const raw: net.Stream = .{ .socket = .{ .handle = @as(std.posix.fd_t, 77), .address = undefined } };
     const wrapped = try server.cfg.tls.?.wrapStream(io, raw);
     try std_testing.expectEqual(@as(std.posix.fd_t, 77), wrapped.socket.handle);
+}
+
+// ── C2 / H1: per-vhost plugin-registry isolation, end-to-end ──────────
+
+/// State a plugin keeps per tenant: a label the handler echoes back.
+const TenantTag = struct { label: []const u8 };
+
+fn pluginNop(_: ?*anyopaque, _: *Context) !void {}
+fn pluginNopDeinit(_: ?*anyopaque, _: *Context) void {}
+
+/// Handler that reports which tenant registry the dispatcher stamped for
+/// this request by reading its plugin's state out of the active registry.
+/// With no stamp (default tenant) it reports "default".
+fn whoamiHandler(hc: *router_mod.HandlerContext) anyerror!void {
+    const label: []const u8 = blk: {
+        if (Plugin.currentRegistry()) |reg| {
+            if (reg.find("whoami")) |p| {
+                const tag: *const TenantTag = @ptrCast(@alignCast(p.state.?));
+                break :blk tag.label;
+            }
+        }
+        break :blk "default";
+    };
+    try hc.response.startStatus(.ok);
+    try hc.response.header("Content-Type", "text/plain");
+    try hc.response.headerFmt("Content-Length", "{d}", .{label.len});
+    try hc.response.header("Connection", "close");
+    try hc.response.finishHeaders();
+    try hc.response.body(label);
+}
+
+/// Issue one GET / over a fresh connection with the given Host header and
+/// return the response bytes read into `buf`.
+fn getWithHost(port: u16, host: []const u8, buf: []u8) usize {
+    const fd = dialLocal(port);
+    if (fd < 0) return 0;
+    defer _ = std.c.close(fd);
+    var req_buf: [256]u8 = undefined;
+    const req = std.fmt.bufPrint(&req_buf, "GET / HTTP/1.1\r\nHost: {s}\r\nConnection: close\r\n\r\n", .{host}) catch return 0;
+    if (!writeAllFd(fd, req)) return 0;
+    return readUntilSubstr(fd, buf, "\r\n\r\n");
+}
+
+const VhostShared = struct {
+    server: *Server,
+    port: u16,
+    default_len: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    a_len: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    b_len: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    default_buf: [512]u8 = undefined,
+    a_buf: [512]u8 = undefined,
+    b_buf: [512]u8 = undefined,
+    done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+};
+
+fn vhostServerRunThread(server: *Server) void {
+    server.run() catch {};
+}
+
+fn vhostClientThread(shared: *VhostShared) void {
+    // Default tenant: unknown host → no binding → handler sees "default".
+    shared.default_len.store(@intCast(getWithHost(shared.port, "unknown.example", &shared.default_buf)), .release);
+    // Tenant A and tenant B map to their own registries / plugin state.
+    shared.a_len.store(@intCast(getWithHost(shared.port, "a.example", &shared.a_buf)), .release);
+    shared.b_len.store(@intCast(getWithHost(shared.port, "b.example", &shared.b_buf)), .release);
+    shared.done.store(true, .release);
+}
+
+test "C2: two vhosts observe isolated plugin state; default tenant unaffected" {
+    const allocator = std_testing.allocator;
+
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const pool = try allocator.create(StaticPool(Connection, limits.max_connections));
+    defer allocator.destroy(pool);
+    pool.initInPlace();
+
+    var rng = @import("rng.zig").Rng.init(0x99);
+    var sc = @import("clock.zig").SimClock.init(0);
+    var ctx: Context = .{ .clock = sc.clock(), .rng = &rng };
+
+    // Shared route TABLE — every tenant exposes the same "/" path.
+    var router: router_mod.Router = router_mod.Router.init();
+    try router.register(.get, "/", whoamiHandler, 0);
+    router.freeze();
+    var ws_router: WsUpgradeRouter = WsUpgradeRouter.init();
+    ws_router.freeze();
+
+    // Two isolated registries, each carrying the SAME plugin name with
+    // distinct per-tenant state.
+    var tag_a = TenantTag{ .label = "tenant-A-state" };
+    var tag_b = TenantTag{ .label = "tenant-B-state" };
+    var reg_a = Plugin.Registry.init();
+    var reg_b = Plugin.Registry.init();
+    _ = try reg_a.register(.{ .name = "whoami", .version = 1, .state = &tag_a, .init = pluginNop, .deinit = pluginNopDeinit });
+    _ = try reg_b.register(.{ .name = "whoami", .version = 1, .state = &tag_b, .init = pluginNop, .deinit = pluginNopDeinit });
+
+    var def_reg = Plugin.Registry.init();
+    var set = Plugin.RegistrySet.init(&def_reg);
+    try set.bind("tenant-a", &reg_a);
+    try set.bind("tenant-b", &reg_b);
+
+    // Tenancy table maps hosts → tenant ids the registry set keys on.
+    tenancy_mod.setGlobalTable(.{});
+    try tenancy_mod.globalTable().add("a.example", "tenant-a");
+    try tenancy_mod.globalTable().add("b.example", "tenant-b");
+    defer tenancy_mod.setGlobalTable(.{});
+
+    var server = try makeServer(io, &ctx, &router, &ws_router, pool);
+    server.registry_set = &set;
+    defer server.deinit();
+
+    const port = listeningPort(&server);
+    var shared: VhostShared = .{ .server = &server, .port = port };
+    const srv_t = try std.Thread.spawn(.{}, vhostServerRunThread, .{&server});
+    const cli_t = try std.Thread.spawn(.{}, vhostClientThread, .{&shared});
+
+    var waited_ns: u64 = 0;
+    const deadline_ns: u64 = 3 * std.time.ns_per_s;
+    while (!shared.done.load(.acquire) and waited_ns < deadline_ns) {
+        var ts: std.c.timespec = .{ .sec = 0, .nsec = 1 * std.time.ns_per_ms };
+        _ = std.c.nanosleep(&ts, &ts);
+        waited_ns += 1 * std.time.ns_per_ms;
+    }
+
+    server.requestShutdown();
+    pokeListener(port);
+    cli_t.join();
+    srv_t.join();
+
+    try std_testing.expect(shared.done.load(.acquire));
+
+    const def_body = shared.default_buf[0..shared.default_len.load(.acquire)];
+    const a_body = shared.a_buf[0..shared.a_len.load(.acquire)];
+    const b_body = shared.b_buf[0..shared.b_len.load(.acquire)];
+
+    // Default tenant: unbound host falls through to the default registry,
+    // which has no plugin → handler reports "default". Default path
+    // unaffected by the per-tenant machinery.
+    try std_testing.expect(std.mem.indexOf(u8, def_body, "default") != null);
+
+    // Each vhost observes ONLY its own plugin state.
+    try std_testing.expect(std.mem.indexOf(u8, a_body, "tenant-A-state") != null);
+    try std_testing.expect(std.mem.indexOf(u8, a_body, "tenant-B-state") == null);
+    try std_testing.expect(std.mem.indexOf(u8, b_body, "tenant-B-state") != null);
+    try std_testing.expect(std.mem.indexOf(u8, b_body, "tenant-A-state") == null);
 }

@@ -67,6 +67,19 @@ pub const conn_write_buffer_bytes: usize = 16 * 1024;
 /// recompile.
 pub const max_plugins: u32 = 16;
 
+/// C2 / H1: maximum number of per-tenant plugin registries the
+/// `RegistrySet` can hold simultaneously (the isolated vhosts). The
+/// default tenant ("") never consumes a slot — it always maps to the
+/// shared default registry. Bounded + linear-scanned, matching the
+/// tenancy table (`tenancy.max_tenants`). Bumping this is a recompile.
+pub const max_tenant_registries: u32 = 16;
+
+/// C2 / H1: maximum length of a tenant id used as a `RegistrySet` key.
+/// Mirrors `tenancy.max_id_bytes` so any id the tenancy table can hold
+/// also fits a registry binding. Declared here (not imported from
+/// tenancy) to keep `plugin.zig` free of a tenancy dependency.
+pub const max_id_bytes_for_registry: usize = 32;
+
 /// Maximum number of HTTP routes registered across all plugins.
 pub const max_routes: u32 = 256;
 
