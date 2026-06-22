@@ -1,14 +1,12 @@
 # Feature Status — speedy-socials
 
-> **2026-06-15 reconciliation:** the authoritative, code-verified
-> ticket status lives at the top of
-> [`SPEC_PUNCHLIST.md`](SPEC_PUNCHLIST.md). Measured baseline: **811
-> unit tests pass**, **5 simulation scenarios pass**. This file tracks
-> *shipped features*; treat the "Recently shipped" lists below as
-> historical — some items listed as done were later found PARTIAL
-> (notably AT account lifecycle is **in-memory only**, OAuth/DPoP
-> binding is incomplete). The "Open work" section near the bottom
-> remains broadly accurate.
+> **2026-06-22 reconciliation:** the single forward "what to do next" list is now
+> [`ROADMAP.md`](ROADMAP.md); spec-ticket status lives in
+> [`SPEC_PUNCHLIST.md`](SPEC_PUNCHLIST.md). This file is now **shipped-feature history**.
+> Correction: the earlier caveat that "AT account lifecycle is in-memory only / OAuth-DPoP
+> incomplete" is **no longer true** — account lifecycle is SQL-backed and OAuth 2.1 + DPoP
+> (Ed25519 **and** ES256) are implemented (code-verified). The "Open work" section below is
+> superseded by [`ROADMAP.md`](ROADMAP.md).
 
 
 _Last updated: 2026-05-19 (post-W6: bridge actually writes — AP→AT commits real records, AT→AP enqueues real outbox rows). Reflects the Tiger-Style

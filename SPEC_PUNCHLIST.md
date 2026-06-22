@@ -9,6 +9,15 @@ Companion docs:
 - [`PUNCHLIST.md`](PUNCHLIST.md) — operational work (TLS, ops,
   bridge correctness).
 - [`docs/design/translation-matrix.md`](docs/design/translation-matrix.md) — per-activity bridge coverage.
+- [`ROADMAP.md`](ROADMAP.md) — **the single forward "what to do next" list.**
+
+> **2026-06-22:** a code-verified reconciliation confirmed the spec sweep below is
+> **substantially accurate** (the AP/AT/DUAL surfaces are real and tested). A handful of
+> tickets are `[x]` but strictly **partial** — interop polish, not core gaps: AT canonical
+> DAG-CBOR re-encode (AT-4), AT P-256 `did:key` roundtrip (AT-25), AP Multikey *advertise*
+> (AP-15), AP `cc`/`bcc`/`as:Public` recipient resolution (AP-3), AT `deleteSession`,
+> firehose `#handle`/`#migrate`/`#info`. These are tracked as open work in
+> [`ROADMAP.md`](ROADMAP.md) — go there for what's next.
 
 _Last refreshed: 2026-06-15 (code-verified reconciliation — see below)._
 

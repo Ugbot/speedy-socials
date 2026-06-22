@@ -1,5 +1,14 @@
 # Protocol Conformance Audit
 
+> ⚠️ **STALE SNAPSHOT (2026-05-19) — superseded by [`ROADMAP.md`](ROADMAP.md).**
+> A 2026-06-22 code-verified reconciliation found this audit predates most of the
+> implementation: many rows marked ❌/⚠️ below are now **done in code** (AP C2S outbox
+> POST, AP signature `Digest`/`created`/`expires`/replay verification, AT OAuth 2.1 +
+> DPoP incl. ES256, AT account lifecycle, CIDv1 blobs, full commit shape, 60+ XRPC
+> routes). **Do not trust the per-row ❌/⚠️ columns without checking [`ROADMAP.md`](ROADMAP.md)
+> or the code.** Kept only for the spec-matrix structure; the executive verdict below
+> has been corrected to current reality.
+
 **Date**: 2026-05-19 (full rewrite — supersedes the 2026-03-17 audit,
 which referenced files removed by the Tiger-Style restructure).
 **Scope**: ActivityPub (W3C REC + Mastodon extensions + FEPs) and
@@ -18,15 +27,17 @@ criteria.
 
 ---
 
-## Executive verdict
+## Executive verdict (corrected 2026-06-22 against code)
 
 | Posture                                          | Status |
 |---|---|
-| AP receiver / S2S federation peer (Mastodon-style) | ✅ production-shaped, with documented gaps |
-| AP independent server (clients post via AP C2S)    | ❌ not viable — no C2S outbox POST |
-| AT PDS for self-hosted accounts (legacy JWT auth)  | ⚠️ usable — repo + firehose work; OAuth missing |
-| AT participant on the live Bluesky network          | ❌ not viable — no `requestCrawl`, no full event stream, no OAuth, no account lifecycle |
+| AP receiver / S2S federation peer (Mastodon-style) | ✅ production-shaped; remaining: full `cc`/`bcc`+`as:Public` recipient resolution, a few FEPs |
+| AP independent server (clients post via AP C2S)    | ✅ viable — `POST /users/:u/outbox` returns 201+Location (`activitypub/routes.zig:993-1043`) |
+| AT PDS for self-hosted accounts                    | ✅ usable — repo + firehose + SQL-backed account lifecycle + OAuth 2.1/DPoP (Ed25519 **and** ES256) all present |
+| AT participant on the live Bluesky network          | ⚠️ close — `requestCrawl`, firehose, OAuth, account lifecycle all DONE; remaining: canonical DAG-CBOR re-encode, external-relay subscription, DNS-TXT/PLC HTTP resolution wiring |
 | AP↔AT bridge / relay                                | ✅ shipped (W6 + B + A1) — see [`docs/adr/002-protocol-relay.md`](docs/adr/002-protocol-relay.md) |
+
+_The detailed per-section ❌/⚠️ matrix below is the stale 2026-05-19 snapshot; see [`ROADMAP.md`](ROADMAP.md) for the reconciled open-work list._
 
 **Bottom line.** The core primitives are good — both protocols have
 real crypto, real storage, real signing, real firehose. The

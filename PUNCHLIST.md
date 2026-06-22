@@ -17,6 +17,18 @@ DUAL-1..DUAL-5), with the underlying audit in
 
 _Last refreshed: 2026-06-15 (code-verified reconciliation)._
 
+> **2026-06-22 reconciliation → see [`ROADMAP.md`](ROADMAP.md) for the single open list.**
+> A code sweep found several items below marked open/partial are in fact **DONE**:
+> **C3** per-socket connect/read timeouts (`tls/native_outbound.zig:204,275`), **E3**
+> Chrome tracing — `-Dtrace` flag + handler spans wired (`core/trace.zig`, `server.zig:474`),
+> **F2** `/readyz` TLS cert-expiry probe (`core/cert_probe.zig`), **A2** synthetic-DID key
+> publication (`relay/routes.zig:306-365`), WSS frames-through-TLS (`server.zig:68-91`),
+> **DUAL-4** AT→AP DID doc with verificationMethod+service. Genuinely still open:
+> **H1** (per-vhost plugin isolation — registry is global), **H3** (tenant lifecycle
+> routes), **C2** multi-SNI + **C5** cert pinning (upstream-Zig-blocked), **D3**
+> multi-level firehose storage, **I2/I3** profile-mutation bridge, **J3** long-replay test,
+> **J5** real-Mastodon e2e. All carried into [`ROADMAP.md`](ROADMAP.md).
+
 ## 2026-06-16 reconciliation (current)
 
 Spec conformance is **complete**: all AP/AT/DUAL/INFRA tickets in
