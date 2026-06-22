@@ -35,6 +35,15 @@ integration, and net-new capability (zorm MS SQL + features)** — not core gaps
 
 ---
 
+## ✅ Shipped 2026-06-23 — Wave 1 (on `main`, 1053 tests green)
+Firehose `#handle`/`#migrate`/`#info` (AT1) · P-256 did:key + ES256 DPoP + DPoP-Nonce (AT3)
+· DNS-TXT handle resolution (AT4) · AP routes cluster — Multikey advertise, liked
+actor-scoping, per-object replies, poll tally, emoji reactions, FEDERATION.md (AP1) ·
+NodeInfo `atproto` protocol (AP3) · zorm typed constraint errors (Z1) · zorm per-dialect
+identifier quoting (Z2). The corresponding bullets below are now done.
+
+---
+
 # Track 1 — Run the node correctly (the original AP/AT target)
 
 ## P0 — Federation correctness (do first; these are interop *hazards*)
