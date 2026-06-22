@@ -19,7 +19,14 @@ const HandlerContext = core.http.router.HandlerContext;
 const Router = core.http.router.Router;
 const Method = core.http.request.Method;
 const Status = core.http.response.Status;
+const response_stream = core.http.response_stream;
 const limits = core.limits;
+
+/// Bounded chunk buffer for streaming filesystem blobs out as HTTP/1.1
+/// chunked transfer encoding. Tiger Style: a single fixed-size read window
+/// — no per-request heap, no full-file buffer. The whole blob is moved
+/// through this 64 KiB window regardless of its size on disk.
+const blob_stream_chunk_bytes: usize = 64 * 1024;
 
 const state = @import("state.zig");
 const multipart = @import("multipart.zig");
@@ -349,25 +356,28 @@ fn getBlob(hc: *HandlerContext) anyerror!void {
     const mime = if (mime_len > 0) mime_buf[0..mime_len] else "application/octet-stream";
 
     if (fs_path_len > 0) {
-        // Filesystem spillover (W5.5). The `fs:<cid>` marker in the
-        // db row points at `<media_root>/<cid>` on disk. Read the
-        // file into a bounded stack buffer and emit as a single
-        // response body. Cap at 4 MiB — anything larger should use
-        // a separate streamed-response path (TODO: chunked transfer
-        // encoding on the response builder).
-        const fs_blob_max_bytes: usize = 4 * 1024 * 1024;
-        var blob_buf: [fs_blob_max_bytes]u8 = undefined;
+        // Filesystem spillover (W5.5). The `fs:<cid>` marker in the db row
+        // points at `<media_root>/<cid>` on disk. These blobs are, by
+        // construction, larger than `media_inline_threshold_bytes` (1 MiB)
+        // — bigger than the fixed `conn.write_buf` — so they cannot be
+        // buffered into a single `Builder` body. Stream them out as
+        // HTTP/1.1 chunked transfer encoding through the socket sink,
+        // moving the file through a bounded 64 KiB window. No full-file
+        // buffer, no heap.
+        const sink = hc.sink orelse return writeError(hc, .internal, "InternalError", "no response sink");
         const path = fs_path_buf[0..fs_path_len];
-        const n = readBlobFileInto(st.media_root, path, &blob_buf) catch {
-            return writeError(hc, .internal, "InternalError", "blob fs read failed");
+        streamBlobFileChunked(sink, st.media_root, path, mime) catch {
+            // The handler may have already pushed the chunked head and
+            // some frames before the read failed mid-file; mark the
+            // response streamed so the server tears the connection down
+            // (truncated body) rather than emitting a fresh 500 that would
+            // corrupt the framing. If nothing has been written yet this
+            // still yields a closed connection, which clients treat as a
+            // failed transfer.
+            hc.streamed = true;
+            return;
         };
-        try hc.response.startStatus(.ok);
-        try hc.response.header("Content-Type", mime);
-        try hc.response.headerFmt("Content-Length", "{d}", .{n});
-        try hc.response.header("Cache-Control", "public, max-age=31536000, immutable");
-        try hc.response.header("Connection", "close");
-        try hc.response.finishHeaders();
-        try hc.response.body(blob_buf[0..n]);
+        hc.streamed = true;
         return;
     }
 
@@ -384,16 +394,7 @@ fn getBlob(hc: *HandlerContext) anyerror!void {
 /// read. Errors if the file is larger than `out.len`.
 fn readBlobFileInto(media_root: []const u8, cid: []const u8, out: []u8) !usize {
     var path_buf: [512]u8 = undefined;
-    if (media_root.len + 1 + cid.len + 1 > path_buf.len) return error.PayloadTooLarge;
-    var n: usize = 0;
-    @memcpy(path_buf[n..][0..media_root.len], media_root);
-    n += media_root.len;
-    path_buf[n] = '/';
-    n += 1;
-    @memcpy(path_buf[n..][0..cid.len], cid);
-    n += cid.len;
-    path_buf[n] = 0;
-    const path_z: [*:0]const u8 = @ptrCast(&path_buf);
+    const path_z = try blobFilePath(media_root, cid, &path_buf);
 
     const fd = std.c.open(path_z, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
     if (fd < 0) return error.StepFailed;
@@ -408,6 +409,69 @@ fn readBlobFileInto(media_root: []const u8, cid: []const u8, out: []u8) !usize {
         total += @intCast(got);
     }
     return total;
+}
+
+/// Build the on-disk path `<media_root>/<cid>` (NUL-terminated) into
+/// `path_buf`. Returns the C string pointer. Errors if it would overflow.
+fn blobFilePath(media_root: []const u8, cid: []const u8, path_buf: []u8) ![*:0]const u8 {
+    if (media_root.len + 1 + cid.len + 1 > path_buf.len) return error.PayloadTooLarge;
+    var n: usize = 0;
+    @memcpy(path_buf[n..][0..media_root.len], media_root);
+    n += media_root.len;
+    path_buf[n] = '/';
+    n += 1;
+    @memcpy(path_buf[n..][0..cid.len], cid);
+    n += cid.len;
+    path_buf[n] = 0;
+    return @ptrCast(path_buf.ptr);
+}
+
+/// Stream `<media_root>/<cid>` to `sink` as an HTTP/1.1 chunked-transfer
+/// response. The file is moved through a fixed 64 KiB window — no full
+/// buffer, no heap, regardless of file size. Each read becomes one chunk
+/// frame (`<hex-len>\r\n<bytes>\r\n`); a terminating zero-length chunk
+/// closes the body. Errors propagate (the caller tears the connection
+/// down); a partial write before the error truncates the transfer.
+fn streamBlobFileChunked(
+    sink: core.http.router.BodySink,
+    media_root: []const u8,
+    cid: []const u8,
+    mime: []const u8,
+) !void {
+    var path_buf: [512]u8 = undefined;
+    const path_z = try blobFilePath(media_root, cid, &path_buf);
+
+    const fd = std.c.open(path_z, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    if (fd < 0) return error.StepFailed;
+    defer _ = std.c.close(fd);
+
+    // Emit the response head (status + headers + blank line) first.
+    var head_buf: [256]u8 = undefined;
+    const head_len = try response_stream.writeChunkedHead(
+        &head_buf,
+        .ok,
+        mime,
+        "public, max-age=31536000, immutable",
+    );
+    try sink.writeAll(head_buf[0..head_len]);
+
+    // The frame buffer holds one 64 KiB read plus chunked framing overhead
+    // (hex length + CRLFs). `writeChunkFrame` requires payload + 16 + 4.
+    var read_buf: [blob_stream_chunk_bytes]u8 = undefined;
+    var frame_buf: [blob_stream_chunk_bytes + 32]u8 = undefined;
+    while (true) {
+        const got = std.c.read(fd, &read_buf, read_buf.len);
+        if (got < 0) return error.StepFailed;
+        if (got == 0) break;
+        const n: usize = @intCast(got);
+        const frame_len = try response_stream.writeChunkFrame(&frame_buf, read_buf[0..n]);
+        try sink.writeAll(frame_buf[0..frame_len]);
+    }
+
+    // Terminating zero-length chunk ends the body.
+    var end_buf: [8]u8 = undefined;
+    const end_len = try response_stream.writeChunkedEnd(&end_buf);
+    try sink.writeAll(end_buf[0..end_len]);
 }
 
 // ── data shapes ────────────────────────────────────────────────────
@@ -841,6 +905,106 @@ test "storeBlobAt: oversize payload spills to media_root and reads back" {
     try std.testing.expectEqualSlices(u8, big, echo[0..got]);
 
     // Cleanup: unlink the blob + rmdir.
+    var path_buf: [512]u8 = undefined;
+    const path_n = std.fmt.bufPrintZ(&path_buf, "{s}/{s}", .{ dir_path, cid }) catch unreachable;
+    _ = std.c.unlink(path_n.ptr);
+    _ = std.c.rmdir(dir_path);
+}
+
+// Capturing BodySink for tests: appends every write into a fixed buffer
+// so we can inspect the full chunked response a handler emits. Sized for
+// the test blob plus chunked framing overhead; overflow fails the write.
+const CaptureSink = struct {
+    buf: [512 * 1024]u8 = undefined,
+    len: usize = 0,
+
+    fn writeAll(ptr: *anyopaque, bytes: []const u8) core.http.router.BodySink.Error!void {
+        const self: *CaptureSink = @ptrCast(@alignCast(ptr));
+        if (self.len + bytes.len > self.buf.len) return error.WriteFailed;
+        @memcpy(self.buf[self.len..][0..bytes.len], bytes);
+        self.len += bytes.len;
+    }
+
+    fn sink(self: *CaptureSink) core.http.router.BodySink {
+        return .{ .ctx = self, .writeAllFn = CaptureSink.writeAll };
+    }
+
+    fn wire(self: *const CaptureSink) []const u8 {
+        return self.buf[0..self.len];
+    }
+};
+
+// Decode an HTTP/1.1 chunked transfer body (the part after the head's
+// blank line) into `out`. Returns the decoded byte count.
+fn dechunk(body: []const u8, out: []u8) !usize {
+    var i: usize = 0;
+    var w: usize = 0;
+    while (i < body.len) {
+        // Parse the hex chunk-size line.
+        const line_end = std.mem.indexOfPos(u8, body, i, "\r\n") orelse return error.BadChunk;
+        const size = try std.fmt.parseInt(usize, body[i..line_end], 16);
+        i = line_end + 2;
+        if (size == 0) break; // terminator
+        if (i + size + 2 > body.len) return error.BadChunk;
+        if (w + size > out.len) return error.BadChunk;
+        @memcpy(out[w .. w + size], body[i .. i + size]);
+        w += size;
+        i += size;
+        // Trailing CRLF after the chunk data.
+        if (body[i] != '\r' or body[i + 1] != '\n') return error.BadChunk;
+        i += 2;
+    }
+    return w;
+}
+
+test "streamBlobFileChunked: large blob round-trips through chunked encoding" {
+    const dir_path = "./_test_media_chunked";
+    _ = std.c.mkdir(dir_path, @as(std.c.mode_t, 0o755));
+
+    // A blob deliberately larger than the 64 KiB streaming window, with a
+    // non-multiple size so the final chunk is partial. Bytes are random
+    // (seeded off the wall clock so runs differ) — not a hardcoded pattern.
+    const blob_len = blob_stream_chunk_bytes * 2 + 7_777;
+    const src = try std.testing.allocator.alloc(u8, blob_len);
+    defer std.testing.allocator.free(src);
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(std.c.CLOCK.REALTIME, &ts);
+    const seed: u64 = @bitCast(@as(i64, ts.sec) *% 1_000_000_000 +% @as(i64, ts.nsec));
+    var prng = std.Random.DefaultPrng.init(seed);
+    prng.random().bytes(src);
+
+    var cid_buf: [64]u8 = undefined;
+    const cid = blobCid(src, &cid_buf);
+    try writeBlobFile(dir_path, cid, src);
+
+    // Stream it out through a capturing sink. Heap-box the sink so the
+    // 512 KiB capture buffer doesn't blow the test's stack frame.
+    const cap = try std.testing.allocator.create(CaptureSink);
+    defer std.testing.allocator.destroy(cap);
+    cap.* = .{};
+    try streamBlobFileChunked(cap.sink(), dir_path, cid, "image/png");
+
+    const wire = cap.wire();
+
+    // Head: status, chunked encoding, content-type, immutable cache.
+    const head_end = std.mem.indexOf(u8, wire, "\r\n\r\n").? + 4;
+    const head = wire[0..head_end];
+    try std.testing.expect(std.mem.startsWith(u8, head, "HTTP/1.1 200 OK\r\n"));
+    try std.testing.expect(std.mem.indexOf(u8, head, "Transfer-Encoding: chunked\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, head, "Content-Type: image/png\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, head, "Cache-Control: public, max-age=31536000, immutable\r\n") != null);
+
+    // Body: dechunk and compare byte-for-byte with the source blob.
+    const decoded = try std.testing.allocator.alloc(u8, blob_len);
+    defer std.testing.allocator.free(decoded);
+    const n = try dechunk(wire[head_end..], decoded);
+    try std.testing.expectEqual(blob_len, n);
+    try std.testing.expectEqualSlices(u8, src, decoded[0..n]);
+
+    // The wire must end with the terminating zero-length chunk.
+    try std.testing.expect(std.mem.endsWith(u8, wire, "0\r\n\r\n"));
+
+    // Cleanup.
     var path_buf: [512]u8 = undefined;
     const path_n = std.fmt.bufPrintZ(&path_buf, "{s}/{s}", .{ dir_path, cid }) catch unreachable;
     _ = std.c.unlink(path_n.ptr);

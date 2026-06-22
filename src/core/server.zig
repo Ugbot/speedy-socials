@@ -403,6 +403,11 @@ pub const Server = struct {
         const match = self.router.matchOrCode(request.method, path_query.path, &params);
 
         var rb = response.Builder.init(&conn.write_buf);
+        // Set true when the matched handler wrote the full response
+        // directly through its socket sink (streamed / chunked body). In
+        // that case the normal single-shot flush of `rb.bytes()` below is
+        // skipped — the response is already on the wire.
+        var streamed = false;
 
         // H3: multi-tenant lifecycle. Resolve the Host header to a tenant
         // (also stamps the thread-local current tenant for plugins).
@@ -461,11 +466,17 @@ pub const Server = struct {
                         }
                     }
                 }
+                // Bind a raw socket sink so handlers can stream bodies
+                // larger than `conn.write_buf` (e.g. large media blobs via
+                // chunked transfer encoding) directly to the wire instead
+                // of buffering the whole response.
+                var sink_ctx = SinkCtx{ .tls = self.cfg.tls, .stream = stream, .io = self.io };
                 var hc = router_mod.HandlerContext{
                     .plugin_ctx = self.ctx,
                     .request = request,
                     .response = &rb,
                     .params = params,
+                    .sink = .{ .ctx = &sink_ctx, .writeAllFn = SinkCtx.writeAll },
                 };
                 // E1: time the handler and observe into the global
                 // request-latency histogram via posix CLOCK_MONOTONIC
@@ -478,8 +489,15 @@ pub const Server = struct {
                     // G6: opaque body to the client; the real error name
                     // goes to the ring log so operators can investigate.
                     std.log.warn("handler returned error: {s}", .{@errorName(err)});
-                    rb = response.Builder.init(&conn.write_buf);
-                    try rb.simple(.internal, "text/plain", "internal error");
+                    // If the handler already streamed (part of) the
+                    // response directly to the socket, we cannot un-send
+                    // those bytes — emitting a fresh 500 would corrupt the
+                    // framing. The truncated stream is the failure signal
+                    // to the client; the connection is torn down below.
+                    if (!hc.streamed) {
+                        rb = response.Builder.init(&conn.write_buf);
+                        try rb.simple(.internal, "text/plain", "internal error");
+                    }
                 };
                 trace_mod.end(span);
                 const t1_ns = monotonicNow();
@@ -505,6 +523,7 @@ pub const Server = struct {
                         .{ .k = "dur_ms", .v = dur_ms },
                     });
                 }
+                streamed = hc.streamed;
             },
             .not_found => try rb.simple(.not_found, "text/plain", "not found"),
             .method_not_allowed => try rb.simple(.method_not_allowed, "text/plain", "method not allowed"),
@@ -523,7 +542,12 @@ pub const Server = struct {
         // this write; we do not rewrite the headers (the client only
         // needs to honor the actual Connection header it sees).
         _ = force_close;
-        try writeRawTls(self.cfg.tls, stream, self.io, rb.bytes());
+        // A streamed handler already pushed the entire response (head +
+        // chunked body + terminator) to the socket via its sink, so there
+        // is nothing left to flush.
+        if (!streamed) {
+            try writeRawTls(self.cfg.tls, stream, self.io, rb.bytes());
+        }
     }
 };
 
@@ -572,6 +596,22 @@ fn writeRaw(stream: net.Stream, io: Io, payload: []const u8) !void {
     writer.interface.writeAll(payload) catch return error.WriteFailed;
     writer.interface.flush() catch return error.WriteFailed;
 }
+
+/// Per-dispatch socket sink handed to handlers via `HandlerContext.sink`.
+/// Lets a handler stream a response body (e.g. chunked transfer encoding
+/// for a large media blob) straight to the wire, in bounded write() calls,
+/// without buffering the whole thing in `conn.write_buf`. TLS-aware: routes
+/// through the active backend when it intercepts the data plane.
+const SinkCtx = struct {
+    tls: ?TlsBackend,
+    stream: net.Stream,
+    io: Io,
+
+    fn writeAll(ptr: *anyopaque, bytes: []const u8) router_mod.BodySink.Error!void {
+        const self: *SinkCtx = @ptrCast(@alignCast(ptr));
+        writeRawTls(self.tls, self.stream, self.io, bytes) catch return error.WriteFailed;
+    }
+};
 
 /// TLS-aware write helpers (W3.1). When the server has a TLS backend
 /// that intercepts the data plane, every write must go through it;

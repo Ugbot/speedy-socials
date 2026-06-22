@@ -80,17 +80,32 @@ pub fn ChunkRing(comptime capacity: u32) type {
 /// Write the HTTP response head with Transfer-Encoding: chunked. After
 /// this, the producer writes body chunks via the ChunkRing and the I/O
 /// layer emits them as proper chunked frames.
+///
+/// `cache_control`, when non-null, is emitted verbatim as the value of a
+/// `Cache-Control` header — handy for immutable, content-addressed bodies
+/// (e.g. media blobs keyed by CID) that should be cached aggressively.
 pub fn writeChunkedHead(
     buffer: []u8,
     status: Status,
     content_type: []const u8,
+    cache_control: ?[]const u8,
 ) HttpError!usize {
-    const written = std.fmt.bufPrint(
-        buffer,
-        "HTTP/1.1 {d} {s}\r\nContent-Type: {s}\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+    var pos: usize = 0;
+    const head = std.fmt.bufPrint(
+        buffer[pos..],
+        "HTTP/1.1 {d} {s}\r\nContent-Type: {s}\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n",
         .{ @intFromEnum(status), status.reason(), content_type },
     ) catch return error.ResponseBufferFull;
-    return written.len;
+    pos += head.len;
+    if (cache_control) |cc| {
+        const cc_line = std.fmt.bufPrint(buffer[pos..], "Cache-Control: {s}\r\n", .{cc}) catch return error.ResponseBufferFull;
+        pos += cc_line.len;
+    }
+    if (pos + 2 > buffer.len) return error.ResponseBufferFull;
+    buffer[pos] = '\r';
+    buffer[pos + 1] = '\n';
+    pos += 2;
+    return pos;
 }
 
 /// Format one chunk frame (`<hex-size>\r\n<bytes>\r\n`) into `out`.
@@ -116,9 +131,19 @@ pub fn writeChunkedEnd(out: []u8) HttpError!usize {
 
 test "writeChunkedHead format" {
     var buf: [256]u8 = undefined;
-    const n = try writeChunkedHead(&buf, .ok, "application/json");
+    const n = try writeChunkedHead(&buf, .ok, "application/json", null);
     const s = buf[0..n];
     try std.testing.expect(std.mem.indexOf(u8, s, "Transfer-Encoding: chunked\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "Cache-Control") == null);
+    try std.testing.expect(std.mem.endsWith(u8, s, "\r\n\r\n"));
+}
+
+test "writeChunkedHead with cache-control" {
+    var buf: [256]u8 = undefined;
+    const n = try writeChunkedHead(&buf, .ok, "image/png", "public, max-age=31536000, immutable");
+    const s = buf[0..n];
+    try std.testing.expect(std.mem.indexOf(u8, s, "Transfer-Encoding: chunked\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "Cache-Control: public, max-age=31536000, immutable\r\n") != null);
     try std.testing.expect(std.mem.endsWith(u8, s, "\r\n\r\n"));
 }
 

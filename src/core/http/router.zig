@@ -44,11 +44,39 @@ pub const PathParams = struct {
     }
 };
 
+/// A raw, TLS-aware byte sink bound to the live response socket. Handlers
+/// that need to emit a body larger than the fixed `conn.write_buf` (e.g.
+/// large media blobs served via HTTP/1.1 chunked transfer encoding) write
+/// directly through this instead of buffering the whole response.
+///
+/// The sink is an opaque `ctx` + a `writeAll` fn pointer so the router has
+/// no dependency on the server's socket/TLS types. A handler that uses the
+/// sink to write a *complete* response (status line + headers + body) must
+/// set `HandlerContext.streamed = true` so the server skips its normal
+/// single-shot flush of `response.bytes()`.
+pub const BodySink = struct {
+    pub const Error = error{WriteFailed};
+
+    ctx: *anyopaque,
+    writeAllFn: *const fn (ctx: *anyopaque, bytes: []const u8) Error!void,
+
+    pub fn writeAll(self: BodySink, bytes: []const u8) Error!void {
+        return self.writeAllFn(self.ctx, bytes);
+    }
+};
+
 pub const HandlerContext = struct {
     plugin_ctx: *Context,
     request: *const Request,
     response: *Response.Builder,
     params: PathParams,
+    /// Direct socket sink for streamed responses. Present whenever the
+    /// server dispatches over a real connection; null in unit tests that
+    /// drive a handler with only a Builder.
+    sink: ?BodySink = null,
+    /// Set by a handler that has already written the full response through
+    /// `sink`. Tells the server not to flush `response.bytes()` afterward.
+    streamed: bool = false,
 };
 
 pub const Handler = *const fn (hc: *HandlerContext) anyerror!void;
