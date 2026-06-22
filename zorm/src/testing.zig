@@ -234,6 +234,23 @@ pub const MockBackend = struct {
         const tname = tableName(sql) orelse return Error.BadStatement;
         const where = whereClause(sql);
 
+        // Aggregate: `SELECT COUNT(*) FROM …` returns one row, one int column
+        // = number of WHERE-matching rows.
+        if (std.mem.eql(u8, proj, "COUNT(*)")) {
+            const t = self.table(tname);
+            var c: i64 = 0;
+            var i: usize = 0;
+            while (i < t.row_count) : (i += 1) {
+                if (!t.rows[i].present) continue;
+                if (rowMatches(&t.rows[i], where, args)) c += 1;
+            }
+            out.column_count = 1;
+            out.columns[0] = .{};
+            out.columns[0].kind = .int;
+            out.columns[0].int_val = c;
+            return true;
+        }
+
         const t = self.table(tname);
         var i: usize = 0;
         while (i < t.row_count) : (i += 1) {

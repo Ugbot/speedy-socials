@@ -70,6 +70,13 @@ pub fn Query(comptime T: type) type {
         has_where: bool = false,
         has_order: bool = false,
         offset_n: ?usize = null,
+        /// Connector for the NEXT predicate: when set, it joins with ` OR `
+        /// (consumed once); otherwise predicates join with ` AND `. Set by
+        /// `orWhere`/`orGroup`/`beginGroup(.or_)`.
+        next_or: bool = false,
+        /// When opening a group we suppress the inner connector for the first
+        /// predicate so the group reads `(<pred> …)` rather than `( AND <pred>`.
+        group_open: bool = false,
 
         pub fn init(dialect: Dialect) Self {
             var q = Self{ .dialect = dialect };
@@ -108,11 +115,31 @@ pub fn Query(comptime T: type) type {
             }
         }
 
-        /// Emit the ` WHERE `/` AND ` join + quoted column name, leaving the
-        /// caller to append the operator and (optional) placeholder.
-        fn whereColumn(self: *Self, comptime name: []const u8) void {
-            self.append(if (self.has_where) " AND " else " WHERE ");
+        /// Emit the leading connector for a new predicate: ` WHERE ` for the
+        /// first predicate in the statement, then ` AND ` (or ` OR ` if an
+        /// `orWhere`/`orGroup` armed `next_or`). Inside a freshly opened group
+        /// the first predicate gets no connector — the `(` already carried it.
+        fn connector(self: *Self) void {
+            if (self.group_open) {
+                // First predicate after `(` — the `(` already emitted its join.
+                self.group_open = false;
+                self.has_where = true;
+                self.next_or = false;
+                return;
+            }
+            if (!self.has_where) {
+                self.append(" WHERE ");
+            } else {
+                self.append(if (self.next_or) " OR " else " AND ");
+            }
             self.has_where = true;
+            self.next_or = false;
+        }
+
+        /// Emit the connector + quoted column name, leaving the caller to
+        /// append the operator and (optional) placeholder.
+        fn whereColumn(self: *Self, comptime name: []const u8) void {
+            self.connector();
             self.appendIdent(name);
         }
 
@@ -155,8 +182,7 @@ pub fn Query(comptime T: type) type {
         /// so the query is well-formed and returns no rows.
         pub fn whereIn(self: *Self, comptime field: []const u8, values: []const BindValue) *Self {
             if (values.len == 0) {
-                self.append(if (self.has_where) " AND " else " WHERE ");
-                self.has_where = true;
+                self.connector();
                 self.append("1 = 0");
                 return self;
             }
@@ -182,6 +208,72 @@ pub fn Query(comptime T: type) type {
         pub fn whereNotNull(self: *Self, comptime field: []const u8) *Self {
             self.whereColumn(checkColumn(T, field));
             self.append(" IS NOT NULL");
+            return self;
+        }
+
+        /// `WHERE <field> BETWEEN <lo> AND <hi>` — inclusive range, both
+        /// bounds bound as parameters (2 binds, in `lo, hi` order).
+        pub fn whereBetween(self: *Self, comptime field: []const u8, lo: BindValue, hi: BindValue) *Self {
+            self.whereColumn(checkColumn(T, field));
+            self.append(" BETWEEN ");
+            self.appendPlaceholder();
+            self.bindArg(lo);
+            self.append(" AND ");
+            self.appendPlaceholder();
+            self.bindArg(hi);
+            return self;
+        }
+
+        // ── OR / grouping ────────────────────────────────────────────────
+        //
+        // Contract: predicates join with ` AND ` by default. `orWhere(...)`
+        // joins THIS predicate with ` OR ` instead (it arms a one-shot OR
+        // connector consumed by the next predicate). Grouping with explicit
+        // precedence is expressed by `beginGroup`/`endGroup`, which wrap the
+        // predicates added between them in parentheses; `orGroup` opens a
+        // group joined to what precedes it with ` OR `. So
+        //   q.whereInt("age", 18)
+        //    .orGroup().whereText("role","admin").whereInt("age",65).endGroup()
+        // builds: WHERE "age" = ? OR ("role" = ? AND "age" = ?) — i.e.
+        // `a OR (b AND c)`. Mixing is straightforward:
+        //   q.beginGroup().whereInt("age",18).orWhere("age",.gt,99).endGroup()
+        //    .whereText("role","admin")
+        // builds: WHERE ("age" = ? OR "age" > ?) AND "role" = ?.
+        // Groups must be balanced (one endGroup per beginGroup/orGroup);
+        // nesting is supported. An empty group is invalid (emits `()`), so a
+        // group must contain at least one predicate.
+
+        /// Join the NEXT predicate with ` OR ` instead of ` AND `, then add it
+        /// as `<field> <op> <value>`. Equivalent to `orWhere` + `whereOp`.
+        pub fn orWhere(self: *Self, comptime field: []const u8, op: Op, value: BindValue) *Self {
+            self.next_or = true;
+            return self.whereOp(field, op, value);
+        }
+
+        /// Open a parenthesized group joined to the preceding predicate with
+        /// ` AND ` (or with the armed `next_or` connector). Predicates added
+        /// until the matching `endGroup` are wrapped in `( … )`.
+        pub fn beginGroup(self: *Self) *Self {
+            // Emit the connector, then `(`; suppress the inner connector for
+            // the group's first predicate.
+            self.connector();
+            self.append("(");
+            self.group_open = true;
+            // `connector()` set has_where; the `(` is now part of the WHERE, so
+            // the first inner predicate must NOT re-emit a connector.
+            return self;
+        }
+
+        /// Open a parenthesized group joined to the preceding predicate with
+        /// ` OR ` (precedence-correct `… OR ( … )`).
+        pub fn orGroup(self: *Self) *Self {
+            self.next_or = true;
+            return self.beginGroup();
+        }
+
+        /// Close the most recently opened group.
+        pub fn endGroup(self: *Self) *Self {
+            self.append(")");
             return self;
         }
 
@@ -278,6 +370,39 @@ pub fn Query(comptime T: type) type {
             return self.buf[0..self.len];
         }
 
+        /// Build `SELECT COUNT(*) FROM <table> <WHERE…>` into `buf`, reusing
+        /// the WHERE predicates already assembled on `self`. ORDER BY / LIMIT /
+        /// OFFSET are intentionally excluded — they don't affect a count. The
+        /// returned slice borrows `buf`, which the caller owns.
+        fn countSql(self: *const Self, buf: []u8) []const u8 {
+            // Re-derive the SELECT-all prefix length so we can slice off just
+            // the WHERE tail the builder appended after it.
+            const prefix = sql.selectAll(T, self.dialect);
+            const body = self.buf[0..self.len];
+            std.debug.assert(std.mem.startsWith(u8, body, prefix));
+            var tail = body[prefix.len..];
+            // Drop any trailing ORDER BY / LIMIT / OFFSET — a count ignores them.
+            for ([_][]const u8{ " ORDER BY ", " LIMIT ", " OFFSET " }) |kw| {
+                if (std.mem.indexOf(u8, tail, kw)) |i| tail = tail[0..i];
+            }
+            const table = switch (self.dialect) {
+                inline else => |d| comptime sql_mod_quoteTable(d),
+            };
+            var n: usize = 0;
+            const pieces = [_][]const u8{ "SELECT COUNT(*) FROM ", table, tail };
+            for (pieces) |p| {
+                std.debug.assert(n + p.len <= buf.len);
+                @memcpy(buf[n .. n + p.len], p);
+                n += p.len;
+            }
+            return buf[0..n];
+        }
+
+        /// The dialect-quoted table identifier (comptime per dialect).
+        fn sql_mod_quoteTable(comptime d: Dialect) []const u8 {
+            return comptime sql.quoteIdent(reflect.TableInfo(T).table, d);
+        }
+
         // ── terminals ───────────────────────────────────────────────────
 
         const Collector = struct {
@@ -308,6 +433,21 @@ pub fn Query(comptime T: type) type {
             if (!try backend.queryOne(self.statement(), self.args[0..self.arg_count], &row)) return false;
             bind.rowToEntity(T, &row, out);
             return true;
+        }
+
+        /// Run `SELECT COUNT(*) FROM <table> <WHERE…>` (reusing this query's
+        /// WHERE; ORDER BY/LIMIT/OFFSET are ignored) and return the scalar.
+        pub fn count(self: *Self, backend: Backend) Error!i64 {
+            var sql_buf: [sql_buf_len]u8 = undefined;
+            const stmt = self.countSql(&sql_buf);
+            var row: contract.Row = .{};
+            if (!try backend.queryOne(stmt, self.args[0..self.arg_count], &row)) return 0;
+            std.debug.assert(row.column_count >= 1);
+            return switch (row.columns[0].kind) {
+                .int => row.columns[0].int_val,
+                .real => @intFromFloat(row.columns[0].real_val),
+                else => 0,
+            };
         }
 
         const ManagedCollector = struct {
@@ -537,6 +677,94 @@ test "whereIn empty list emits the always-false 1 = 0 with no binds" {
     );
 }
 
+test "whereBetween emits BETWEEN with two bound placeholders (all dialects)" {
+    var qs = Query(Account).init(.sqlite);
+    _ = qs.whereBetween("age", .{ .int = 18 }, .{ .int = 65 });
+    try testing.expectEqualStrings(
+        sel_sqlite ++ " WHERE \"age\" BETWEEN ? AND ?",
+        qs.buf[0..qs.len],
+    );
+    try testing.expectEqual(@as(usize, 2), qs.arg_count);
+    try testing.expectEqual(@as(i64, 18), qs.args[0].int);
+    try testing.expectEqual(@as(i64, 65), qs.args[1].int);
+
+    var qp = Query(Account).init(.postgres);
+    _ = qp.whereBetween("age", .{ .int = 1 }, .{ .int = 9 });
+    try testing.expectEqualStrings(
+        sel_pg ++ " WHERE \"age\" BETWEEN $1 AND $2",
+        qp.buf[0..qp.len],
+    );
+
+    var qm = Query(Account).init(.mssql);
+    _ = qm.whereBetween("age", .{ .int = 1 }, .{ .int = 9 });
+    try testing.expectEqualStrings(
+        sel_mssql ++ " WHERE [age] BETWEEN @p1 AND @p2",
+        qm.buf[0..qm.len],
+    );
+
+    // Chains after a prior predicate with AND.
+    var qc = Query(Account).init(.postgres);
+    _ = qc.whereText("handle", "x").whereBetween("age", .{ .int = 1 }, .{ .int = 9 });
+    try testing.expectEqualStrings(
+        sel_pg ++ " WHERE \"handle\" = $1 AND \"age\" BETWEEN $2 AND $3",
+        qc.buf[0..qc.len],
+    );
+}
+
+test "orWhere joins the next predicate with OR" {
+    var q = Query(Account).init(.postgres);
+    _ = q.whereInt("age", 18).orWhere("age", .gt, .{ .int = 99 });
+    try testing.expectEqualStrings(
+        sel_pg ++ " WHERE \"age\" = $1 OR \"age\" > $2",
+        q.buf[0..q.len],
+    );
+    try testing.expectEqual(@as(usize, 2), q.arg_count);
+}
+
+test "beginGroup/endGroup wraps predicates: (a OR b) AND c" {
+    var q = Query(Account).init(.sqlite);
+    _ = q.beginGroup()
+        .whereInt("age", 18)
+        .orWhere("age", .gt, .{ .int = 99 })
+        .endGroup()
+        .whereText("handle", "admin");
+    try testing.expectEqualStrings(
+        sel_sqlite ++ " WHERE (\"age\" = ? OR \"age\" > ?) AND \"handle\" = ?",
+        q.buf[0..q.len],
+    );
+    try testing.expectEqual(@as(usize, 3), q.arg_count);
+}
+
+test "orGroup builds a OR (b AND c) with correct precedence" {
+    var q = Query(Account).init(.postgres);
+    _ = q.whereInt("age", 18)
+        .orGroup()
+        .whereEnum("role", Role.admin)
+        .whereInt("age", 65)
+        .endGroup();
+    try testing.expectEqualStrings(
+        sel_pg ++ " WHERE \"age\" = $1 OR (\"role\" = $2 AND \"age\" = $3)",
+        q.buf[0..q.len],
+    );
+    try testing.expectEqual(@as(usize, 3), q.arg_count);
+    try testing.expectEqualStrings("admin", q.args[1].text);
+}
+
+test "nested groups: (a AND (b OR c))" {
+    var q = Query(Account).init(.sqlite);
+    _ = q.beginGroup()
+        .whereInt("age", 18)
+        .beginGroup()
+        .whereText("handle", "a")
+        .orWhere("handle", .ne, .{ .text = "b" })
+        .endGroup()
+        .endGroup();
+    try testing.expectEqualStrings(
+        sel_sqlite ++ " WHERE (\"age\" = ? AND (\"handle\" = ? OR \"handle\" <> ?))",
+        q.buf[0..q.len],
+    );
+}
+
 test "whereNull / whereNotNull emit IS NULL / IS NOT NULL with no binds" {
     var q = Query(Account).init(.sqlite);
     _ = q.whereNull("handle").whereNotNull("age");
@@ -661,6 +889,59 @@ test "all() fills a bounded slice and matches the predicate" {
     try testing.expectEqual(@as(usize, 1), n);
     try testing.expectEqualStrings("b", out[0].handle.slice());
     try testing.expectEqual(@as(i64, 30), out[0].age);
+}
+
+test "countSql emits SELECT COUNT(*) and drops ORDER BY / LIMIT" {
+    var q = Query(Account).init(.postgres);
+    _ = q.whereText("handle", "a").whereInt("age", 30).orderBy("age", .desc).limit(5);
+    var buf: [256]u8 = undefined;
+    try testing.expectEqualStrings(
+        "SELECT COUNT(*) FROM \"atp_accounts\" WHERE \"handle\" = $1 AND \"age\" = $2",
+        q.countSql(&buf),
+    );
+
+    // No predicates → bare COUNT over the table.
+    var q2 = Query(Account).init(.mssql);
+    var buf2: [256]u8 = undefined;
+    try testing.expectEqualStrings(
+        "SELECT COUNT(*) FROM [atp_accounts]",
+        q2.countSql(&buf2),
+    );
+}
+
+test "count() returns the number of matching rows from the mock" {
+    var db = mock.MockBackend.init();
+    const backend = db.backend(.sqlite);
+
+    // Seed a randomized number of admins and members; assert count() matches.
+    var prng = std.Random.DefaultPrng.init(0xC0FFEE);
+    const rnd = prng.random();
+    const n_admin = rnd.intRangeAtMost(usize, 1, 5);
+    const n_member = rnd.intRangeAtMost(usize, 1, 5);
+
+    var idbuf: [16]u8 = undefined;
+    var i: usize = 0;
+    while (i < n_admin) : (i += 1) {
+        const id = std.fmt.bufPrint(&idbuf, "a{d}", .{i}) catch unreachable;
+        try seed(backend, id, "adm", .admin, 40);
+    }
+    var j: usize = 0;
+    while (j < n_member) : (j += 1) {
+        const id = std.fmt.bufPrint(&idbuf, "m{d}", .{j}) catch unreachable;
+        try seed(backend, id, "mem", .member, 20);
+    }
+
+    // Total rows.
+    var qall = Query(Account).init(.sqlite);
+    try testing.expectEqual(@as(i64, @intCast(n_admin + n_member)), try qall.count(backend));
+
+    // Filtered by role → only the admins.
+    var qadm = Query(Account).init(.sqlite);
+    try testing.expectEqual(@as(i64, @intCast(n_admin)), try qadm.whereEnum("role", Role.admin).count(backend));
+
+    // A predicate that matches nothing → 0.
+    var qnone = Query(Account).init(.sqlite);
+    try testing.expectEqual(@as(i64, 0), try qnone.whereText("handle", "nobody").count(backend));
 }
 
 test "first() returns false when no row matches" {
