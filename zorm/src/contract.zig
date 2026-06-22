@@ -21,6 +21,20 @@ pub const Error = error{
     StepFailed,
     BackendFailed,
     BufferTooSmall,
+    /// A UNIQUE (or PRIMARY KEY) constraint was violated — the row's key
+    /// already exists. Backends map their engine code here: SQLite
+    /// `SQLITE_CONSTRAINT_UNIQUE`/`_PRIMARYKEY`, Postgres SQLSTATE `23505`.
+    /// Distinct from `AlreadyExists`, which zorm raises for higher-level
+    /// "entity already present" cases that don't originate from the engine.
+    UniqueViolation,
+    /// A FOREIGN KEY constraint was violated — a referenced parent row is
+    /// missing, or a referenced child still exists on delete. Backends map
+    /// SQLite `SQLITE_CONSTRAINT_FOREIGNKEY`, Postgres SQLSTATE `23503`.
+    ForeignKeyViolation,
+    /// A NOT NULL constraint was violated — a required column received NULL.
+    /// Backends map SQLite `SQLITE_CONSTRAINT_NOTNULL`, Postgres SQLSTATE
+    /// `23502`.
+    NotNullViolation,
 };
 
 /// Which SQL dialect the active backend speaks. zorm generates

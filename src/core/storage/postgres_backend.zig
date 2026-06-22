@@ -68,6 +68,22 @@ pub const PostgresBackend = struct {
         if (tx_conn != conn) self.pool.release(conn);
     }
 
+    /// Refine a pg.zig failure into a typed constraint error by inspecting
+    /// the connection's last server error (SQLSTATE). pg.zig surfaces server
+    /// errors as `error.PG` and stashes the parsed `proto.Error` (with its
+    /// 5-char SQLSTATE `code`) on `conn.err`. The PostgreSQL class 23
+    /// integrity-constraint codes map as: `23505` unique_violation,
+    /// `23503` foreign_key_violation, `23502` not_null_violation. Anything
+    /// else (including a null/absent error) falls back to `fallback`.
+    fn classify(conn: *pg.Conn, fallback: Error) Error {
+        const pg_err = conn.err orelse return fallback;
+        const code = pg_err.code;
+        if (std.mem.eql(u8, code, "23505")) return error.UniqueViolation;
+        if (std.mem.eql(u8, code, "23503")) return error.ForeignKeyViolation;
+        if (std.mem.eql(u8, code, "23502")) return error.NotNullViolation;
+        return fallback;
+    }
+
     fn bindAll(stmt: *pg.Stmt, args: []const BindValue) Error!void {
         stmt.prepareForBind(@intCast(args.len)) catch return error.BadStatement;
         for (args) |a| {
@@ -88,9 +104,9 @@ pub const PostgresBackend = struct {
         var stmt = conn.prepare(sql) catch return error.BadStatement;
         defer stmt.deinit();
         try bindAll(&stmt, args);
-        var result = stmt.execute() catch return error.StepFailed;
+        var result = stmt.execute() catch return classify(conn, error.StepFailed);
         defer result.deinit();
-        result.drain() catch return error.StepFailed;
+        result.drain() catch return classify(conn, error.StepFailed);
     }
 
     fn doQuery(ptr: *anyopaque, sql: []const u8, args: []const BindValue, ctx: *anyopaque, cb: RowCallback) Error!void {
@@ -100,9 +116,9 @@ pub const PostgresBackend = struct {
         var stmt = conn.prepare(sql) catch return error.BadStatement;
         defer stmt.deinit();
         try bindAll(&stmt, args);
-        var result = stmt.execute() catch return error.StepFailed;
+        var result = stmt.execute() catch return classify(conn, error.StepFailed);
         defer result.deinit();
-        while (result.next() catch return error.StepFailed) |row| {
+        while (result.next() catch return classify(conn, error.StepFailed)) |row| {
             var out: Row = .{};
             readRow(&row, &out);
             if (!cb(ctx, &out)) return;
@@ -116,9 +132,9 @@ pub const PostgresBackend = struct {
         var stmt = conn.prepare(sql) catch return error.BadStatement;
         defer stmt.deinit();
         try bindAll(&stmt, args);
-        var result = stmt.execute() catch return error.StepFailed;
+        var result = stmt.execute() catch return classify(conn, error.StepFailed);
         defer result.deinit();
-        if (result.next() catch return error.StepFailed) |row| {
+        if (result.next() catch return classify(conn, error.StepFailed)) |row| {
             readRow(&row, out);
             result.drain() catch {};
             return true;

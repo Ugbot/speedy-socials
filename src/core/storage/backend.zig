@@ -29,6 +29,15 @@ pub const Error = error{
     StepFailed,
     BackendFailed,
     BufferTooSmall,
+    /// A UNIQUE / PRIMARY KEY constraint was violated. Mapped from SQLite
+    /// `SQLITE_CONSTRAINT_UNIQUE`/`_PRIMARYKEY` and Postgres SQLSTATE `23505`.
+    UniqueViolation,
+    /// A FOREIGN KEY constraint was violated. Mapped from SQLite
+    /// `SQLITE_CONSTRAINT_FOREIGNKEY` and Postgres SQLSTATE `23503`.
+    ForeignKeyViolation,
+    /// A NOT NULL constraint was violated. Mapped from SQLite
+    /// `SQLITE_CONSTRAINT_NOTNULL` and Postgres SQLSTATE `23502`.
+    NotNullViolation,
 };
 
 /// One bind argument. Mirrors the high-level value union from
@@ -196,13 +205,27 @@ pub const SqliteBackend = struct {
         }
     }
 
+    /// Translate a failed `sqlite3_step` into a typed constraint error.
+    /// Reads the *extended* result code (`sqlite3_extended_errcode`) so a
+    /// generic `SQLITE_CONSTRAINT` (19) is refined to the specific violated
+    /// constraint. Anything that is not a recognized constraint code falls
+    /// back to `error.StepFailed`.
+    fn stepError(self: *SqliteBackend) Error {
+        return switch (c.sqlite3_extended_errcode(self.db)) {
+            c.SQLITE_CONSTRAINT_UNIQUE, c.SQLITE_CONSTRAINT_PRIMARYKEY => error.UniqueViolation,
+            c.SQLITE_CONSTRAINT_FOREIGNKEY => error.ForeignKeyViolation,
+            c.SQLITE_CONSTRAINT_NOTNULL => error.NotNullViolation,
+            else => error.StepFailed,
+        };
+    }
+
     fn doExec(ptr: *anyopaque, sql: []const u8, args: []const BindValue) Error!void {
         const self: *SqliteBackend = @ptrCast(@alignCast(ptr));
         var stmt: ?*c.sqlite3_stmt = null;
         try self.prepareAndBind(sql, args, &stmt);
         defer _ = c.sqlite3_finalize(stmt);
         const rc = c.sqlite3_step(stmt.?);
-        if (rc != c.SQLITE_DONE) return error.StepFailed;
+        if (rc != c.SQLITE_DONE) return self.stepError();
     }
 
     fn doQuery(ptr: *anyopaque, sql: []const u8, args: []const BindValue, ctx: *anyopaque, cb: RowCallback) Error!void {
@@ -213,7 +236,7 @@ pub const SqliteBackend = struct {
         while (true) {
             const rc = c.sqlite3_step(stmt.?);
             if (rc == c.SQLITE_DONE) return;
-            if (rc != c.SQLITE_ROW) return error.StepFailed;
+            if (rc != c.SQLITE_ROW) return self.stepError();
             var row: Row = .{};
             readRow(stmt.?, &row);
             if (!cb(ctx, &row)) return;
@@ -230,7 +253,7 @@ pub const SqliteBackend = struct {
             out.column_count = 0;
             return false;
         }
-        if (rc != c.SQLITE_ROW) return error.StepFailed;
+        if (rc != c.SQLITE_ROW) return self.stepError();
         readRow(stmt.?, out);
         return true;
     }
@@ -400,6 +423,80 @@ test "Phase G: a non-SQLite backend satisfies the same vtable + global routing" 
     var row: Row = .{};
     try testing.expect(try g.queryOne("SELECT a FROM t", &.{}, &row));
     try testing.expectEqual(@as(i64, 7), row.columns[0].int_val);
+}
+
+test "Z1: SqliteBackend maps UNIQUE/PK violation to UniqueViolation" {
+    const db = try sqlite.openWriter(":memory:");
+    defer sqlite.closeDb(db);
+    var em: [*c]u8 = null;
+    _ = c.sqlite3_exec(db, "PRAGMA foreign_keys=ON", null, null, &em);
+    if (em != null) c.sqlite3_free(em);
+    _ = c.sqlite3_exec(db, "CREATE TABLE parent (id INTEGER PRIMARY KEY, name TEXT)", null, null, &em);
+    if (em != null) c.sqlite3_free(em);
+
+    var be = SqliteBackend.init(db);
+    const b = be.backend();
+
+    // Randomize the PK so the test never leans on a hardcoded happy path.
+    var prng = std.Random.DefaultPrng.init(std.testing.random_seed);
+    const rand = prng.random();
+    const pk: i64 = rand.intRangeAtMost(i64, 1, 1_000_000);
+
+    try b.exec("INSERT INTO parent (id, name) VALUES (?, ?)", &.{ .{ .int = pk }, .{ .text = "first" } });
+    // Re-inserting the same PRIMARY KEY → SQLITE_CONSTRAINT_PRIMARYKEY.
+    try testing.expectError(
+        error.UniqueViolation,
+        b.exec("INSERT INTO parent (id, name) VALUES (?, ?)", &.{ .{ .int = pk }, .{ .text = "dup" } }),
+    );
+}
+
+test "Z1: SqliteBackend maps FK violation to ForeignKeyViolation" {
+    const db = try sqlite.openWriter(":memory:");
+    defer sqlite.closeDb(db);
+    var em: [*c]u8 = null;
+    _ = c.sqlite3_exec(db, "PRAGMA foreign_keys=ON", null, null, &em);
+    if (em != null) c.sqlite3_free(em);
+    _ = c.sqlite3_exec(db, "CREATE TABLE parent (id INTEGER PRIMARY KEY)", null, null, &em);
+    if (em != null) c.sqlite3_free(em);
+    _ = c.sqlite3_exec(db, "CREATE TABLE child (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parent(id))", null, null, &em);
+    if (em != null) c.sqlite3_free(em);
+
+    var be = SqliteBackend.init(db);
+    const b = be.backend();
+
+    var prng = std.Random.DefaultPrng.init(std.testing.random_seed);
+    const rand = prng.random();
+    const missing_parent: i64 = rand.intRangeAtMost(i64, 1, 1_000_000);
+    const child_id: i64 = rand.intRangeAtMost(i64, 1, 1_000_000);
+
+    // No parent row exists with `missing_parent` → SQLITE_CONSTRAINT_FOREIGNKEY.
+    try testing.expectError(
+        error.ForeignKeyViolation,
+        b.exec("INSERT INTO child (id, parent_id) VALUES (?, ?)", &.{ .{ .int = child_id }, .{ .int = missing_parent } }),
+    );
+}
+
+test "Z1: SqliteBackend maps NOT NULL violation to NotNullViolation" {
+    const db = try sqlite.openWriter(":memory:");
+    defer sqlite.closeDb(db);
+    var em: [*c]u8 = null;
+    _ = c.sqlite3_exec(db, "PRAGMA foreign_keys=ON", null, null, &em);
+    if (em != null) c.sqlite3_free(em);
+    _ = c.sqlite3_exec(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, required TEXT NOT NULL)", null, null, &em);
+    if (em != null) c.sqlite3_free(em);
+
+    var be = SqliteBackend.init(db);
+    const b = be.backend();
+
+    var prng = std.Random.DefaultPrng.init(std.testing.random_seed);
+    const rand = prng.random();
+    const id: i64 = rand.intRangeAtMost(i64, 1, 1_000_000);
+
+    // NULL into a NOT NULL column → SQLITE_CONSTRAINT_NOTNULL.
+    try testing.expectError(
+        error.NotNullViolation,
+        b.exec("INSERT INTO t (id, required) VALUES (?, ?)", &.{ .{ .int = id }, .null_ }),
+    );
 }
 
 test "INFRA-1: SqliteBackend query streams rows" {

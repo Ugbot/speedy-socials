@@ -59,6 +59,9 @@ fn mapErr(e: storage.Error) zorm.Error {
         error.StepFailed => zorm.Error.StepFailed,
         error.BackendFailed => zorm.Error.BackendFailed,
         error.BufferTooSmall => zorm.Error.BufferTooSmall,
+        error.UniqueViolation => zorm.Error.UniqueViolation,
+        error.ForeignKeyViolation => zorm.Error.ForeignKeyViolation,
+        error.NotNullViolation => zorm.Error.NotNullViolation,
     };
 }
 
@@ -159,6 +162,44 @@ test "zorm_adapter: round-trips exec + queryOne through a real SqliteBackend" {
     try testing.expect(found);
     try testing.expectEqual(@as(i64, 7), row.columns[0].int_val);
     try testing.expectEqualStrings("hi", row.columns[1].bytes());
+}
+
+test "zorm_adapter: maps engine constraint violations to typed zorm errors" {
+    const db = try sqlite.openWriter(":memory:");
+    defer sqlite.closeDb(db);
+    var em: [*c]u8 = null;
+    _ = c.sqlite3_exec(db, "PRAGMA foreign_keys=ON", null, null, &em);
+    if (em != null) c.sqlite3_free(em);
+    _ = c.sqlite3_exec(db, "CREATE TABLE parent (id INTEGER PRIMARY KEY)", null, null, &em);
+    if (em != null) c.sqlite3_free(em);
+    _ = c.sqlite3_exec(db, "CREATE TABLE child (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parent(id), label TEXT NOT NULL)", null, null, &em);
+    if (em != null) c.sqlite3_free(em);
+
+    var be = SqliteBackend.init(db);
+    var adapter = Adapter.init(be.backend());
+    const zb = adapter.backend(.sqlite);
+
+    var prng = std.Random.DefaultPrng.init(std.testing.random_seed);
+    const rand = prng.random();
+    const pid: i64 = rand.intRangeAtMost(i64, 1, 1_000_000);
+
+    try zb.exec("INSERT INTO parent (id) VALUES (?)", &.{.{ .int = pid }});
+
+    // UNIQUE / PRIMARY KEY → zorm.Error.UniqueViolation
+    try testing.expectError(
+        zorm.Error.UniqueViolation,
+        zb.exec("INSERT INTO parent (id) VALUES (?)", &.{.{ .int = pid }}),
+    );
+    // FOREIGN KEY → zorm.Error.ForeignKeyViolation (missing parent)
+    try testing.expectError(
+        zorm.Error.ForeignKeyViolation,
+        zb.exec("INSERT INTO child (id, parent_id, label) VALUES (?, ?, ?)", &.{ .{ .int = 1 }, .{ .int = pid + 1 }, .{ .text = "x" } }),
+    );
+    // NOT NULL → zorm.Error.NotNullViolation
+    try testing.expectError(
+        zorm.Error.NotNullViolation,
+        zb.exec("INSERT INTO child (id, parent_id, label) VALUES (?, ?, ?)", &.{ .{ .int = 2 }, .{ .int = pid }, .null_ }),
+    );
 }
 
 test "zorm_adapter: query streams rows + transaction rolls back on error" {
