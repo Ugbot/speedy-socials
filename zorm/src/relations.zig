@@ -315,32 +315,35 @@ test "foreignKeys: BelongsTo yields an FkSpec; HasMany/HasOne do not" {
 }
 
 test "createTable emits the FOREIGN KEY clause for every dialect" {
-    inline for (.{ .sqlite, .postgres, .mysql }) |d| {
-        const sql = ddl.createTable(Post, d);
-        try testing.expect(std.mem.indexOf(u8, sql, "FOREIGN KEY (author_id) REFERENCES users (id) ON DELETE CASCADE") != null);
-    }
+    // Identifiers are quoted per dialect (sqlite/postgres → "..", mysql → `..`).
+    try testing.expect(std.mem.indexOf(u8, ddl.createTable(Post, .sqlite), "FOREIGN KEY (\"author_id\") REFERENCES \"users\" (\"id\") ON DELETE CASCADE") != null);
+    try testing.expect(std.mem.indexOf(u8, ddl.createTable(Post, .postgres), "FOREIGN KEY (\"author_id\") REFERENCES \"users\" (\"id\") ON DELETE CASCADE") != null);
+    try testing.expect(std.mem.indexOf(u8, ddl.createTable(Post, .mysql), "FOREIGN KEY (`author_id`) REFERENCES `users` (`id`) ON DELETE CASCADE") != null);
+    try testing.expect(std.mem.indexOf(u8, ddl.createTable(Post, .mssql), "FOREIGN KEY ([author_id]) REFERENCES [users] ([id]) ON DELETE CASCADE") != null);
 }
 
 test "createIndex + foreignKeyIndexes" {
     try testing.expectEqualStrings(
-        "CREATE INDEX IF NOT EXISTS ix_posts_author_id ON posts (author_id)",
+        "CREATE INDEX IF NOT EXISTS \"ix_posts_author_id\" ON \"posts\" (\"author_id\")",
         ddl.createIndex(Post, &.{"author_id"}, false, .sqlite),
     );
     try testing.expectEqualStrings(
-        "CREATE UNIQUE INDEX IF NOT EXISTS ix_profiles_user_id ON profiles (user_id)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS \"ix_profiles_user_id\" ON \"profiles\" (\"user_id\")",
         ddl.createIndex(Profile, &.{"user_id"}, true, .sqlite),
     );
-    // T-SQL has no IF NOT EXISTS — guarded via sys.indexes.
+    // T-SQL has no IF NOT EXISTS — guarded via sys.indexes. The guard refers to
+    // the index + table as STRING LITERALS (unquoted); the CREATE INDEX / ON
+    // identifiers are bracket-quoted.
     try testing.expectEqualStrings(
-        "IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'ix_posts_author_id' AND object_id = OBJECT_ID(N'posts')) CREATE INDEX ix_posts_author_id ON posts (author_id)",
+        "IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'ix_posts_author_id' AND object_id = OBJECT_ID(N'posts')) CREATE INDEX [ix_posts_author_id] ON [posts] ([author_id])",
         ddl.createIndex(Post, &.{"author_id"}, false, .mssql),
     );
     const ix = ddl.foreignKeyIndexes(Post, .sqlite);
     try testing.expectEqual(@as(usize, 1), ix.len);
-    try testing.expectEqualStrings("CREATE INDEX IF NOT EXISTS ix_posts_author_id ON posts (author_id)", ix[0]);
+    try testing.expectEqualStrings("CREATE INDEX IF NOT EXISTS \"ix_posts_author_id\" ON \"posts\" (\"author_id\")", ix[0]);
 
     // MySQL + T-SQL drop-index form names the table.
-    try testing.expectEqualStrings("DROP INDEX ix_posts_author_id ON posts", ddl.dropIndex(Post, &.{"author_id"}, .mysql));
-    try testing.expectEqualStrings("DROP INDEX ix_posts_author_id ON posts", ddl.dropIndex(Post, &.{"author_id"}, .mssql));
-    try testing.expectEqualStrings("DROP INDEX IF EXISTS ix_posts_author_id", ddl.dropIndex(Post, &.{"author_id"}, .sqlite));
+    try testing.expectEqualStrings("DROP INDEX `ix_posts_author_id` ON `posts`", ddl.dropIndex(Post, &.{"author_id"}, .mysql));
+    try testing.expectEqualStrings("DROP INDEX [ix_posts_author_id] ON [posts]", ddl.dropIndex(Post, &.{"author_id"}, .mssql));
+    try testing.expectEqualStrings("DROP INDEX IF EXISTS \"ix_posts_author_id\"", ddl.dropIndex(Post, &.{"author_id"}, .sqlite));
 }

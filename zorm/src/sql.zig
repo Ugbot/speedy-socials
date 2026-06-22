@@ -15,14 +15,27 @@ const contract = @import("contract.zig");
 
 const Dialect = contract.Dialect;
 
-/// Comma-joined column-name list for every column (SELECT projection).
-fn columnList(comptime T: type) []const u8 {
+/// Quote a SQL identifier (table or column name) for the given dialect so
+/// reserved words and special characters are safe. Comptime-only: the result
+/// is a comptime-known string, so there is zero runtime cost.
+///   sqlite/postgres → "name"   mysql → `name`   mssql → [name]
+pub fn quoteIdent(comptime name: []const u8, comptime dialect: Dialect) []const u8 {
+    return switch (dialect) {
+        .sqlite, .postgres => "\"" ++ name ++ "\"",
+        .mysql => "`" ++ name ++ "`",
+        .mssql => "[" ++ name ++ "]",
+    };
+}
+
+/// Comma-joined column-name list for every column (SELECT projection),
+/// identifier-quoted for `dialect`.
+fn columnList(comptime T: type, comptime dialect: Dialect) []const u8 {
     const info = reflect.TableInfo(T);
     comptime {
         var s: []const u8 = "";
         for (info.columns, 0..) |col, i| {
             if (i > 0) s = s ++ ", ";
-            s = s ++ col.name;
+            s = s ++ quoteIdent(col.name, dialect);
         }
         return s;
     }
@@ -40,21 +53,21 @@ fn buildInsert(comptime T: type, comptime dialect: Dialect) []const u8 {
                 cols = cols ++ ", ";
                 vals = vals ++ ", ";
             }
-            cols = cols ++ col.name;
+            cols = cols ++ quoteIdent(col.name, dialect);
             vals = vals ++ dialect.placeholder(n + 1);
             n += 1;
         }
-        var sql: []const u8 = "INSERT INTO " ++ info.table ++ " (" ++ cols ++ ")";
+        var sql: []const u8 = "INSERT INTO " ++ quoteIdent(info.table, dialect) ++ " (" ++ cols ++ ")";
         // SQL Server returns the assigned id via an OUTPUT clause placed
         // between the column list and VALUES.
         if (info.pk_auto and dialect == .mssql) {
-            sql = sql ++ " OUTPUT INSERTED." ++ info.pk_column.name;
+            sql = sql ++ " OUTPUT INSERTED." ++ quoteIdent(info.pk_column.name, dialect);
         }
         sql = sql ++ " VALUES (" ++ vals ++ ")";
         // Postgres assigns the auto PK and returns it via RETURNING; SQLite +
         // MySQL use lastInsertId(). Text PKs are caller-supplied (no clause).
         if (info.pk_auto and dialect == .postgres) {
-            sql = sql ++ " RETURNING " ++ info.pk_column.name;
+            sql = sql ++ " RETURNING " ++ quoteIdent(info.pk_column.name, dialect);
         }
         return sql;
     }
@@ -63,8 +76,8 @@ fn buildInsert(comptime T: type, comptime dialect: Dialect) []const u8 {
 fn buildSelectByPk(comptime T: type, comptime dialect: Dialect) []const u8 {
     const info = reflect.TableInfo(T);
     comptime {
-        return "SELECT " ++ columnList(T) ++ " FROM " ++ info.table ++
-            " WHERE " ++ info.pk_column.name ++ " = " ++ dialect.placeholder(1);
+        return "SELECT " ++ columnList(T, dialect) ++ " FROM " ++ quoteIdent(info.table, dialect) ++
+            " WHERE " ++ quoteIdent(info.pk_column.name, dialect) ++ " = " ++ dialect.placeholder(1);
     }
 }
 
@@ -76,19 +89,19 @@ fn buildUpdate(comptime T: type, comptime dialect: Dialect) []const u8 {
         for (info.columns) |col| {
             if (col.is_pk) continue;
             if (n > 0) sets = sets ++ ", ";
-            sets = sets ++ col.name ++ " = " ++ dialect.placeholder(n + 1);
+            sets = sets ++ quoteIdent(col.name, dialect) ++ " = " ++ dialect.placeholder(n + 1);
             n += 1;
         }
-        return "UPDATE " ++ info.table ++ " SET " ++ sets ++
-            " WHERE " ++ info.pk_column.name ++ " = " ++ dialect.placeholder(n + 1);
+        return "UPDATE " ++ quoteIdent(info.table, dialect) ++ " SET " ++ sets ++
+            " WHERE " ++ quoteIdent(info.pk_column.name, dialect) ++ " = " ++ dialect.placeholder(n + 1);
     }
 }
 
 fn buildDeleteByPk(comptime T: type, comptime dialect: Dialect) []const u8 {
     const info = reflect.TableInfo(T);
     comptime {
-        return "DELETE FROM " ++ info.table ++
-            " WHERE " ++ info.pk_column.name ++ " = " ++ dialect.placeholder(1);
+        return "DELETE FROM " ++ quoteIdent(info.table, dialect) ++
+            " WHERE " ++ quoteIdent(info.pk_column.name, dialect) ++ " = " ++ dialect.placeholder(1);
     }
 }
 
@@ -106,15 +119,21 @@ pub fn insert(comptime T: type, dialect: Dialect) []const u8 {
 }
 
 /// `SELECT <all columns> FROM <table>` with no clauses — the base a query
-/// builder appends WHERE/ORDER BY/LIMIT onto. Dialect-independent (only the
-/// value placeholders in a WHERE differ, which the builder adds).
-pub fn selectAll(comptime T: type) []const u8 {
-    return comptime "SELECT " ++ columnList(T) ++ " FROM " ++ reflect.TableInfo(T).table;
+/// builder appends WHERE/ORDER BY/LIMIT onto. Identifiers are quoted per
+/// dialect (only the value placeholders in a WHERE differ, which the builder
+/// adds).
+pub fn selectAll(comptime T: type, dialect: Dialect) []const u8 {
+    return switch (dialect) {
+        inline else => |d| comptime "SELECT " ++ columnList(T, d) ++ " FROM " ++ quoteIdent(reflect.TableInfo(T).table, d),
+    };
 }
 
-/// The comma-joined projection column list (full row, `TableInfo` order).
-pub fn projection(comptime T: type) []const u8 {
-    return comptime columnList(T);
+/// The comma-joined projection column list (full row, `TableInfo` order),
+/// identifier-quoted for `dialect`.
+pub fn projection(comptime T: type, dialect: Dialect) []const u8 {
+    return switch (dialect) {
+        inline else => |d| comptime columnList(T, d),
+    };
 }
 
 /// `SELECT … WHERE pk = ?` (full projection, `TableInfo` column order).
@@ -169,106 +188,161 @@ const AutoEntity = struct {
 
 test "INSERT: text PK, SQLite placeholders, no RETURNING" {
     try testing.expectEqualStrings(
-        "INSERT INTO atp_accounts (id, handle, email, role) VALUES (?, ?, ?, ?)",
+        "INSERT INTO \"atp_accounts\" (\"id\", \"handle\", \"email\", \"role\") VALUES (?, ?, ?, ?)",
         insert(Account, .sqlite),
     );
 }
 
 test "INSERT: Postgres uses $N placeholders" {
     try testing.expectEqualStrings(
-        "INSERT INTO atp_accounts (id, handle, email, role) VALUES ($1, $2, $3, $4)",
+        "INSERT INTO \"atp_accounts\" (\"id\", \"handle\", \"email\", \"role\") VALUES ($1, $2, $3, $4)",
         insert(Account, .postgres),
     );
 }
 
 test "INSERT: auto PK is omitted; Postgres appends RETURNING, SQLite does not" {
     try testing.expectEqualStrings(
-        "INSERT INTO things (name) VALUES (?)",
+        "INSERT INTO \"things\" (\"name\") VALUES (?)",
         insert(AutoEntity, .sqlite),
     );
     try testing.expectEqualStrings(
-        "INSERT INTO things (name) VALUES ($1) RETURNING id",
+        "INSERT INTO \"things\" (\"name\") VALUES ($1) RETURNING \"id\"",
         insert(AutoEntity, .postgres),
     );
 }
 
 test "MySQL: ? placeholders, no RETURNING (auto PK via lastInsertId)" {
     try testing.expectEqualStrings(
-        "INSERT INTO atp_accounts (id, handle, email, role) VALUES (?, ?, ?, ?)",
+        "INSERT INTO `atp_accounts` (`id`, `handle`, `email`, `role`) VALUES (?, ?, ?, ?)",
         insert(Account, .mysql),
     );
     // Auto-PK INSERT omits the id and does NOT append RETURNING on MySQL.
     try testing.expectEqualStrings(
-        "INSERT INTO things (name) VALUES (?)",
+        "INSERT INTO `things` (`name`) VALUES (?)",
         insert(AutoEntity, .mysql),
     );
     try testing.expectEqualStrings(
-        "SELECT id, handle, email, role FROM atp_accounts WHERE id = ?",
+        "SELECT `id`, `handle`, `email`, `role` FROM `atp_accounts` WHERE `id` = ?",
         selectByPk(Account, .mysql),
     );
     try testing.expectEqualStrings(
-        "UPDATE atp_accounts SET handle = ?, email = ?, role = ? WHERE id = ?",
+        "UPDATE `atp_accounts` SET `handle` = ?, `email` = ?, `role` = ? WHERE `id` = ?",
         update(Account, .mysql),
     );
     try testing.expectEqualStrings(
-        "DELETE FROM things WHERE id = ?",
+        "DELETE FROM `things` WHERE `id` = ?",
         deleteByPk(AutoEntity, .mysql),
     );
 }
 
 test "MS SQL: @pN placeholders, OUTPUT INSERTED for auto PK" {
     try testing.expectEqualStrings(
-        "INSERT INTO atp_accounts (id, handle, email, role) VALUES (@p1, @p2, @p3, @p4)",
+        "INSERT INTO [atp_accounts] ([id], [handle], [email], [role]) VALUES (@p1, @p2, @p3, @p4)",
         insert(Account, .mssql),
     );
     // Auto-PK INSERT: OUTPUT INSERTED.<pk> sits between the column list + VALUES.
     try testing.expectEqualStrings(
-        "INSERT INTO things (name) OUTPUT INSERTED.id VALUES (@p1)",
+        "INSERT INTO [things] ([name]) OUTPUT INSERTED.[id] VALUES (@p1)",
         insert(AutoEntity, .mssql),
     );
     try testing.expectEqualStrings(
-        "SELECT id, handle, email, role FROM atp_accounts WHERE id = @p1",
+        "SELECT [id], [handle], [email], [role] FROM [atp_accounts] WHERE [id] = @p1",
         selectByPk(Account, .mssql),
     );
     try testing.expectEqualStrings(
-        "UPDATE atp_accounts SET handle = @p1, email = @p2, role = @p3 WHERE id = @p4",
+        "UPDATE [atp_accounts] SET [handle] = @p1, [email] = @p2, [role] = @p3 WHERE [id] = @p4",
         update(Account, .mssql),
     );
     try testing.expectEqualStrings(
-        "DELETE FROM things WHERE id = @p1",
+        "DELETE FROM [things] WHERE [id] = @p1",
         deleteByPk(AutoEntity, .mssql),
     );
 }
 
 test "SELECT by PK projects all columns in order" {
     try testing.expectEqualStrings(
-        "SELECT id, handle, email, role FROM atp_accounts WHERE id = ?",
+        "SELECT \"id\", \"handle\", \"email\", \"role\" FROM \"atp_accounts\" WHERE \"id\" = ?",
         selectByPk(Account, .sqlite),
     );
     try testing.expectEqualStrings(
-        "SELECT id, handle, email, role FROM atp_accounts WHERE id = $1",
+        "SELECT \"id\", \"handle\", \"email\", \"role\" FROM \"atp_accounts\" WHERE \"id\" = $1",
         selectByPk(Account, .postgres),
     );
 }
 
 test "UPDATE sets non-PK columns then binds PK last" {
     try testing.expectEqualStrings(
-        "UPDATE atp_accounts SET handle = ?, email = ?, role = ? WHERE id = ?",
+        "UPDATE \"atp_accounts\" SET \"handle\" = ?, \"email\" = ?, \"role\" = ? WHERE \"id\" = ?",
         update(Account, .sqlite),
     );
     try testing.expectEqualStrings(
-        "UPDATE atp_accounts SET handle = $1, email = $2, role = $3 WHERE id = $4",
+        "UPDATE \"atp_accounts\" SET \"handle\" = $1, \"email\" = $2, \"role\" = $3 WHERE \"id\" = $4",
         update(Account, .postgres),
     );
 }
 
 test "DELETE by PK" {
     try testing.expectEqualStrings(
-        "DELETE FROM atp_accounts WHERE id = ?",
+        "DELETE FROM \"atp_accounts\" WHERE \"id\" = ?",
         deleteByPk(Account, .sqlite),
     );
     try testing.expectEqualStrings(
-        "DELETE FROM things WHERE id = $1",
+        "DELETE FROM \"things\" WHERE \"id\" = $1",
         deleteByPk(AutoEntity, .postgres),
     );
+}
+
+test "quoteIdent: bracket/backtick/double-quote per dialect" {
+    try testing.expectEqualStrings("\"order\"", quoteIdent("order", .sqlite));
+    try testing.expectEqualStrings("\"order\"", quoteIdent("order", .postgres));
+    try testing.expectEqualStrings("`order`", quoteIdent("order", .mysql));
+    try testing.expectEqualStrings("[order]", quoteIdent("order", .mssql));
+}
+
+// An entity whose column name (`order`) AND table name (`select`) are SQL
+// reserved words — quoting is what makes the emitted SQL valid.
+const Reserved = struct {
+    pub const zorm_table = "select";
+    id: fields.Pk(32) = .{},
+    order: fields.Text(16) = .{},
+};
+
+test "reserved-word table + column produce valid quoted SQL per dialect" {
+    // SQLite / Postgres → double quotes.
+    try testing.expectEqualStrings(
+        "INSERT INTO \"select\" (\"id\", \"order\") VALUES (?, ?)",
+        insert(Reserved, .sqlite),
+    );
+    try testing.expectEqualStrings(
+        "SELECT \"id\", \"order\" FROM \"select\" WHERE \"id\" = $1",
+        selectByPk(Reserved, .postgres),
+    );
+    try testing.expectEqualStrings(
+        "UPDATE \"select\" SET \"order\" = ? WHERE \"id\" = ?",
+        update(Reserved, .sqlite),
+    );
+    // MySQL → backticks.
+    try testing.expectEqualStrings(
+        "INSERT INTO `select` (`id`, `order`) VALUES (?, ?)",
+        insert(Reserved, .mysql),
+    );
+    try testing.expectEqualStrings(
+        "UPDATE `select` SET `order` = ? WHERE `id` = ?",
+        update(Reserved, .mysql),
+    );
+    // MS SQL → brackets.
+    try testing.expectEqualStrings(
+        "INSERT INTO [select] ([id], [order]) VALUES (@p1, @p2)",
+        insert(Reserved, .mssql),
+    );
+    try testing.expectEqualStrings(
+        "DELETE FROM [select] WHERE [id] = @p1",
+        deleteByPk(Reserved, .mssql),
+    );
+    // selectAll + projection are also quoted.
+    try testing.expectEqualStrings(
+        "SELECT `id`, `order` FROM `select`",
+        selectAll(Reserved, .mysql),
+    );
+    try testing.expectEqualStrings("[id], [order]", projection(Reserved, .mssql));
 }

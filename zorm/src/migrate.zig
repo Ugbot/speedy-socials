@@ -169,9 +169,9 @@ test "initialMigration: table create + FK index, drop in down" {
     try testing.expectEqualStrings("m_posts:create", m.name);
     // up: CREATE TABLE (with FK), then the FK index.
     try testing.expectEqual(@as(usize, 2), m.up.len);
-    try testing.expect(std.mem.startsWith(u8, m.up[0], "CREATE TABLE IF NOT EXISTS m_posts ("));
-    try testing.expect(std.mem.indexOf(u8, m.up[0], "FOREIGN KEY (author_id) REFERENCES m_users (id) ON DELETE CASCADE") != null);
-    try testing.expectEqualStrings("CREATE INDEX IF NOT EXISTS ix_m_posts_author_id ON m_posts (author_id)", m.up[1]);
+    try testing.expect(std.mem.startsWith(u8, m.up[0], "CREATE TABLE IF NOT EXISTS \"m_posts\" ("));
+    try testing.expect(std.mem.indexOf(u8, m.up[0], "FOREIGN KEY (\"author_id\") REFERENCES \"m_users\" (\"id\") ON DELETE CASCADE") != null);
+    try testing.expectEqualStrings("CREATE INDEX IF NOT EXISTS \"ix_m_posts_author_id\" ON \"m_posts\" (\"author_id\")", m.up[1]);
     try testing.expect(m.down != null);
     try testing.expectEqualStrings("DROP TABLE IF EXISTS m_posts", m.down.?[0]);
 }
@@ -179,7 +179,7 @@ test "initialMigration: table create + FK index, drop in down" {
 test "initialMigration: no-FK entity has a single up statement" {
     const m = initialMigration(User, 2000, .postgres);
     try testing.expectEqual(@as(usize, 1), m.up.len);
-    try testing.expect(std.mem.indexOf(u8, m.up[0], "CREATE TABLE IF NOT EXISTS m_users") != null);
+    try testing.expect(std.mem.indexOf(u8, m.up[0], "CREATE TABLE IF NOT EXISTS \"m_users\"") != null);
 }
 
 test "Migrator: applies an ordered set + is idempotent by id" {

@@ -73,7 +73,7 @@ pub fn Query(comptime T: type) type {
 
         pub fn init(dialect: Dialect) Self {
             var q = Self{ .dialect = dialect };
-            q.append(sql.selectAll(T));
+            q.append(sql.selectAll(T, dialect));
             return q;
         }
 
@@ -99,12 +99,21 @@ pub fn Query(comptime T: type) type {
             }
         }
 
-        /// Emit the ` WHERE `/` AND ` join + bare column name, leaving the
+        /// Append a column identifier, quoted for the runtime dialect so it
+        /// stays consistent with the (quoted) projection/table emitted by
+        /// `sql.selectAll`. Quoting is comptime per dialect (no runtime cost).
+        fn appendIdent(self: *Self, comptime name: []const u8) void {
+            switch (self.dialect) {
+                inline else => |d| self.append(comptime sql.quoteIdent(name, d)),
+            }
+        }
+
+        /// Emit the ` WHERE `/` AND ` join + quoted column name, leaving the
         /// caller to append the operator and (optional) placeholder.
         fn whereColumn(self: *Self, comptime name: []const u8) void {
             self.append(if (self.has_where) " AND " else " WHERE ");
             self.has_where = true;
-            self.append(name);
+            self.appendIdent(name);
         }
 
         /// Record a single bound parameter into the args array.
@@ -192,7 +201,7 @@ pub fn Query(comptime T: type) type {
 
         pub fn orderBy(self: *Self, comptime field: []const u8, dir: Dir) *Self {
             self.append(" ORDER BY ");
-            self.append(checkColumn(T, field));
+            self.appendIdent(checkColumn(T, field));
             self.append(if (dir == .desc) " DESC" else " ASC");
             self.has_order = true;
             return self;
@@ -366,11 +375,18 @@ fn seed(backend: Backend, id: []const u8, handle: []const u8, role: Role, age: i
     try crud.insert(Account, backend, &a);
 }
 
+// SELECT projection + table (and WHERE/ORDER BY columns) are identifier-quoted
+// per dialect: sqlite/postgres → "..", mysql → `..`, mssql → [..].
+const sel_sqlite = "SELECT \"id\", \"handle\", \"role\", \"age\" FROM \"atp_accounts\"";
+const sel_pg = sel_sqlite; // postgres shares double-quote quoting
+const sel_mysql = "SELECT `id`, `handle`, `role`, `age` FROM `atp_accounts`";
+const sel_mssql = "SELECT [id], [handle], [role], [age] FROM [atp_accounts]";
+
 test "where builds dialect placeholders + binds values" {
     var q = Query(Account).init(.postgres);
     _ = q.whereText("handle", "alice").whereInt("age", 30);
     try testing.expectEqualStrings(
-        "SELECT id, handle, role, age FROM atp_accounts WHERE handle = $1 AND age = $2",
+        sel_pg ++ " WHERE \"handle\" = $1 AND \"age\" = $2",
         q.buf[0..q.len],
     );
     try testing.expectEqual(@as(usize, 2), q.arg_count);
@@ -378,7 +394,7 @@ test "where builds dialect placeholders + binds values" {
     var q2 = Query(Account).init(.sqlite);
     _ = q2.whereText("handle", "bob");
     try testing.expectEqualStrings(
-        "SELECT id, handle, role, age FROM atp_accounts WHERE handle = ?",
+        sel_sqlite ++ " WHERE \"handle\" = ?",
         q2.buf[0..q2.len],
     );
 }
@@ -387,7 +403,7 @@ test "orderBy + limit append correctly" {
     var q = Query(Account).init(.sqlite);
     _ = q.whereEnum("role", Role.admin).orderBy("age", .desc).limit(5);
     try testing.expectEqualStrings(
-        "SELECT id, handle, role, age FROM atp_accounts WHERE role = ? ORDER BY age DESC LIMIT 5",
+        sel_sqlite ++ " WHERE \"role\" = ? ORDER BY \"age\" DESC LIMIT 5",
         q.buf[0..q.len],
     );
     try testing.expectEqualStrings("admin", q.args[0].text);
@@ -398,14 +414,14 @@ test "MS SQL: @pN placeholders + OFFSET/FETCH for limit" {
     var q = Query(Account).init(.mssql);
     _ = q.whereText("handle", "a").whereInt("age", 9).orderBy("age", .desc).limit(5);
     try testing.expectEqualStrings(
-        "SELECT id, handle, role, age FROM atp_accounts WHERE handle = @p1 AND age = @p2 ORDER BY age DESC OFFSET 0 ROWS FETCH NEXT 5 ROWS ONLY",
+        sel_mssql ++ " WHERE [handle] = @p1 AND [age] = @p2 ORDER BY [age] DESC OFFSET 0 ROWS FETCH NEXT 5 ROWS ONLY",
         q.buf[0..q.len],
     );
     // limit WITHOUT an order → a synthesized no-op ORDER BY (T-SQL requires one).
     var q2 = Query(Account).init(.mssql);
     _ = q2.whereText("id", "x").limit(1);
     try testing.expectEqualStrings(
-        "SELECT id, handle, role, age FROM atp_accounts WHERE id = @p1 ORDER BY (SELECT NULL) OFFSET 0 ROWS FETCH NEXT 1 ROWS ONLY",
+        sel_mssql ++ " WHERE [id] = @p1 ORDER BY (SELECT NULL) OFFSET 0 ROWS FETCH NEXT 1 ROWS ONLY",
         q2.buf[0..q2.len],
     );
 }
@@ -423,19 +439,19 @@ test "whereOp emits each comparison operator (sqlite/postgres/mssql)" {
         var qs = Query(Account).init(.sqlite);
         _ = qs.whereOp("age", c.op, .{ .int = 18 });
         var buf: [256]u8 = undefined;
-        const want_s = std.fmt.bufPrint(&buf, "SELECT id, handle, role, age FROM atp_accounts WHERE age {s} ?", .{c.sym}) catch unreachable;
+        const want_s = std.fmt.bufPrint(&buf, sel_sqlite ++ " WHERE \"age\" {s} ?", .{c.sym}) catch unreachable;
         try testing.expectEqualStrings(want_s, qs.buf[0..qs.len]);
 
         var qp = Query(Account).init(.postgres);
         _ = qp.whereOp("age", c.op, .{ .int = 18 });
         var buf2: [256]u8 = undefined;
-        const want_p = std.fmt.bufPrint(&buf2, "SELECT id, handle, role, age FROM atp_accounts WHERE age {s} $1", .{c.sym}) catch unreachable;
+        const want_p = std.fmt.bufPrint(&buf2, sel_pg ++ " WHERE \"age\" {s} $1", .{c.sym}) catch unreachable;
         try testing.expectEqualStrings(want_p, qp.buf[0..qp.len]);
 
         var qm = Query(Account).init(.mssql);
         _ = qm.whereOp("age", c.op, .{ .int = 18 });
         var buf3: [256]u8 = undefined;
-        const want_m = std.fmt.bufPrint(&buf3, "SELECT id, handle, role, age FROM atp_accounts WHERE age {s} @p1", .{c.sym}) catch unreachable;
+        const want_m = std.fmt.bufPrint(&buf3, sel_mssql ++ " WHERE [age] {s} @p1", .{c.sym}) catch unreachable;
         try testing.expectEqualStrings(want_m, qm.buf[0..qm.len]);
         try testing.expectEqual(@as(i64, 18), qm.args[0].int);
     }
@@ -445,7 +461,7 @@ test "whereOp chains with AND and binds in order" {
     var q = Query(Account).init(.postgres);
     _ = q.whereOp("age", .gte, .{ .int = 18 }).whereOp("age", .lt, .{ .int = 65 });
     try testing.expectEqualStrings(
-        "SELECT id, handle, role, age FROM atp_accounts WHERE age >= $1 AND age < $2",
+        sel_pg ++ " WHERE \"age\" >= $1 AND \"age\" < $2",
         q.buf[0..q.len],
     );
     try testing.expectEqual(@as(usize, 2), q.arg_count);
@@ -457,7 +473,7 @@ test "whereLike emits LIKE with a bound pattern (all placeholder styles)" {
     var qs = Query(Account).init(.sqlite);
     _ = qs.whereLike("handle", "a%");
     try testing.expectEqualStrings(
-        "SELECT id, handle, role, age FROM atp_accounts WHERE handle LIKE ?",
+        sel_sqlite ++ " WHERE \"handle\" LIKE ?",
         qs.buf[0..qs.len],
     );
     try testing.expectEqualStrings("a%", qs.args[0].text);
@@ -465,14 +481,14 @@ test "whereLike emits LIKE with a bound pattern (all placeholder styles)" {
     var qp = Query(Account).init(.postgres);
     _ = qp.whereLike("handle", "%bob%");
     try testing.expectEqualStrings(
-        "SELECT id, handle, role, age FROM atp_accounts WHERE handle LIKE $1",
+        sel_pg ++ " WHERE \"handle\" LIKE $1",
         qp.buf[0..qp.len],
     );
 
     var qm = Query(Account).init(.mssql);
     _ = qm.whereLike("handle", "z_");
     try testing.expectEqualStrings(
-        "SELECT id, handle, role, age FROM atp_accounts WHERE handle LIKE @p1",
+        sel_mssql ++ " WHERE [handle] LIKE @p1",
         qm.buf[0..qm.len],
     );
 }
@@ -482,7 +498,7 @@ test "whereIn with three values binds each as a placeholder" {
     const vals = [_]BindValue{ .{ .text = "1" }, .{ .text = "2" }, .{ .text = "3" } };
     _ = qs.whereIn("id", &vals);
     try testing.expectEqualStrings(
-        "SELECT id, handle, role, age FROM atp_accounts WHERE id IN (?, ?, ?)",
+        sel_sqlite ++ " WHERE \"id\" IN (?, ?, ?)",
         qs.buf[0..qs.len],
     );
     try testing.expectEqual(@as(usize, 3), qs.arg_count);
@@ -490,14 +506,14 @@ test "whereIn with three values binds each as a placeholder" {
     var qp = Query(Account).init(.postgres);
     _ = qp.whereIn("id", &vals);
     try testing.expectEqualStrings(
-        "SELECT id, handle, role, age FROM atp_accounts WHERE id IN ($1, $2, $3)",
+        sel_pg ++ " WHERE \"id\" IN ($1, $2, $3)",
         qp.buf[0..qp.len],
     );
 
     var qm = Query(Account).init(.mssql);
     _ = qm.whereIn("id", &vals);
     try testing.expectEqualStrings(
-        "SELECT id, handle, role, age FROM atp_accounts WHERE id IN (@p1, @p2, @p3)",
+        sel_mssql ++ " WHERE [id] IN (@p1, @p2, @p3)",
         qm.buf[0..qm.len],
     );
 }
@@ -507,7 +523,7 @@ test "whereIn empty list emits the always-false 1 = 0 with no binds" {
     const empty = [_]BindValue{};
     _ = q.whereIn("id", &empty);
     try testing.expectEqualStrings(
-        "SELECT id, handle, role, age FROM atp_accounts WHERE 1 = 0",
+        sel_pg ++ " WHERE 1 = 0",
         q.buf[0..q.len],
     );
     try testing.expectEqual(@as(usize, 0), q.arg_count);
@@ -516,7 +532,7 @@ test "whereIn empty list emits the always-false 1 = 0 with no binds" {
     var q2 = Query(Account).init(.sqlite);
     _ = q2.whereIn("id", &empty).whereText("handle", "x");
     try testing.expectEqualStrings(
-        "SELECT id, handle, role, age FROM atp_accounts WHERE 1 = 0 AND handle = ?",
+        sel_sqlite ++ " WHERE 1 = 0 AND \"handle\" = ?",
         q2.buf[0..q2.len],
     );
 }
@@ -525,7 +541,7 @@ test "whereNull / whereNotNull emit IS NULL / IS NOT NULL with no binds" {
     var q = Query(Account).init(.sqlite);
     _ = q.whereNull("handle").whereNotNull("age");
     try testing.expectEqualStrings(
-        "SELECT id, handle, role, age FROM atp_accounts WHERE handle IS NULL AND age IS NOT NULL",
+        sel_sqlite ++ " WHERE \"handle\" IS NULL AND \"age\" IS NOT NULL",
         q.buf[0..q.len],
     );
     try testing.expectEqual(@as(usize, 0), q.arg_count);
@@ -533,7 +549,7 @@ test "whereNull / whereNotNull emit IS NULL / IS NOT NULL with no binds" {
     var qp = Query(Account).init(.postgres);
     _ = qp.whereNotNull("handle");
     try testing.expectEqualStrings(
-        "SELECT id, handle, role, age FROM atp_accounts WHERE handle IS NOT NULL",
+        sel_pg ++ " WHERE \"handle\" IS NOT NULL",
         qp.buf[0..qp.len],
     );
 }
@@ -543,7 +559,7 @@ test "offset + limit combined is dialect-correct on all four dialects" {
     var qs = Query(Account).init(.sqlite);
     _ = qs.orderBy("age", .asc).offset(20).limit(10);
     try testing.expectEqualStrings(
-        "SELECT id, handle, role, age FROM atp_accounts ORDER BY age ASC LIMIT 10 OFFSET 20",
+        sel_sqlite ++ " ORDER BY \"age\" ASC LIMIT 10 OFFSET 20",
         qs.buf[0..qs.len],
     );
 
@@ -551,7 +567,7 @@ test "offset + limit combined is dialect-correct on all four dialects" {
     var qp = Query(Account).init(.postgres);
     _ = qp.orderBy("age", .asc).offset(20).limit(10);
     try testing.expectEqualStrings(
-        "SELECT id, handle, role, age FROM atp_accounts ORDER BY age ASC LIMIT 10 OFFSET 20",
+        sel_pg ++ " ORDER BY \"age\" ASC LIMIT 10 OFFSET 20",
         qp.buf[0..qp.len],
     );
 
@@ -559,7 +575,7 @@ test "offset + limit combined is dialect-correct on all four dialects" {
     var qy = Query(Account).init(.mysql);
     _ = qy.orderBy("age", .asc).offset(20).limit(10);
     try testing.expectEqualStrings(
-        "SELECT id, handle, role, age FROM atp_accounts ORDER BY age ASC LIMIT 10 OFFSET 20",
+        sel_mysql ++ " ORDER BY `age` ASC LIMIT 10 OFFSET 20",
         qy.buf[0..qy.len],
     );
 
@@ -567,7 +583,7 @@ test "offset + limit combined is dialect-correct on all four dialects" {
     var qm = Query(Account).init(.mssql);
     _ = qm.orderBy("age", .asc).offset(20).limit(10);
     try testing.expectEqualStrings(
-        "SELECT id, handle, role, age FROM atp_accounts ORDER BY age ASC OFFSET 20 ROWS FETCH NEXT 10 ROWS ONLY",
+        sel_mssql ++ " ORDER BY [age] ASC OFFSET 20 ROWS FETCH NEXT 10 ROWS ONLY",
         qm.buf[0..qm.len],
     );
 }
@@ -576,7 +592,7 @@ test "limit without offset is unchanged across dialects" {
     var qs = Query(Account).init(.sqlite);
     _ = qs.limit(5);
     try testing.expectEqualStrings(
-        "SELECT id, handle, role, age FROM atp_accounts LIMIT 5",
+        sel_sqlite ++ " LIMIT 5",
         qs.buf[0..qs.len],
     );
 
@@ -584,7 +600,7 @@ test "limit without offset is unchanged across dialects" {
     var qm = Query(Account).init(.mssql);
     _ = qm.limit(5);
     try testing.expectEqualStrings(
-        "SELECT id, handle, role, age FROM atp_accounts ORDER BY (SELECT NULL) OFFSET 0 ROWS FETCH NEXT 5 ROWS ONLY",
+        sel_mssql ++ " ORDER BY (SELECT NULL) OFFSET 0 ROWS FETCH NEXT 5 ROWS ONLY",
         qm.buf[0..qm.len],
     );
 }
@@ -598,7 +614,7 @@ test "offset without limit flushes a standalone clause at statement()" {
     var out: [4]Account = undefined;
     _ = try qs.all(db.backend(.sqlite), &out);
     try testing.expectEqualStrings(
-        "SELECT id, handle, role, age FROM atp_accounts ORDER BY age ASC LIMIT -1 OFFSET 7",
+        sel_sqlite ++ " ORDER BY \"age\" ASC LIMIT -1 OFFSET 7",
         qs.buf[0..qs.len],
     );
 
@@ -608,7 +624,7 @@ test "offset without limit flushes a standalone clause at statement()" {
     var out2: [4]Account = undefined;
     _ = try qp.all(db.backend(.postgres), &out2);
     try testing.expectEqualStrings(
-        "SELECT id, handle, role, age FROM atp_accounts LIMIT -1 OFFSET 7",
+        sel_pg ++ " LIMIT -1 OFFSET 7",
         qp.buf[0..qp.len],
     );
 
@@ -618,7 +634,7 @@ test "offset without limit flushes a standalone clause at statement()" {
     var out3: [4]Account = undefined;
     _ = try qy.all(db.backend(.mysql), &out3);
     try testing.expectEqualStrings(
-        "SELECT id, handle, role, age FROM atp_accounts LIMIT 18446744073709551615 OFFSET 7",
+        sel_mysql ++ " LIMIT 18446744073709551615 OFFSET 7",
         qy.buf[0..qy.len],
     );
 
@@ -628,7 +644,7 @@ test "offset without limit flushes a standalone clause at statement()" {
     var out4: [4]Account = undefined;
     _ = try qm.all(db.backend(.mssql), &out4);
     try testing.expectEqualStrings(
-        "SELECT id, handle, role, age FROM atp_accounts ORDER BY (SELECT NULL) OFFSET 7 ROWS",
+        sel_mssql ++ " ORDER BY (SELECT NULL) OFFSET 7 ROWS",
         qm.buf[0..qm.len],
     );
 }

@@ -9,9 +9,12 @@
 const std = @import("std");
 const reflect = @import("reflect.zig");
 const contract = @import("contract.zig");
+const sql = @import("sql.zig");
 
 const Dialect = contract.Dialect;
 const ColType = reflect.ColType;
+/// Identifier quoting helper shared with `sql.zig` (one definition for both).
+const quoteIdent = sql.quoteIdent;
 
 /// SQL type keyword for a column, per dialect. Auto PKs carry their full
 /// PRIMARY KEY + identity syntax here.
@@ -58,7 +61,7 @@ fn buildCreateTable(comptime T: type, comptime dialect: Dialect) []const u8 {
         var body: []const u8 = "";
         for (info.columns, 0..) |col, i| {
             if (i > 0) body = body ++ ", ";
-            body = body ++ col.name ++ " " ++ sqlType(col, dialect);
+            body = body ++ quoteIdent(col.name, dialect) ++ " " ++ sqlType(col, dialect);
             // Text PK: PRIMARY KEY + implicitly NOT NULL.
             if (col.is_pk and !col.pk_auto) {
                 body = body ++ " PRIMARY KEY";
@@ -69,15 +72,17 @@ fn buildCreateTable(comptime T: type, comptime dialect: Dialect) []const u8 {
         // Table-level FOREIGN KEY clauses derived from BelongsTo relations.
         // (Table-level form is identical on all four dialects.)
         for (reflect.foreignKeys(T)) |fk| {
-            body = body ++ ", FOREIGN KEY (" ++ fk.local_col ++ ") REFERENCES " ++
-                fk.ref_table ++ " (" ++ fk.ref_col ++ ")";
+            body = body ++ ", FOREIGN KEY (" ++ quoteIdent(fk.local_col, dialect) ++ ") REFERENCES " ++
+                quoteIdent(fk.ref_table, dialect) ++ " (" ++ quoteIdent(fk.ref_col, dialect) ++ ")";
             if (fk.on_delete_sql.len > 0) body = body ++ " ON DELETE " ++ fk.on_delete_sql;
             if (fk.on_update_sql.len > 0) body = body ++ " ON UPDATE " ++ fk.on_update_sql;
         }
-        // T-SQL has no `CREATE TABLE IF NOT EXISTS`; guard with OBJECT_ID.
+        // T-SQL has no `CREATE TABLE IF NOT EXISTS`; guard with OBJECT_ID. The
+        // OBJECT_ID guard references the table as a STRING LITERAL (unquoted);
+        // only the `CREATE TABLE <ident>` identifier is bracket-quoted.
         return switch (dialect) {
-            .sqlite, .postgres, .mysql => "CREATE TABLE IF NOT EXISTS " ++ info.table ++ " (" ++ body ++ ")",
-            .mssql => "IF OBJECT_ID(N'" ++ info.table ++ "', N'U') IS NULL CREATE TABLE " ++ info.table ++ " (" ++ body ++ ")",
+            .sqlite, .postgres, .mysql => "CREATE TABLE IF NOT EXISTS " ++ quoteIdent(info.table, dialect) ++ " (" ++ body ++ ")",
+            .mssql => "IF OBJECT_ID(N'" ++ info.table ++ "', N'U') IS NULL CREATE TABLE " ++ quoteIdent(info.table, dialect) ++ " (" ++ body ++ ")",
         };
     }
 }
@@ -131,14 +136,18 @@ fn buildIndex(comptime T: type, comptime cols: []const []const u8, comptime uniq
         var list: []const u8 = "";
         for (cols, 0..) |c, i| {
             if (i > 0) list = list ++ ", ";
-            list = list ++ c;
+            list = list ++ quoteIdent(c, dialect);
         }
         const ix = indexName(T, cols);
-        const tbl = info.table;
+        const ix_q = quoteIdent(ix, dialect);
+        const tbl_q = quoteIdent(info.table, dialect);
         const kw = if (unique) "CREATE UNIQUE INDEX " else "CREATE INDEX ";
+        // The `sys.indexes` guard references the index + table as STRING
+        // LITERALS (N'…', unquoted); only the CREATE INDEX / ON identifiers
+        // are bracket-quoted.
         break :blk switch (dialect) {
-            .sqlite, .postgres, .mysql => (if (unique) "CREATE UNIQUE INDEX IF NOT EXISTS " else "CREATE INDEX IF NOT EXISTS ") ++ ix ++ " ON " ++ tbl ++ " (" ++ list ++ ")",
-            .mssql => "IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'" ++ ix ++ "' AND object_id = OBJECT_ID(N'" ++ tbl ++ "')) " ++ kw ++ ix ++ " ON " ++ tbl ++ " (" ++ list ++ ")",
+            .sqlite, .postgres, .mysql => (if (unique) "CREATE UNIQUE INDEX IF NOT EXISTS " else "CREATE INDEX IF NOT EXISTS ") ++ ix_q ++ " ON " ++ tbl_q ++ " (" ++ list ++ ")",
+            .mssql => "IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'" ++ ix ++ "' AND object_id = OBJECT_ID(N'" ++ info.table ++ "')) " ++ kw ++ ix_q ++ " ON " ++ tbl_q ++ " (" ++ list ++ ")",
         };
     };
 }
@@ -147,10 +156,9 @@ fn buildIndex(comptime T: type, comptime cols: []const []const u8, comptime uniq
 /// a bare index name; MySQL and T-SQL need the table (`DROP INDEX … ON <table>`).
 pub fn dropIndex(comptime T: type, comptime cols: []const []const u8, dialect: Dialect) []const u8 {
     const name = comptime indexName(T, cols);
-    const table = comptime reflect.TableInfo(T).table;
     return switch (dialect) {
-        .sqlite, .postgres => "DROP INDEX IF EXISTS " ++ name,
-        .mysql, .mssql => "DROP INDEX " ++ name ++ " ON " ++ table,
+        inline .sqlite, .postgres => |d| comptime "DROP INDEX IF EXISTS " ++ quoteIdent(name, d),
+        inline .mysql, .mssql => |d| comptime "DROP INDEX " ++ quoteIdent(name, d) ++ " ON " ++ quoteIdent(reflect.TableInfo(T).table, d),
     };
 }
 
@@ -175,7 +183,7 @@ fn buildAddColumn(comptime T: type, comptime field_name: []const u8, comptime di
                     .sqlite, .postgres, .mysql => " ADD COLUMN ",
                     .mssql => " ADD ",
                 };
-                break :blk "ALTER TABLE " ++ info.table ++ add_kw ++ col.name ++ " " ++ sqlType(col, dialect);
+                break :blk "ALTER TABLE " ++ quoteIdent(info.table, dialect) ++ add_kw ++ quoteIdent(col.name, dialect) ++ " " ++ sqlType(col, dialect);
             }
         }
         @compileError("zorm: ADD COLUMN field '" ++ field_name ++ "' is not a column of " ++ @typeName(T));
@@ -185,8 +193,10 @@ fn buildAddColumn(comptime T: type, comptime field_name: []const u8, comptime di
 /// `ALTER TABLE <table> DROP COLUMN <col>` — string-based, since a dropped
 /// column no longer exists on the (new) struct. Dialect-independent
 /// (SQLite ≥3.35, Postgres, MySQL).
-pub fn dropColumn(comptime table: []const u8, comptime col: []const u8) []const u8 {
-    return "ALTER TABLE " ++ table ++ " DROP COLUMN " ++ col;
+pub fn dropColumn(comptime table: []const u8, comptime col: []const u8, dialect: Dialect) []const u8 {
+    return switch (dialect) {
+        inline else => |d| comptime "ALTER TABLE " ++ quoteIdent(table, d) ++ " DROP COLUMN " ++ quoteIdent(col, d),
+    };
 }
 
 /// `CREATE INDEX` for every foreign-key column of `T` (one per BelongsTo).
@@ -223,15 +233,15 @@ const Account = struct {
 };
 
 test "createTable: SQLite DDL shape" {
-    const sql = createTable(Account, .sqlite);
-    try testing.expect(std.mem.startsWith(u8, sql, "CREATE TABLE IF NOT EXISTS atp_accounts ("));
-    try testing.expect(std.mem.indexOf(u8, sql, "id TEXT PRIMARY KEY") != null);
-    try testing.expect(std.mem.indexOf(u8, sql, "handle TEXT NOT NULL") != null);
-    try testing.expect(std.mem.indexOf(u8, sql, "email TEXT") != null);
-    try testing.expect(std.mem.indexOf(u8, sql, "email TEXT NOT NULL") == null); // nullable
-    try testing.expect(std.mem.indexOf(u8, sql, "role TEXT NOT NULL") != null); // enum non-null
-    try testing.expect(std.mem.indexOf(u8, sql, "confirmed INTEGER NOT NULL") != null);
-    try testing.expect(std.mem.endsWith(u8, sql, ")"));
+    const sql_ddl = createTable(Account, .sqlite);
+    try testing.expect(std.mem.startsWith(u8, sql_ddl, "CREATE TABLE IF NOT EXISTS \"atp_accounts\" ("));
+    try testing.expect(std.mem.indexOf(u8, sql_ddl, "\"id\" TEXT PRIMARY KEY") != null);
+    try testing.expect(std.mem.indexOf(u8, sql_ddl, "\"handle\" TEXT NOT NULL") != null);
+    try testing.expect(std.mem.indexOf(u8, sql_ddl, "\"email\" TEXT") != null);
+    try testing.expect(std.mem.indexOf(u8, sql_ddl, "\"email\" TEXT NOT NULL") == null); // nullable
+    try testing.expect(std.mem.indexOf(u8, sql_ddl, "\"role\" TEXT NOT NULL") != null); // enum non-null
+    try testing.expect(std.mem.indexOf(u8, sql_ddl, "\"confirmed\" INTEGER NOT NULL") != null);
+    try testing.expect(std.mem.endsWith(u8, sql_ddl, ")"));
 }
 
 const AutoEntity = struct {
@@ -242,43 +252,45 @@ const AutoEntity = struct {
 
 test "createTable: autoincrement PK differs by dialect" {
     const s = createTable(AutoEntity, .sqlite);
-    try testing.expect(std.mem.indexOf(u8, s, "id INTEGER PRIMARY KEY AUTOINCREMENT") != null);
+    try testing.expect(std.mem.indexOf(u8, s, "\"id\" INTEGER PRIMARY KEY AUTOINCREMENT") != null);
     const p = createTable(AutoEntity, .postgres);
-    try testing.expect(std.mem.indexOf(u8, p, "id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY") != null);
-    try testing.expect(std.mem.indexOf(u8, p, "name TEXT NOT NULL") != null);
+    try testing.expect(std.mem.indexOf(u8, p, "\"id\" BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY") != null);
+    try testing.expect(std.mem.indexOf(u8, p, "\"name\" TEXT NOT NULL") != null);
 }
 
 test "createTable: MySQL dialect — VARCHAR(N), BIGINT, TINYINT-free integers, AUTO_INCREMENT" {
     const a = createTable(Account, .mysql);
     // Text columns become VARCHAR(capacity) (MySQL can't PK/index a TEXT).
-    try testing.expect(std.mem.indexOf(u8, a, "id VARCHAR(64) PRIMARY KEY") != null);
-    try testing.expect(std.mem.indexOf(u8, a, "handle VARCHAR(253) NOT NULL") != null);
-    try testing.expect(std.mem.indexOf(u8, a, "email VARCHAR(320)") != null);
-    try testing.expect(std.mem.indexOf(u8, a, "email VARCHAR(320) NOT NULL") == null); // nullable
-    try testing.expect(std.mem.indexOf(u8, a, "role VARCHAR(6) NOT NULL") != null); // enum -> VARCHAR(longest tag = "member")
-    try testing.expect(std.mem.indexOf(u8, a, "confirmed BIGINT NOT NULL") != null); // bool -> integer family
-    try testing.expect(std.mem.indexOf(u8, a, "created_at BIGINT NOT NULL") != null);
+    try testing.expect(std.mem.indexOf(u8, a, "`id` VARCHAR(64) PRIMARY KEY") != null);
+    try testing.expect(std.mem.indexOf(u8, a, "`handle` VARCHAR(253) NOT NULL") != null);
+    try testing.expect(std.mem.indexOf(u8, a, "`email` VARCHAR(320)") != null);
+    try testing.expect(std.mem.indexOf(u8, a, "`email` VARCHAR(320) NOT NULL") == null); // nullable
+    try testing.expect(std.mem.indexOf(u8, a, "`role` VARCHAR(6) NOT NULL") != null); // enum -> VARCHAR(longest tag = "member")
+    try testing.expect(std.mem.indexOf(u8, a, "`confirmed` BIGINT NOT NULL") != null); // bool -> integer family
+    try testing.expect(std.mem.indexOf(u8, a, "`created_at` BIGINT NOT NULL") != null);
 
     const e = createTable(AutoEntity, .mysql);
-    try testing.expect(std.mem.indexOf(u8, e, "id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY") != null);
-    try testing.expect(std.mem.indexOf(u8, e, "name VARCHAR(32) NOT NULL") != null);
+    try testing.expect(std.mem.indexOf(u8, e, "`id` BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY") != null);
+    try testing.expect(std.mem.indexOf(u8, e, "`name` VARCHAR(32) NOT NULL") != null);
 }
 
 test "createTable: MS SQL dialect — OBJECT_ID guard, NVARCHAR(N), BIGINT, IDENTITY" {
     const a = createTable(Account, .mssql);
-    // T-SQL has no CREATE TABLE IF NOT EXISTS — guarded with OBJECT_ID.
-    try testing.expect(std.mem.startsWith(u8, a, "IF OBJECT_ID(N'atp_accounts', N'U') IS NULL CREATE TABLE atp_accounts ("));
-    try testing.expect(std.mem.indexOf(u8, a, "id NVARCHAR(64) PRIMARY KEY") != null);
-    try testing.expect(std.mem.indexOf(u8, a, "handle NVARCHAR(253) NOT NULL") != null);
-    try testing.expect(std.mem.indexOf(u8, a, "email NVARCHAR(320)") != null);
-    try testing.expect(std.mem.indexOf(u8, a, "email NVARCHAR(320) NOT NULL") == null); // nullable
-    try testing.expect(std.mem.indexOf(u8, a, "role NVARCHAR(6) NOT NULL") != null); // enum
-    try testing.expect(std.mem.indexOf(u8, a, "confirmed BIGINT NOT NULL") != null);
-    try testing.expect(std.mem.indexOf(u8, a, "created_at BIGINT NOT NULL") != null);
+    // T-SQL has no CREATE TABLE IF NOT EXISTS — guarded with OBJECT_ID. The
+    // guard refers to the table as a STRING LITERAL (unquoted); the actual
+    // CREATE TABLE identifier is bracket-quoted.
+    try testing.expect(std.mem.startsWith(u8, a, "IF OBJECT_ID(N'atp_accounts', N'U') IS NULL CREATE TABLE [atp_accounts] ("));
+    try testing.expect(std.mem.indexOf(u8, a, "[id] NVARCHAR(64) PRIMARY KEY") != null);
+    try testing.expect(std.mem.indexOf(u8, a, "[handle] NVARCHAR(253) NOT NULL") != null);
+    try testing.expect(std.mem.indexOf(u8, a, "[email] NVARCHAR(320)") != null);
+    try testing.expect(std.mem.indexOf(u8, a, "[email] NVARCHAR(320) NOT NULL") == null); // nullable
+    try testing.expect(std.mem.indexOf(u8, a, "[role] NVARCHAR(6) NOT NULL") != null); // enum
+    try testing.expect(std.mem.indexOf(u8, a, "[confirmed] BIGINT NOT NULL") != null);
+    try testing.expect(std.mem.indexOf(u8, a, "[created_at] BIGINT NOT NULL") != null);
 
     const e = createTable(AutoEntity, .mssql);
-    try testing.expect(std.mem.indexOf(u8, e, "id BIGINT IDENTITY(1,1) PRIMARY KEY") != null);
-    try testing.expect(std.mem.indexOf(u8, e, "name NVARCHAR(32) NOT NULL") != null);
+    try testing.expect(std.mem.indexOf(u8, e, "[id] BIGINT IDENTITY(1,1) PRIMARY KEY") != null);
+    try testing.expect(std.mem.indexOf(u8, e, "[name] NVARCHAR(32) NOT NULL") != null);
 }
 
 const BlobEntity = struct {
@@ -288,12 +300,68 @@ const BlobEntity = struct {
 };
 
 test "createTable: blob type per dialect" {
-    try testing.expect(std.mem.indexOf(u8, createTable(BlobEntity, .sqlite), "data BLOB NOT NULL") != null);
-    try testing.expect(std.mem.indexOf(u8, createTable(BlobEntity, .postgres), "data BYTEA NOT NULL") != null);
-    try testing.expect(std.mem.indexOf(u8, createTable(BlobEntity, .mysql), "data VARBINARY(512) NOT NULL") != null);
-    try testing.expect(std.mem.indexOf(u8, createTable(BlobEntity, .mssql), "data VARBINARY(512) NOT NULL") != null);
+    try testing.expect(std.mem.indexOf(u8, createTable(BlobEntity, .sqlite), "\"data\" BLOB NOT NULL") != null);
+    try testing.expect(std.mem.indexOf(u8, createTable(BlobEntity, .postgres), "\"data\" BYTEA NOT NULL") != null);
+    try testing.expect(std.mem.indexOf(u8, createTable(BlobEntity, .mysql), "`data` VARBINARY(512) NOT NULL") != null);
+    try testing.expect(std.mem.indexOf(u8, createTable(BlobEntity, .mssql), "[data] VARBINARY(512) NOT NULL") != null);
 }
 
 test "dropTable" {
     try testing.expectEqualStrings("DROP TABLE IF EXISTS things", dropTable(AutoEntity));
+}
+
+// An entity whose table name (`order`) AND a column name (`select`) are SQL
+// reserved words — identifier quoting is what makes the DDL valid.
+const ReservedDdl = struct {
+    pub const zorm_table = "order";
+    id: fields.Pk(32) = .{},
+    select: fields.Text(16) = .{},
+};
+
+test "createTable: reserved-word table + column are quoted per dialect" {
+    // SQLite / Postgres → double quotes.
+    try testing.expectEqualStrings(
+        "CREATE TABLE IF NOT EXISTS \"order\" (\"id\" TEXT PRIMARY KEY, \"select\" TEXT NOT NULL)",
+        createTable(ReservedDdl, .sqlite),
+    );
+    // MySQL → backticks.
+    try testing.expectEqualStrings(
+        "CREATE TABLE IF NOT EXISTS `order` (`id` VARCHAR(32) PRIMARY KEY, `select` VARCHAR(16) NOT NULL)",
+        createTable(ReservedDdl, .mysql),
+    );
+    // MS SQL → brackets; the OBJECT_ID guard keeps the string-literal table name.
+    try testing.expectEqualStrings(
+        "IF OBJECT_ID(N'order', N'U') IS NULL CREATE TABLE [order] ([id] NVARCHAR(32) PRIMARY KEY, [select] NVARCHAR(16) NOT NULL)",
+        createTable(ReservedDdl, .mssql),
+    );
+}
+
+test "createIndex/addColumn/dropColumn: reserved-word identifiers are quoted" {
+    // Index name + table + column all quoted.
+    try testing.expectEqualStrings(
+        "CREATE INDEX IF NOT EXISTS \"ix_order_select\" ON \"order\" (\"select\")",
+        createIndex(ReservedDdl, &.{"select"}, false, .sqlite),
+    );
+    try testing.expectEqualStrings(
+        "CREATE INDEX IF NOT EXISTS `ix_order_select` ON `order` (`select`)",
+        createIndex(ReservedDdl, &.{"select"}, false, .mysql),
+    );
+    // ADD COLUMN quotes table + column (emitted WITHOUT NOT NULL by design).
+    try testing.expectEqualStrings(
+        "ALTER TABLE \"order\" ADD COLUMN \"select\" TEXT",
+        addColumn(ReservedDdl, "select", .sqlite),
+    );
+    try testing.expectEqualStrings(
+        "ALTER TABLE [order] ADD [select] NVARCHAR(16)",
+        addColumn(ReservedDdl, "select", .mssql),
+    );
+    // DROP COLUMN (string-based) quotes both identifiers per dialect.
+    try testing.expectEqualStrings(
+        "ALTER TABLE \"order\" DROP COLUMN \"select\"",
+        dropColumn("order", "select", .sqlite),
+    );
+    try testing.expectEqualStrings(
+        "ALTER TABLE `order` DROP COLUMN `select`",
+        dropColumn("order", "select", .mysql),
+    );
 }

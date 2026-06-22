@@ -77,9 +77,9 @@ test "toCoreMigration joins zorm statements into one SQL string" {
     try testing.expectEqual(@as(u32, 5001), m.id);
     try testing.expectEqualStrings("zm_posts:create", m.name);
     // CREATE TABLE (with FK) ; CREATE INDEX
-    try testing.expect(std.mem.indexOf(u8, m.up, "CREATE TABLE IF NOT EXISTS zm_posts (") != null);
-    try testing.expect(std.mem.indexOf(u8, m.up, "FOREIGN KEY (author_id) REFERENCES zm_users (id) ON DELETE CASCADE") != null);
-    try testing.expect(std.mem.indexOf(u8, m.up, ";\nCREATE INDEX IF NOT EXISTS ix_zm_posts_author_id") != null);
+    try testing.expect(std.mem.indexOf(u8, m.up, "CREATE TABLE IF NOT EXISTS \"zm_posts\" (") != null);
+    try testing.expect(std.mem.indexOf(u8, m.up, "FOREIGN KEY (\"author_id\") REFERENCES \"zm_users\" (\"id\") ON DELETE CASCADE") != null);
+    try testing.expect(std.mem.indexOf(u8, m.up, ";\nCREATE INDEX IF NOT EXISTS \"ix_zm_posts_author_id\"") != null);
     try testing.expect(m.down != null);
     try testing.expect(std.mem.indexOf(u8, m.down.?, "DROP TABLE IF EXISTS zm_posts") != null);
 }
