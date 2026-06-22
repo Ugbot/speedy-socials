@@ -67,6 +67,95 @@ fn buildInitialUp(comptime T: type, comptime dialect: Dialect) []const []const u
     return &out;
 }
 
+/// A comptime schema diff between two versions of the SAME entity: a
+/// migration whose `up` evolves `OldT`'s columns into `NewT`'s and whose
+/// `down` is the exact inverse.
+///
+/// Diff rules (pure struct-vs-struct via `reflect.TableInfo`, NO DB
+/// introspection):
+///   * a column present in `NewT` but not `OldT` → `ddl.addColumn(NewT, …)`
+///     (down: `ddl.dropColumn(table, col)`);
+///   * a column present in `OldT` but not `NewT` → `ddl.dropColumn(table, col)`
+///     (down: `ddl.addColumn(OldT, …)`, since the column's type lives on OldT).
+///
+/// Columns are matched by NAME. A column whose TYPE/constraints CHANGED, or a
+/// RENAME, is OUT OF SCOPE — the differ sees a same-named column as unchanged
+/// and a rename as an unrelated drop+add. Author a type change explicitly as a
+/// drop-then-add (two columns, or a hand-written `Migration`); zorm will not
+/// silently emit an `ALTER … TYPE` it cannot make safe across dialects.
+///
+/// Both entities must declare the same `zorm_table` (a diff is within ONE
+/// table); this is asserted at comptime.
+pub fn diffMigration(comptime OldT: type, comptime NewT: type, id: u32, name: []const u8, dialect: Dialect) Migration {
+    return switch (dialect) {
+        inline else => |d| .{
+            .id = id,
+            .name = name,
+            .up = comptime diffUp(OldT, NewT, d),
+            .down = comptime diffDown(OldT, NewT, d),
+        },
+    };
+}
+
+/// Comptime `up` statement list for an `OldT → NewT` diff (added columns
+/// ADDed, removed columns DROPped). See `diffMigration`.
+fn diffUp(comptime OldT: type, comptime NewT: type, comptime dialect: Dialect) []const []const u8 {
+    comptime {
+        const old_info = reflect.TableInfo(OldT);
+        const new_info = reflect.TableInfo(NewT);
+        assertSameTable(old_info, new_info);
+        const table = new_info.table;
+        var up: []const []const u8 = &.{};
+        for (new_info.columns) |nc| {
+            if (!hasColumn(old_info, nc.name))
+                up = up ++ [_][]const u8{ddl.addColumn(NewT, nc.name, dialect)};
+        }
+        for (old_info.columns) |oc| {
+            if (!hasColumn(new_info, oc.name))
+                up = up ++ [_][]const u8{ddl.dropColumn(table, oc.name, dialect)};
+        }
+        const out = up;
+        return out;
+    }
+}
+
+/// Comptime `down` list — the exact inverse of `diffUp`: added columns are
+/// DROPped, removed columns are re-ADDed off `OldT` (where their type spec
+/// still lives). Same per-direction order as `diffUp`, so a `down` applied
+/// after its `up` returns the schema to `OldT`.
+fn diffDown(comptime OldT: type, comptime NewT: type, comptime dialect: Dialect) []const []const u8 {
+    comptime {
+        const old_info = reflect.TableInfo(OldT);
+        const new_info = reflect.TableInfo(NewT);
+        assertSameTable(old_info, new_info);
+        const table = new_info.table;
+        var down: []const []const u8 = &.{};
+        for (new_info.columns) |nc| {
+            if (!hasColumn(old_info, nc.name))
+                down = down ++ [_][]const u8{ddl.dropColumn(table, nc.name, dialect)};
+        }
+        for (old_info.columns) |oc| {
+            if (!hasColumn(new_info, oc.name))
+                down = down ++ [_][]const u8{ddl.addColumn(OldT, oc.name, dialect)};
+        }
+        const out = down;
+        return out;
+    }
+}
+
+fn assertSameTable(comptime old_info: type, comptime new_info: type) void {
+    if (!std.mem.eql(u8, old_info.table, new_info.table))
+        @compileError("zorm: diffMigration requires both entities to share `zorm_table` (got '" ++
+            old_info.table ++ "' vs '" ++ new_info.table ++ "')");
+}
+
+fn hasColumn(comptime info: type, comptime col_name: []const u8) bool {
+    for (info.columns) |c| {
+        if (std.mem.eql(u8, c.name, col_name)) return true;
+    }
+    return false;
+}
+
 /// Applies ordered migrations over a `zorm.Backend`, tracked in a
 /// `zorm_migrations` table. Dialect-aware (tracking DDL + bind placeholders).
 pub const Migrator = struct {
@@ -113,6 +202,77 @@ pub const Migrator = struct {
             });
         }
     };
+
+    /// Undo every APPLIED migration with `id > down_to_id`, in DESCENDING id
+    /// order (the inverse of `run`'s ascending apply). For each such migration
+    /// this execs its `down` statements and deletes its `zorm_migrations` row,
+    /// all inside ONE `backend.transaction` per migration (so a failed `down`
+    /// rolls back and leaves the tracking row intact — the migration stays
+    /// "applied", consistent with `run`'s failure semantics).
+    ///
+    /// Migrations are matched against the caller-supplied `migrations` slice
+    /// (same set passed to `run`); we never introspect the DB schema. An
+    /// id present in `zorm_migrations` but ABSENT from the slice is left
+    /// untouched (we have no `down` for it) — callers pass the full history.
+    ///
+    /// NULL-DOWN POLICY: a migration whose `down == null` is IRREVERSIBLE.
+    /// Encountering one in the rollback range is a hard error
+    /// (`Error.BackendFailed`): we will NOT silently skip it and delete its
+    /// tracking row, because that would leave the DB schema ahead of the
+    /// recorded migration state. The caller must split the irreversible step
+    /// out or supply a `down`. The error is raised BEFORE any `down` runs for
+    /// that migration, so nothing in the range is half-applied.
+    ///
+    /// `now_unix` is accepted for signature symmetry with `run` (rollback
+    /// writes no timestamps); it is currently unused.
+    pub fn rollback(backend: Backend, migrations: []const Migration, down_to_id: u32, now_unix: i64) Error!void {
+        _ = now_unix;
+        if (migrations.len > max_migrations) return Error.BackendFailed;
+        try ensureTable(backend);
+
+        // Descending id order over a private index buffer (don't mutate the
+        // caller's slice).
+        var order: [max_migrations]usize = undefined;
+        for (0..migrations.len) |i| order[i] = i;
+        var i: usize = 1;
+        while (i < migrations.len) : (i += 1) {
+            var j = i;
+            while (j > 0 and migrations[order[j - 1]].id < migrations[order[j]].id) : (j -= 1) {
+                const t = order[j];
+                order[j] = order[j - 1];
+                order[j - 1] = t;
+            }
+        }
+
+        for (order[0..migrations.len]) |idx| {
+            const m = &migrations[idx];
+            if (m.id <= down_to_id) continue;
+            if (!try isApplied(backend, m.id)) continue;
+            if (m.down == null) return Error.BackendFailed;
+            var ctx = RollbackCtx{ .backend = backend, .mig = m, .del_sql = deleteSql(backend.dialect) };
+            try backend.transaction(&ctx, RollbackCtx.body);
+        }
+    }
+
+    const RollbackCtx = struct {
+        backend: Backend,
+        mig: *const Migration,
+        del_sql: []const u8,
+
+        fn body(ptr: *anyopaque) Error!void {
+            const c: *RollbackCtx = @ptrCast(@alignCast(ptr));
+            for (c.mig.down.?) |stmt| try c.backend.exec(stmt, &.{});
+            try c.backend.exec(c.del_sql, &.{.{ .int = @intCast(c.mig.id) }});
+        }
+    };
+
+    fn deleteSql(dialect: Dialect) []const u8 {
+        return switch (dialect) {
+            .sqlite, .mysql => "DELETE FROM zorm_migrations WHERE id = ?",
+            .postgres => "DELETE FROM zorm_migrations WHERE id = $1",
+            .mssql => "DELETE FROM zorm_migrations WHERE id = @p1",
+        };
+    }
 
     fn ensureTable(backend: Backend) Error!void {
         const sql = switch (backend.dialect) {
@@ -240,4 +400,142 @@ test "Migrator: a failing migration rolls back and is not recorded" {
     var row: contract.Row = .{};
     try testing.expect(try backend.queryOne("SELECT 1 FROM zorm_migrations WHERE id = ?", &.{.{ .int = 2000 }}, &row));
     try testing.expect(!try backend.queryOne("SELECT 1 FROM zorm_migrations WHERE id = ?", &.{.{ .int = 2001 }}, &row));
+}
+
+// Two versions of the SAME entity, differing by columns, for diff tests.
+const UserV1 = struct {
+    pub const zorm_table = "m_users";
+    id: fields.Pk(64) = .{},
+    name: fields.Text(64) = .{},
+};
+const UserV2 = struct {
+    pub const zorm_table = "m_users";
+    id: fields.Pk(64) = .{},
+    name: fields.Text(64) = .{},
+    bio: fields.Text(128) = .{},
+};
+
+test "diffMigration: added column → ADD COLUMN up, DROP COLUMN down" {
+    const m = diffMigration(UserV1, UserV2, 3001, "m_users:add_bio", .sqlite);
+    try testing.expectEqual(@as(u32, 3001), m.id);
+    try testing.expectEqualStrings("m_users:add_bio", m.name);
+    // up: one ADD COLUMN for the new `bio` field (no NOT NULL, by ddl design).
+    try testing.expectEqual(@as(usize, 1), m.up.len);
+    try testing.expectEqualStrings("ALTER TABLE \"m_users\" ADD COLUMN \"bio\" TEXT", m.up[0]);
+    // down: drop it again.
+    try testing.expect(m.down != null);
+    try testing.expectEqual(@as(usize, 1), m.down.?.len);
+    try testing.expectEqualStrings("ALTER TABLE \"m_users\" DROP COLUMN \"bio\"", m.down.?[0]);
+}
+
+test "diffMigration: dropped column → DROP COLUMN up, ADD COLUMN (off OldT) down" {
+    // Reverse direction: V2 → V1 drops `bio`.
+    const m = diffMigration(UserV2, UserV1, 3002, "m_users:drop_bio", .postgres);
+    try testing.expectEqual(@as(usize, 1), m.up.len);
+    try testing.expectEqualStrings("ALTER TABLE \"m_users\" DROP COLUMN \"bio\"", m.up[0]);
+    // down re-adds the column using OldT (=V2), where `bio`'s type still lives.
+    try testing.expect(m.down != null);
+    try testing.expectEqual(@as(usize, 1), m.down.?.len);
+    try testing.expectEqualStrings("ALTER TABLE \"m_users\" ADD COLUMN \"bio\" TEXT", m.down.?[0]);
+}
+
+test "diffMigration: identical schemas → empty up/down" {
+    const m = diffMigration(UserV2, UserV2, 3003, "noop", .mysql);
+    try testing.expectEqual(@as(usize, 0), m.up.len);
+    try testing.expect(m.down != null);
+    try testing.expectEqual(@as(usize, 0), m.down.?.len);
+}
+
+test "diffMigration: add + drop together (rename expressed as drop+add)" {
+    const A = struct {
+        pub const zorm_table = "m_things";
+        id: fields.Pk(32) = .{},
+        old_name: fields.Text(40) = .{},
+    };
+    const B = struct {
+        pub const zorm_table = "m_things";
+        id: fields.Pk(32) = .{},
+        new_name: fields.Text(40) = .{},
+    };
+    const m = diffMigration(A, B, 3004, "m_things:rename", .sqlite);
+    // up: ADD new_name (from B), then DROP old_name (gone from B).
+    try testing.expectEqual(@as(usize, 2), m.up.len);
+    try testing.expectEqualStrings("ALTER TABLE \"m_things\" ADD COLUMN \"new_name\" TEXT", m.up[0]);
+    try testing.expectEqualStrings("ALTER TABLE \"m_things\" DROP COLUMN \"old_name\"", m.up[1]);
+    // down: inverse — DROP new_name, ADD old_name (off OldT=A).
+    try testing.expectEqual(@as(usize, 2), m.down.?.len);
+    try testing.expectEqualStrings("ALTER TABLE \"m_things\" DROP COLUMN \"new_name\"", m.down.?[0]);
+    try testing.expectEqualStrings("ALTER TABLE \"m_things\" ADD COLUMN \"old_name\" TEXT", m.down.?[1]);
+}
+
+test "Migrator.rollback: undoes applied migrations above down_to_id, runs down + removes rows" {
+    var db = mock.MockBackend.init();
+    const backend = db.backend(.sqlite);
+
+    const migs = [_]Migration{
+        initialMigration(User, 2000, .sqlite),
+        diffMigration(UserV1, UserV2, 2001, "m_users:add_bio", .sqlite),
+        // a further reversible step
+        .{
+            .id = 2002,
+            .name = "m_users:add_idx",
+            .up = &.{ddl.createIndex(UserV2, &.{"bio"}, false, .sqlite)},
+            .down = &.{ddl.dropIndex(UserV2, &.{"bio"}, .sqlite)},
+        },
+    };
+    try Migrator.run(backend, &migs, 1_700_000_000);
+    // Sanity: all three applied.
+    var row: contract.Row = .{};
+    inline for (.{ 2000, 2001, 2002 }) |id| {
+        try testing.expect(try backend.queryOne("SELECT 1 FROM zorm_migrations WHERE id = ?", &.{.{ .int = id }}, &row));
+    }
+
+    // Roll back everything above 2000 (i.e. 2001 and 2002).
+    try Migrator.rollback(backend, &migs, 2000, 1_700_000_500);
+
+    // 2001 + 2002 tracking rows removed; 2000 (the floor) untouched.
+    try testing.expect(try backend.queryOne("SELECT 1 FROM zorm_migrations WHERE id = ?", &.{.{ .int = 2000 }}, &row));
+    try testing.expect(!try backend.queryOne("SELECT 1 FROM zorm_migrations WHERE id = ?", &.{.{ .int = 2001 }}, &row));
+    try testing.expect(!try backend.queryOne("SELECT 1 FROM zorm_migrations WHERE id = ?", &.{.{ .int = 2002 }}, &row));
+
+    // Idempotent: rolling back again is a no-op (nothing applied above floor).
+    try Migrator.rollback(backend, &migs, 2000, 1_700_000_600);
+    try testing.expect(try backend.queryOne("SELECT 1 FROM zorm_migrations WHERE id = ?", &.{.{ .int = 2000 }}, &row));
+}
+
+test "Migrator.rollback: a null-down migration in range is a hard error (irreversible policy)" {
+    var db = mock.MockBackend.init();
+    const backend = db.backend(.sqlite);
+    const migs = [_]Migration{
+        initialMigration(User, 2000, .sqlite),
+        // No `down` → irreversible.
+        .{ .id = 2001, .name = "m_users:irreversible", .up = &.{ddl.addColumn(UserV2, "bio", .sqlite)} },
+    };
+    try Migrator.run(backend, &migs, 1_700_000_000);
+
+    // Rolling back past it must error, and must NOT delete its tracking row.
+    try testing.expectError(Error.BackendFailed, Migrator.rollback(backend, &migs, 2000, 1_700_000_500));
+    var row: contract.Row = .{};
+    try testing.expect(try backend.queryOne("SELECT 1 FROM zorm_migrations WHERE id = ?", &.{.{ .int = 2001 }}, &row));
+}
+
+test "Migrator.rollback: a failing down rolls back and keeps the tracking row" {
+    var db = mock.MockBackend.init();
+    const backend = db.backend(.sqlite);
+    const migs = [_]Migration{
+        initialMigration(User, 2000, .sqlite),
+        .{
+            .id = 2001,
+            .name = "m_users:add_bio",
+            .up = &.{ddl.addColumn(UserV2, "bio", .sqlite)},
+            // down has a statement the mock rejects → transaction rolls back.
+            .down = &.{"TOTALLY NOT SQL"},
+        },
+    };
+    try Migrator.run(backend, &migs, 1_700_000_000);
+
+    try testing.expectError(Error.BadStatement, Migrator.rollback(backend, &migs, 2000, 1_700_000_500));
+    // The failed down rolled back: 2001 is STILL recorded as applied.
+    var row: contract.Row = .{};
+    try testing.expect(try backend.queryOne("SELECT 1 FROM zorm_migrations WHERE id = ?", &.{.{ .int = 2001 }}, &row));
 }
