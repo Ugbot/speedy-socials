@@ -48,6 +48,7 @@ pub const subscription = @import("subscription.zig");
 pub const routes = @import("routes.zig");
 pub const state = @import("state.zig");
 pub const firehose_consumer = @import("firehose_consumer.zig");
+pub const downstream_subscriber = @import("downstream_subscriber.zig");
 pub const ap_to_at = @import("ap_to_at.zig");
 pub const synthetic_keys = @import("synthetic_keys.zig");
 pub const followers = @import("followers.zig");
@@ -236,6 +237,7 @@ test {
     _ = routes;
     _ = state;
     _ = firehose_consumer;
+    _ = downstream_subscriber;
     _ = ap_to_at;
     _ = synthetic_keys;
     _ = followers;

@@ -64,6 +64,45 @@ fn relayConsumerReadyHook(_: ?*anyopaque) core.health.Status {
     return .ready;
 }
 
+/// R1: start the downstream relay subscriber when `RELAY_DOWNSTREAM_*`
+/// env enables it. Opens its own sqlite handle (same NOMUTEX
+/// per-thread constraint the firehose consumer documents) and a
+/// heap-allocated `Subscriber` that lives for the process. Returns the
+/// subscriber pointer (caller stops + frees it) or null when disabled /
+/// on failure (a soft boot failure — the rest of the relay still runs).
+fn startDownstreamRelaySubscriber(
+    allocator: std.mem.Allocator,
+    db_path: [:0]const u8,
+    clock: core.clock.Clock,
+    io: std.Io,
+    log_ptr: *core.log.Log,
+) ?*relay.downstream_subscriber.Subscriber {
+    const cfg = relay.downstream_subscriber.Config.fromEnv();
+    if (!cfg.enable) return null;
+
+    const sub_db = core.storage.sqlite.openWriter(db_path) catch |err| {
+        log_ptr.record(.warn, "boot", "relay downstream subscriber db open failed", &.{
+            .{ .k = "err", .v = @errorName(err) },
+        });
+        return null;
+    };
+    const sub = allocator.create(relay.downstream_subscriber.Subscriber) catch {
+        core.storage.sqlite.closeDb(sub_db);
+        return null;
+    };
+    sub.* = .{ .db = sub_db, .clock = clock, .cfg = cfg, .io = io };
+    relay.downstream_subscriber.start(sub) catch |err| {
+        log_ptr.record(.warn, "boot", "relay downstream subscriber failed to start", &.{
+            .{ .k = "err", .v = @errorName(err) },
+        });
+        core.storage.sqlite.closeDb(sub_db);
+        allocator.destroy(sub);
+        return null;
+    };
+    log_ptr.info("boot", "relay downstream subscriber started (consuming external relay firehose)");
+    return sub;
+}
+
 // ── Inbound TLS (W3.2) wiring helpers ────────────────────────────────
 //
 // `InboundTlsHolder` owns the heap-allocated inbound TLS backend for
@@ -656,6 +695,15 @@ pub fn main() !void {
     log_ptr.info("boot", "relay firehose consumer started (dedicated db handle)");
     // F2: probe.
     try health.addHook("relay_firehose_consumer", relayConsumerReadyHook, null);
+
+    // R1: optional downstream relay subscriber — consumes an EXTERNAL
+    // relay's subscribeRepos firehose into the same translate/ingest path.
+    const relay_downstream = startDownstreamRelaySubscriber(gpa_allocator, db_path, real_clock.clock(), io, log_ptr);
+    defer if (relay_downstream) |s| {
+        relay.downstream_subscriber.stop(s);
+        core.storage.sqlite.closeDb(s.db);
+        gpa_allocator.destroy(s);
+    };
 
     // W5.2 + W6: install the relay's AP-inbox hook. Fires after
     // every accepted AP activity; the relay translates it into a

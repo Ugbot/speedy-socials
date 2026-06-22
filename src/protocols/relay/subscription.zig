@@ -122,6 +122,49 @@ pub fn subscribe(
     return c.sqlite3_column_int64(stmt, 0);
 }
 
+/// R1: persist the upstream cursor for a subscription. The cursor is an
+/// opaque token the upstream defines; for an AT `subscribeRepos` source
+/// it is the last consumed `seq` rendered as a decimal string. Stored so
+/// a reconnect resumes from `?cursor=<value>` rather than replaying the
+/// whole firehose. No-op (returns SubscriptionNotFound) if the id is
+/// unknown.
+pub fn setCursor(db: *c.sqlite3, id: i64, cursor: []const u8) RelayError!void {
+    if (cursor.len > max_cursor_bytes) return error.BadSubscriptionState;
+    var stmt: ?*c.sqlite3_stmt = null;
+    if (c.sqlite3_prepare_v2(db, "UPDATE relay_subscriptions SET cursor = ? WHERE id = ?", -1, &stmt, null) != c.SQLITE_OK) {
+        if (stmt != null) _ = c.sqlite3_finalize(stmt);
+        return error.BadSubscriptionState;
+    }
+    defer _ = c.sqlite3_finalize(stmt);
+    if (cursor.len == 0) {
+        if (c.sqlite3_bind_null(stmt, 1) != c.SQLITE_OK) return error.BadSubscriptionState;
+    } else {
+        if (c.sqlite3_bind_text(stmt, 1, cursor.ptr, @intCast(cursor.len), c.sqliteTransientAsDestructor()) != c.SQLITE_OK) return error.BadSubscriptionState;
+    }
+    if (c.sqlite3_bind_int64(stmt, 2, id) != c.SQLITE_OK) return error.BadSubscriptionState;
+    if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.BadSubscriptionState;
+    if (c.sqlite3_changes(db) == 0) return error.SubscriptionNotFound;
+}
+
+/// R1: read back the cursor for a subscription into `out`, returning the
+/// slice written (empty when the cursor is NULL or the id is unknown).
+pub fn getCursor(db: *c.sqlite3, id: i64, out: []u8) RelayError![]const u8 {
+    var stmt: ?*c.sqlite3_stmt = null;
+    if (c.sqlite3_prepare_v2(db, "SELECT cursor FROM relay_subscriptions WHERE id = ?", -1, &stmt, null) != c.SQLITE_OK) {
+        if (stmt != null) _ = c.sqlite3_finalize(stmt);
+        return error.BadSubscriptionState;
+    }
+    defer _ = c.sqlite3_finalize(stmt);
+    if (c.sqlite3_bind_int64(stmt, 1, id) != c.SQLITE_OK) return error.BadSubscriptionState;
+    if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return out[0..0];
+    if (c.sqlite3_column_type(stmt, 0) != c.SQLITE_TEXT) return out[0..0];
+    const cp = c.sqlite3_column_text(stmt, 0);
+    const cn: usize = @intCast(c.sqlite3_column_bytes(stmt, 0));
+    const cap = @min(cn, out.len);
+    if (cap > 0 and cp != null) @memcpy(out[0..cap], cp[0..cap]);
+    return out[0..cap];
+}
+
 /// Transition a subscription's state. Allowed transitions:
 ///   active → paused | failed
 ///   paused → active
@@ -450,6 +493,40 @@ test "translation log append + paginate (newest first)" {
     try testing.expectEqual(@as(u32, 2), n);
     try testing.expectEqual(ids[2], rows[0].id);
     try testing.expectEqual(ids[1], rows[1].id);
+}
+
+test "R1: setCursor/getCursor round-trips opaque token; null on fresh sub" {
+    const db = try sqlite_mod.openWriter(":memory:");
+    defer sqlite_mod.closeDb(db);
+    try applyRelaySchema(db);
+    var sc = core.clock.SimClock.init(1);
+
+    const id = try subscribe(db, sc.clock(), .atproto_firehose, "wss://relay.example/xrpc/com.atproto.sync.subscribeRepos");
+
+    // Fresh subscription has a NULL cursor.
+    var buf: [64]u8 = undefined;
+    try testing.expectEqualStrings("", try getCursor(db, id, &buf));
+
+    // Randomized seq token so we're not asserting a hardcoded happy path.
+    var prng = std.Random.DefaultPrng.init(0x5E_A1_C0_DE);
+    const rand = prng.random();
+    const seq = rand.intRangeAtMost(u64, 1, 9_999_999);
+    var tok_buf: [32]u8 = undefined;
+    const tok = try std.fmt.bufPrint(&tok_buf, "{d}", .{seq});
+    try setCursor(db, id, tok);
+    try testing.expectEqualStrings(tok, try getCursor(db, id, &buf));
+
+    // Overwrite with a later seq.
+    const tok2 = try std.fmt.bufPrint(&tok_buf, "{d}", .{seq + 1});
+    try setCursor(db, id, tok2);
+    try testing.expectEqualStrings(tok2, try getCursor(db, id, &buf));
+}
+
+test "R1: setCursor on missing subscription returns SubscriptionNotFound" {
+    const db = try sqlite_mod.openWriter(":memory:");
+    defer sqlite_mod.closeDb(db);
+    try applyRelaySchema(db);
+    try testing.expectError(error.SubscriptionNotFound, setCursor(db, 4242, "100"));
 }
 
 test "translation log records errors with error_msg" {
