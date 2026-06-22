@@ -184,6 +184,22 @@ pub const AttachmentList = struct {
 
 pub const public_addressing_iri = "https://www.w3.org/ns/activitystreams#Public";
 
+/// AP federation-correctness: recognise the AS2 public collection in any
+/// of its three spelled forms so recipient resolution does NOT treat it
+/// as a fetchable inbox / actor:
+///   * the full IRI `https://www.w3.org/ns/activitystreams#Public`
+///   * the JSON-LD compact alias `as:Public`
+///   * the bare alias `Public`
+/// The bare/compact aliases are non-conformant but appear in the wild
+/// (older Mastodon, some bridges); peers expect us to treat them as
+/// public addressing rather than dereference them.
+pub fn isPublicAddressing(addr: []const u8) bool {
+    if (std.mem.eql(u8, addr, public_addressing_iri)) return true;
+    if (std.mem.eql(u8, addr, "as:Public")) return true;
+    if (std.mem.eql(u8, addr, "Public")) return true;
+    return false;
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // AP-22: AS2 object type validation. The parser is *tolerant* — unknown
 // types are accepted (state machines treat them as opaque), but we
@@ -452,12 +468,12 @@ fn parseTopObject(
         } else if (std.mem.eql(u8, key, "published")) {
             out.published = try parseString(sc);
         } else if (std.mem.eql(u8, key, "to")) {
-            try parseAddressing(sc, &out.to_first);
-            // Note: parseAddressing only sets the head; we'd need a
-            // re-scan to populate `out.to` fully. For now the
-            // `to_first` field covers the common Mastodon shape
-            // (single Public addressing); broader recipient walking
-            // is handled at the delivery layer via `resolveRecipients`.
+            // Populate the full `to` list AND the legacy `to_first`
+            // head in one pass. Inbound recipient handling walks the
+            // whole `to` array; `to_first` is retained for callers that
+            // only need the common single-recipient Mastodon shape.
+            try parseAddressingList(sc, &out.to);
+            if (out.to.len > 0) out.to_first = out.to.items[0];
         } else if (std.mem.eql(u8, key, "cc")) {
             try parseAddressingList(sc, &out.cc);
         } else if (std.mem.eql(u8, key, "bto") or std.mem.eql(u8, key, "bcc")) {
@@ -784,53 +800,6 @@ fn parseAttachmentObject(sc: *Scanner) ApError!Attachment {
     }
 }
 
-// AP-2: parse a `to` / `cc` value, capturing both the head (legacy
-// `to_first` callers) AND populating a bounded `AddressingList` so
-// recipient resolution can walk every entry.
-fn parseAddressing(sc: *Scanner, first: *[]const u8) ApError!void {
-    sc.skipWhitespace();
-    if (sc.peek() == '"') {
-        first.* = try parseString(sc);
-        return;
-    }
-    if (sc.peek() != '[') {
-        try skipValue(sc, 1);
-        return;
-    }
-    sc.advance();
-    sc.skipWhitespace();
-    if (sc.peek() == ']') {
-        sc.advance();
-        return;
-    }
-    if (sc.peek() == '"') {
-        first.* = try parseString(sc);
-    } else {
-        try skipValue(sc, 2);
-    }
-    var guard: u32 = 0;
-    while (true) {
-        guard += 1;
-        if (guard > 256) return error.BadObject;
-        sc.skipWhitespace();
-        if (sc.peek() == ']') {
-            sc.advance();
-            return;
-        }
-        if (sc.peek() == ',') {
-            sc.advance();
-            sc.skipWhitespace();
-            if (sc.peek() == '"') {
-                _ = try parseString(sc);
-            } else {
-                try skipValue(sc, 2);
-            }
-            continue;
-        }
-        return error.BadObject;
-    }
-}
-
 /// AP-2 full addressing parse: populate an `AddressingList` with every
 /// IRI from a `to` / `cc` value. Accepts string OR array form.
 fn parseAddressingList(sc: *Scanner, list: *AddressingList) ApError!void {
@@ -1021,6 +990,45 @@ test "AP-24: parse defaults sensitive to false when absent" {
     ;
     const act = try parse(input);
     try std.testing.expect(!act.sensitive);
+}
+
+test "isPublicAddressing recognises the AS2 public collection and aliases" {
+    try std.testing.expect(isPublicAddressing("https://www.w3.org/ns/activitystreams#Public"));
+    try std.testing.expect(isPublicAddressing("as:Public"));
+    try std.testing.expect(isPublicAddressing("Public"));
+    // Look-alikes must NOT be treated as public — they are real targets.
+    try std.testing.expect(!isPublicAddressing("https://w3.org/Public"));
+    try std.testing.expect(!isPublicAddressing("https://example.test/users/public"));
+    try std.testing.expect(!isPublicAddressing(""));
+}
+
+test "parse populates full `to` list and `to_first` head" {
+    const input =
+        \\{"id":"https://a/x/1","type":"Create","actor":"https://a/u",
+        \\ "to":["https://www.w3.org/ns/activitystreams#Public",
+        \\       "https://b/users/bob","https://c/users/carol"],
+        \\ "object":{"id":"https://a/n/1","type":"Note","content":"hi"}}
+    ;
+    const act = try parse(input);
+    try std.testing.expectEqual(@as(u8, 3), act.to.len);
+    try std.testing.expectEqualStrings("https://www.w3.org/ns/activitystreams#Public", act.to_first);
+    try std.testing.expectEqualStrings("https://www.w3.org/ns/activitystreams#Public", act.to.items[0]);
+    try std.testing.expectEqualStrings("https://b/users/bob", act.to.items[1]);
+    try std.testing.expectEqualStrings("https://c/users/carol", act.to.items[2]);
+}
+
+test "parse does not capture bto/bcc into addressing lists" {
+    const input =
+        \\{"type":"Create","actor":"https://a/u",
+        \\ "to":["https://b/users/bob"],
+        \\ "bto":["https://secret/spy"],
+        \\ "bcc":["https://secret/followers"],
+        \\ "object":{"id":"https://a/n/1","type":"Note"}}
+    ;
+    const act = try parse(input);
+    try std.testing.expectEqual(@as(u8, 1), act.to.len);
+    try std.testing.expectEqual(@as(u8, 0), act.cc.len);
+    try std.testing.expectEqualStrings("https://b/users/bob", act.to.items[0]);
 }
 
 test "AP-24: parse honours sensitive: false" {

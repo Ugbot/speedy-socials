@@ -283,25 +283,46 @@ fn runCreate(env: *const Envelope, eff: *SideEffectBuffer) ApError!void {
                 s = .fanout;
             },
             .fanout => {
-                if (env.activity.to_first.len > 0) {
-                    try eff.push(.{ .enqueue_delivery = .{
-                        .target = env.activity.to_first,
-                        .in_reply_to_id = env.activity.object_id,
-                    } });
+                // Walk the FULL `to` + `cc` addressing arrays to resolve
+                // delivery targets. Public addressing (the AS2 public
+                // collection in any of its spellings) is recognised and
+                // NOT enqueued as a fetchable inbox; local followers
+                // collections are handled by the inbox-forwarding pass
+                // below, not enqueued as direct targets. Everything else
+                // is a concrete recipient. Deduplicated against the
+                // delivery targets already emitted in this fanout.
+                var delivered: DedupSet = .{};
+                inline for (.{ &env.activity.to, &env.activity.cc }) |list| {
+                    var di: u8 = 0;
+                    while (di < list.len) : (di += 1) {
+                        const addr = list.items[di];
+                        if (addr.len == 0) continue;
+                        if (activity.isPublicAddressing(addr)) continue;
+                        if (isLocalFollowersCollection(addr, env.local_host)) continue;
+                        if (!delivered.add(addr)) continue; // dup — already enqueued
+                        eff.push(.{ .enqueue_delivery = .{
+                            .target = addr,
+                            .in_reply_to_id = env.activity.object_id,
+                        } }) catch break; // buffer full — bounded, drop the rest
+                    }
                 }
-                // AP-3: inbox forwarding. If any `cc` entry names a
-                // local actor's `/followers` collection, forward the
-                // verbatim raw body to that follower set.
+                // AP §7.1.3 inbox forwarding: redistribute to EVERY `to`
+                // or `cc` entry that names a local actor's `/followers`
+                // collection — not just the first match. Dedupe so the
+                // same collection forwarded twice (e.g. in both `to` and
+                // `cc`) only enqueues one forward.
                 if (env.local_host.len > 0 and env.raw_body.len > 0) {
-                    var ci: u8 = 0;
-                    while (ci < env.activity.cc.len) : (ci += 1) {
-                        const addr = env.activity.cc.items[ci];
-                        if (isLocalFollowersCollection(addr, env.local_host)) {
-                            try eff.push(.{ .forward_to_followers = .{
+                    var forwarded: DedupSet = .{};
+                    inline for (.{ &env.activity.to, &env.activity.cc }) |list| {
+                        var fi: u8 = 0;
+                        while (fi < list.len) : (fi += 1) {
+                            const addr = list.items[fi];
+                            if (!isLocalFollowersCollection(addr, env.local_host)) continue;
+                            if (!forwarded.add(addr)) continue; // already forwarded
+                            eff.push(.{ .forward_to_followers = .{
                                 .collection_url = addr,
                                 .raw_body = env.raw_body,
-                            } });
-                            break;
+                            } }) catch break; // buffer full — bounded
                         }
                     }
                 }
@@ -660,6 +681,28 @@ fn runMove(env: *const Envelope, eff: *SideEffectBuffer) ApError!void {
     try eff.push(.{ .increment_counter = .{ .name = "ap.inbox.move" } });
 }
 
+/// Heap-free dedup set for recipient IRIs. Bounded by the combined
+/// `to` + `cc` addressing capacity (2 × `max_addressed`). Linear scan
+/// — the sets are tiny (≤32 entries) so this beats hashing on cost and
+/// allocation. `add` returns true when the value was newly inserted,
+/// false when it was already present (a duplicate).
+const max_dedup: u8 = activity.max_addressed * 2;
+const DedupSet = struct {
+    items: [max_dedup][]const u8 = undefined,
+    len: u8 = 0,
+
+    fn add(self: *DedupSet, s: []const u8) bool {
+        var i: u8 = 0;
+        while (i < self.len) : (i += 1) {
+            if (std.mem.eql(u8, self.items[i], s)) return false;
+        }
+        if (self.len >= max_dedup) return false; // full — treat as dup
+        self.items[self.len] = s;
+        self.len += 1;
+        return true;
+    }
+};
+
 /// AP-3: detect whether `addr` is a local followers collection URL.
 fn isLocalFollowersCollection(addr: []const u8, local_host: []const u8) bool {
     const prefix = "https://";
@@ -814,6 +857,191 @@ test "AP-23: Create{Note} with attachment[] records media attachments" {
         else => {},
     };
     try std.testing.expect(found);
+}
+
+test "AP §7.1.3: Public + local followers collection forwards to followers, Public not delivered" {
+    var rng = Rng.init(7);
+    var sc = SimClock.init(0);
+    const raw =
+        \\{"id":"https://a/x/4","type":"Create","actor":"https://a/u",
+        \\ "to":["https://www.w3.org/ns/activitystreams#Public"],
+        \\ "cc":["https://local.test/users/bob/followers"],
+        \\ "object":{"id":"https://a/n/4","type":"Note","content":"hi"}}
+    ;
+    const act = try activity.parse(raw);
+    var env: Envelope = .{
+        .activity = act,
+        .verified_actor = .{ .iri = act.actor, .is_known_to_us = false },
+        .clock = sc.clock(),
+        .rng = &rng,
+        .local_host = "local.test",
+        .raw_body = raw,
+    };
+    var eff: SideEffectBuffer = .{};
+    try dispatch(&env, &eff);
+
+    var forwards: u8 = 0;
+    var deliveries: u8 = 0;
+    for (eff.slice()) |e| switch (e) {
+        .forward_to_followers => |f| {
+            try std.testing.expectEqualStrings("https://local.test/users/bob/followers", f.collection_url);
+            try std.testing.expectEqualStrings(raw, f.raw_body);
+            forwards += 1;
+        },
+        .enqueue_delivery => deliveries += 1,
+        else => {},
+    };
+    // Public addressing must NOT be enqueued as a fetchable target, and
+    // the local followers collection is forwarded rather than delivered.
+    try std.testing.expectEqual(@as(u8, 0), deliveries);
+    try std.testing.expectEqual(@as(u8, 1), forwards);
+}
+
+test "AP §7.1.3: multiple cc followers collections all forward (not just first)" {
+    var rng = Rng.init(8);
+    var sc = SimClock.init(0);
+    const raw =
+        \\{"id":"https://a/x/5","type":"Create","actor":"https://a/u",
+        \\ "to":["https://local.test/users/alice/followers"],
+        \\ "cc":["https://www.w3.org/ns/activitystreams#Public",
+        \\       "https://local.test/users/bob/followers",
+        \\       "https://local.test/users/carol/followers"],
+        \\ "object":{"id":"https://a/n/5","type":"Note","content":"hi all"}}
+    ;
+    const act = try activity.parse(raw);
+    var env: Envelope = .{
+        .activity = act,
+        .verified_actor = .{ .iri = act.actor, .is_known_to_us = false },
+        .clock = sc.clock(),
+        .rng = &rng,
+        .local_host = "local.test",
+        .raw_body = raw,
+    };
+    var eff: SideEffectBuffer = .{};
+    try dispatch(&env, &eff);
+
+    var saw_alice = false;
+    var saw_bob = false;
+    var saw_carol = false;
+    var forwards: u8 = 0;
+    for (eff.slice()) |e| switch (e) {
+        .forward_to_followers => |f| {
+            forwards += 1;
+            if (std.mem.eql(u8, f.collection_url, "https://local.test/users/alice/followers")) saw_alice = true;
+            if (std.mem.eql(u8, f.collection_url, "https://local.test/users/bob/followers")) saw_bob = true;
+            if (std.mem.eql(u8, f.collection_url, "https://local.test/users/carol/followers")) saw_carol = true;
+        },
+        else => {},
+    };
+    // One follower collection in `to` + two in `cc` → three forwards.
+    try std.testing.expectEqual(@as(u8, 3), forwards);
+    try std.testing.expect(saw_alice and saw_bob and saw_carol);
+}
+
+test "AP §7.1.3: same followers collection in both to and cc forwards once (dedup)" {
+    var rng = Rng.init(9);
+    var sc = SimClock.init(0);
+    const raw =
+        \\{"id":"https://a/x/6","type":"Create","actor":"https://a/u",
+        \\ "to":["https://local.test/users/dave/followers"],
+        \\ "cc":["https://local.test/users/dave/followers"],
+        \\ "object":{"id":"https://a/n/6","type":"Note","content":"dup"}}
+    ;
+    const act = try activity.parse(raw);
+    var env: Envelope = .{
+        .activity = act,
+        .verified_actor = .{ .iri = act.actor, .is_known_to_us = false },
+        .clock = sc.clock(),
+        .rng = &rng,
+        .local_host = "local.test",
+        .raw_body = raw,
+    };
+    var eff: SideEffectBuffer = .{};
+    try dispatch(&env, &eff);
+
+    var forwards: u8 = 0;
+    for (eff.slice()) |e| switch (e) {
+        .forward_to_followers => forwards += 1,
+        else => {},
+    };
+    try std.testing.expectEqual(@as(u8, 1), forwards);
+}
+
+test "recipient scan delivers to remote to+cc entries and dedupes" {
+    var rng = Rng.init(10);
+    var sc = SimClock.init(0);
+    const raw =
+        \\{"id":"https://a/x/7","type":"Create","actor":"https://a/u",
+        \\ "to":["https://remote.test/users/x","https://www.w3.org/ns/activitystreams#Public"],
+        \\ "cc":["https://remote.test/users/y","https://remote.test/users/x"],
+        \\ "object":{"id":"https://a/n/7","type":"Note","content":"hi"}}
+    ;
+    const act = try activity.parse(raw);
+    var env: Envelope = .{
+        .activity = act,
+        .verified_actor = .{ .iri = act.actor, .is_known_to_us = false },
+        .clock = sc.clock(),
+        .rng = &rng,
+        .local_host = "local.test",
+        .raw_body = raw,
+    };
+    var eff: SideEffectBuffer = .{};
+    try dispatch(&env, &eff);
+
+    var saw_x = false;
+    var saw_y = false;
+    var deliveries: u8 = 0;
+    for (eff.slice()) |e| switch (e) {
+        .enqueue_delivery => |d| {
+            deliveries += 1;
+            if (std.mem.eql(u8, d.target, "https://remote.test/users/x")) saw_x = true;
+            if (std.mem.eql(u8, d.target, "https://remote.test/users/y")) saw_y = true;
+        },
+        else => {},
+    };
+    // x appears in both `to` and `cc` → delivered once; Public skipped.
+    try std.testing.expectEqual(@as(u8, 2), deliveries);
+    try std.testing.expect(saw_x and saw_y);
+}
+
+test "bto/bcc are not leaked into recipient handling" {
+    var rng = Rng.init(11);
+    var sc = SimClock.init(0);
+    const raw =
+        \\{"id":"https://a/x/8","type":"Create","actor":"https://a/u",
+        \\ "to":["https://www.w3.org/ns/activitystreams#Public"],
+        \\ "bto":["https://secret.test/users/spy"],
+        \\ "bcc":["https://local.test/users/hidden/followers"],
+        \\ "object":{"id":"https://a/n/8","type":"Note","content":"private routing"}}
+    ;
+    const act = try activity.parse(raw);
+    // The parser must not capture bto/bcc into the addressing lists.
+    try std.testing.expectEqual(@as(u8, 0), act.cc.len);
+    for (act.to.slice()) |a| {
+        try std.testing.expect(!std.mem.eql(u8, a, "https://secret.test/users/spy"));
+        try std.testing.expect(!std.mem.eql(u8, a, "https://local.test/users/hidden/followers"));
+    }
+    var env: Envelope = .{
+        .activity = act,
+        .verified_actor = .{ .iri = act.actor, .is_known_to_us = false },
+        .clock = sc.clock(),
+        .rng = &rng,
+        .local_host = "local.test",
+        .raw_body = raw,
+    };
+    var eff: SideEffectBuffer = .{};
+    try dispatch(&env, &eff);
+
+    for (eff.slice()) |e| switch (e) {
+        .enqueue_delivery => |d| {
+            try std.testing.expect(!std.mem.eql(u8, d.target, "https://secret.test/users/spy"));
+        },
+        .forward_to_followers => |f| {
+            // The bcc'd hidden followers collection must not be forwarded.
+            try std.testing.expect(!std.mem.eql(u8, f.collection_url, "https://local.test/users/hidden/followers"));
+        },
+        else => {},
+    };
 }
 
 test "Update with object_id emits update_object" {
