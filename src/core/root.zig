@@ -35,6 +35,7 @@ pub const dual_identity = @import("dual_identity.zig");
 pub const trace = @import("trace.zig");
 pub const cert_probe = @import("cert_probe.zig");
 pub const tenancy = @import("tenancy.zig");
+pub const tenancy_routes = @import("tenancy_routes.zig");
 
 /// Pluggable event-stream sink (Null / Log / Kafka / Redis / NATS). See `stream.zig`.
 pub const stream = @import("stream.zig");

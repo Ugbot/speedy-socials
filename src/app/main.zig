@@ -917,6 +917,12 @@ pub fn main() !void {
     try core.tls.admin_routes.registerRoutes(&router, std.math.maxInt(u16));
     if (std.c.getenv("ADMIN_TOKEN")) |t| core.tls.admin_routes.setToken(std.mem.sliceTo(t, 0));
 
+    // C1/H3: tenant lifecycle CRUD (POST /admin/tenants, PATCH/DELETE
+    // /admin/tenants/:id). Same ADMIN_TOKEN gate; audits to the writer db.
+    try core.tenancy_routes.registerRoutes(&router, std.math.maxInt(u16));
+    if (std.c.getenv("ADMIN_TOKEN")) |t| core.tenancy_routes.setToken(std.mem.sliceTo(t, 0));
+    core.tenancy_routes.setAudit(db, real_clock.clock());
+
     // H1/H3: static Host→tenant table from TENANTS=host1=t1,host2=t2.
     // Unconfigured => single default tenant (resolveTenant returns active
     // for every Host). Lifecycle flips via POST /admin/tenants/:id/*.
