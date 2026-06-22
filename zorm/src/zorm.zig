@@ -55,6 +55,11 @@ pub const Bytes = fields.Bytes;
 pub const Pk = fields.Pk;
 pub const AutoPk = fields.AutoPk;
 pub const Timestamp = fields.Timestamp;
+pub const Decimal = fields.Decimal;
+pub const Uuid = fields.Uuid;
+pub const Json = fields.Json;
+pub const Date = fields.Date;
+pub const DateTime = fields.DateTime;
 
 // ── Reflection + DDL (S1) ──────────────────────────────────────────────
 pub const TableInfo = reflect.TableInfo;
