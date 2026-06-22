@@ -25,6 +25,10 @@ pub const Kind = enum {
     bytes,
     pk_text,
     pk_auto,
+    /// Caller-supplied integer PRIMARY KEY (NOT auto-assigned). Stored as
+    /// INTEGER. Used as a single PK or — more commonly — as one part of a
+    /// COMPOSITE key (e.g. `(tenant TEXT, seq INTEGER)`).
+    pk_int,
     timestamp,
     /// Fixed-point numeric (money). Stored losslessly as text.
     decimal,
@@ -131,6 +135,15 @@ pub fn Pk(comptime N: usize) type {
 /// Postgres, `lastInsertId()` on SQLite).
 pub const AutoPk = struct {
     pub const zorm_kind: Kind = .pk_auto;
+    value: i64 = 0,
+};
+
+/// Caller-supplied integer PRIMARY KEY (the value is NOT DB-assigned — the
+/// caller sets it). The natural integer member of a composite key. Stored as
+/// INTEGER PRIMARY KEY (single) or as one column of a table-level composite
+/// PRIMARY KEY.
+pub const PkInt = struct {
+    pub const zorm_kind: Kind = .pk_int;
     value: i64 = 0,
 };
 

@@ -11,11 +11,23 @@ const fields = @import("fields.zig");
 const BindValue = contract.BindValue;
 const ColumnValue = contract.ColumnValue;
 
-/// The Zig type of a primary key value passed to find/delete: `[]const u8`
-/// for a text PK, `i64` for an auto/integer PK.
+/// The Zig type of a single PK column's value: `[]const u8` for a text PK,
+/// `i64` for an auto/integer PK.
+fn PkPartValue(comptime col: reflect.ColumnSpec) type {
+    return if (col.bind_kind == .text) []const u8 else i64;
+}
+
+/// The Zig type of a primary key value passed to find/delete.
+///   single PK    → `[]const u8` (text) or `i64` (auto/integer), unchanged.
+///   composite PK → a TUPLE of the parts, one element per PK column in
+///                  declaration order. Build it positionally:
+///                  `.{ "tenant", 42 }`, access by index `pk[0]`, `pk[1]`.
 pub fn PkValue(comptime T: type) type {
     const info = reflect.TableInfo(T);
-    return if (info.pk_column.bind_kind == .text) []const u8 else i64;
+    if (!info.composite_pk) return PkPartValue(info.pk_column);
+    var part_types: [info.pk_count]type = undefined;
+    inline for (0..info.pk_count) |k| part_types[k] = PkPartValue(info.pkColumn(k));
+    return std.meta.Tuple(&part_types);
 }
 
 /// Convert a NON-optional field, given a POINTER into the caller's entity,
@@ -81,8 +93,9 @@ pub fn bindInsert(comptime T: type, entity: *const T, out: []BindValue) usize {
 }
 
 /// Fill `out` with bind values in UPDATE order: every NON-PK column (the
-/// SET list, in `TableInfo` order) followed by the PK (the WHERE clause).
-/// Matches the placeholder numbering `sql.update` emits. Returns count.
+/// SET list, in `TableInfo` order) followed by EVERY PK column (the WHERE
+/// clause `pk1 = ? AND pk2 = ? …`, in declaration order). Matches the
+/// placeholder numbering `sql.update` emits. Returns count.
 pub fn bindUpdate(comptime T: type, entity: *const T, out: []BindValue) usize {
     const info = reflect.TableInfo(T);
     var n: usize = 0;
@@ -91,20 +104,57 @@ pub fn bindUpdate(comptime T: type, entity: *const T, out: []BindValue) usize {
         out[n] = bindColumn(T, col, entity);
         n += 1;
     }
-    out[n] = bindColumn(T, info.pk_column, entity);
-    return n + 1;
+    inline for (0..info.pk_count) |k| {
+        out[n] = bindColumn(T, info.pkColumn(k), entity);
+        n += 1;
+    }
+    return n;
 }
 
-/// The PK column's bind value for `entity`.
+/// The (first) PK column's bind value for `entity`. For a single-PK entity
+/// this is THE key; for a composite key it is the first part (kept for the
+/// single-column callers — FK refs, routing-key prefix).
 pub fn bindPk(comptime T: type, entity: *const T) BindValue {
     const info = reflect.TableInfo(T);
     return bindColumn(T, info.pk_column, entity);
 }
 
-/// A bind value from a free-standing PK value (for find/delete-by-pk).
+/// Fill `out` with the bind value of EVERY PK column of `entity`, in
+/// declaration order (the WHERE-clause order for select/delete-by-pk).
+/// Returns the count written (`pk_count`).
+pub fn bindPkAll(comptime T: type, entity: *const T, out: []BindValue) usize {
+    const info = reflect.TableInfo(T);
+    inline for (0..info.pk_count) |k| {
+        out[k] = bindColumn(T, info.pkColumn(k), entity);
+    }
+    return info.pk_count;
+}
+
+/// A bind value from a free-standing single PK part value.
+fn bindPartValue(comptime col: reflect.ColumnSpec, v: anytype) BindValue {
+    return if (col.bind_kind == .text) .{ .text = v } else .{ .int = v };
+}
+
+/// A bind value from a free-standing single-PK value (for find/delete-by-pk).
+/// Composite keys use `bindPkValueAll`.
 pub fn bindPkValue(comptime T: type, pk: PkValue(T)) BindValue {
     const info = reflect.TableInfo(T);
-    return if (info.pk_column.bind_kind == .text) .{ .text = pk } else .{ .int = pk };
+    return bindPartValue(info.pk_column, pk);
+}
+
+/// Fill `out` with one bind value per PK column from a free-standing
+/// `PkValue(T)`. Single PK → one value; composite → its tuple elements in
+/// order. Returns the count written (`pk_count`).
+pub fn bindPkValueAll(comptime T: type, pk: PkValue(T), out: []BindValue) usize {
+    const info = reflect.TableInfo(T);
+    if (!info.composite_pk) {
+        out[0] = bindPartValue(info.pk_column, pk);
+        return 1;
+    }
+    inline for (0..info.pk_count) |k| {
+        out[k] = bindPartValue(info.pkColumn(k), pk[k]);
+    }
+    return info.pk_count;
 }
 
 /// Read one `ColumnValue` into the corresponding entity field.
@@ -303,6 +353,55 @@ test "Z5 column types bind as text + read back via MockBackend round-trip" {
     try testing.expectEqualStrings("{\"k\":42}", got.payload.slice());
     try testing.expectEqualStrings("2026-06-23", got.born_on.slice());
     try testing.expectEqualStrings("2026-06-23T14:05:09.250", got.seen_at.slice());
+}
+
+// ── Composite primary key (Z4) ──────────────────────────────────────────
+
+const TenantDoc = struct {
+    pub const zorm_table = "tenant_docs";
+    tenant: fields.Pk(32) = .{},
+    seq: fields.PkInt = .{},
+    title: fields.Text(64) = .{},
+};
+
+test "composite PkValue is a tuple of the parts; single PK is unchanged" {
+    // Single text PK → []const u8 (byte-for-byte the old type).
+    try testing.expectEqual([]const u8, PkValue(Account));
+    // Composite (text, int) → a 2-tuple of {[]const u8, i64}.
+    const PV = PkValue(TenantDoc);
+    const ti = @typeInfo(PV).@"struct";
+    try testing.expect(ti.is_tuple);
+    try testing.expectEqual(@as(usize, 2), ti.fields.len);
+    try testing.expectEqual([]const u8, ti.fields[0].type);
+    try testing.expectEqual(i64, ti.fields[1].type);
+}
+
+test "bindPkAll / bindPkValueAll bind every PK column in order" {
+    var e = TenantDoc{
+        .tenant = fields.Pk(32).from("acme"),
+        .seq = .{ .value = 9 },
+        .title = fields.Text(64).from("t"),
+    };
+    var out: [16]BindValue = undefined;
+
+    // From the entity.
+    const n1 = bindPkAll(TenantDoc, &e, &out);
+    try testing.expectEqual(@as(usize, 2), n1);
+    try testing.expectEqualStrings("acme", out[0].text);
+    try testing.expectEqual(@as(i64, 9), out[1].int);
+
+    // From a free-standing composite key tuple.
+    const n2 = bindPkValueAll(TenantDoc, .{ "globex", 4 }, &out);
+    try testing.expectEqual(@as(usize, 2), n2);
+    try testing.expectEqualStrings("globex", out[0].text);
+    try testing.expectEqual(@as(i64, 4), out[1].int);
+
+    // bindUpdate appends BOTH pk columns after the SET (non-PK) columns.
+    const n3 = bindUpdate(TenantDoc, &e, &out);
+    try testing.expectEqual(@as(usize, 3), n3); // title + (tenant, seq)
+    try testing.expectEqualStrings("t", out[0].text); // SET title
+    try testing.expectEqualStrings("acme", out[1].text); // WHERE tenant
+    try testing.expectEqual(@as(i64, 9), out[2].int); // WHERE seq
 }
 
 test "bindInsert skips the auto PK column" {

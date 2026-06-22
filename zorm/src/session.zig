@@ -26,6 +26,12 @@ const Error = contract.Error;
 /// Lifecycle state of a managed slot.
 const State = enum { empty, clean, new, deleted };
 
+/// The free-standing value type of one PK column: `[]const u8` for a text
+/// PK, `i64` for an int/auto PK.
+fn PkPartType(comptime col: reflect.ColumnSpec) type {
+    return if (col.bind_kind == .text) []const u8 else i64;
+}
+
 /// A bounded, identity-mapped unit of work over entity `T`.
 pub fn Session(comptime T: type, comptime capacity: usize) type {
     const info = reflect.TableInfo(T);
@@ -184,18 +190,40 @@ pub fn Session(comptime T: type, comptime capacity: usize) type {
             }
         }
 
-        /// PK value of `entity` as a free-standing key.
-        fn pkValue(entity: *const T) bind.PkValue(T) {
-            const f = &@field(entity.*, info.pk_column.name);
-            return if (info.pk_column.bind_kind == .text) f.slice() else f.value;
+        /// One PK part's free-standing value (its `slice()` for text, its
+        /// `.value` for int/auto).
+        fn pkPart(comptime col: reflect.ColumnSpec, entity: *const T) PkPartType(col) {
+            const f = &@field(entity.*, col.name);
+            return if (col.bind_kind == .text) f.slice() else f.value;
         }
 
+        /// PK value of `entity` as a free-standing key. Single PK → the lone
+        /// value; composite → the `{ part0, part1, … }` tuple.
+        fn pkValue(entity: *const T) bind.PkValue(T) {
+            if (comptime !info.composite_pk) return pkPart(info.pk_column, entity);
+            var key: bind.PkValue(T) = undefined;
+            inline for (0..info.pk_count) |k| {
+                key[k] = pkPart(info.pkColumn(k), entity);
+            }
+            return key;
+        }
+
+        /// Compare `entity`'s PK against a free-standing key — ALL PK columns
+        /// for a composite key (every part must match).
         fn pkEql(entity: *const T, pk: bind.PkValue(T)) bool {
-            const f = &@field(entity.*, info.pk_column.name);
-            return if (info.pk_column.bind_kind == .text)
-                std.mem.eql(u8, f.slice(), pk)
+            if (comptime !info.composite_pk) return pkPartEql(info.pk_column, entity, pk);
+            inline for (0..info.pk_count) |k| {
+                if (!pkPartEql(info.pkColumn(k), entity, pk[k])) return false;
+            }
+            return true;
+        }
+
+        fn pkPartEql(comptime col: reflect.ColumnSpec, entity: *const T, part: anytype) bool {
+            const f = &@field(entity.*, col.name);
+            return if (col.bind_kind == .text)
+                std.mem.eql(u8, f.slice(), part)
             else
-                f.value == pk;
+                f.value == part;
         }
     };
 }
@@ -386,6 +414,68 @@ test "Session.upsert: insert then upsert the same PK updates, no duplicate" {
     try testing.expectEqual(@as(f64, 4.25), got.score);
     // Exactly one physical row for that PK.
     try testing.expectEqual(@as(usize, 1), db.rowCount("atp_accounts"));
+}
+
+// ── Composite primary key (Z4) ──────────────────────────────────────────
+
+const TenantDoc = struct {
+    pub const zorm_table = "tenant_docs";
+    tenant: fields.Pk(32) = .{},
+    doc_id: fields.Pk(32) = .{},
+    title: fields.Text(64) = .{},
+};
+
+fn tdoc(tenant: []const u8, doc: []const u8, title: []const u8) TenantDoc {
+    return .{
+        .tenant = fields.Pk(32).from(tenant),
+        .doc_id = fields.Pk(32).from(doc),
+        .title = fields.Text(64).from(title),
+    };
+}
+
+test "composite PK identity map: same pointer for the same composite key" {
+    var db = mock.MockBackend.init();
+    var s = Session(TenantDoc, 16).init(db.backend(.sqlite));
+
+    _ = try s.add(tdoc("acme", "readme", "A"));
+    _ = try s.add(tdoc("acme", "guide", "B")); // shares tenant, distinct key
+    try s.flush();
+    s.reset();
+
+    // get with the composite tuple returns the SAME pointer on repeat calls.
+    const p1 = (try s.get(.{ "acme", "readme" })).?;
+    const p2 = (try s.get(.{ "acme", "readme" })).?;
+    try testing.expectEqual(p1, p2);
+    try testing.expectEqualStrings("A", p1.title.slice());
+
+    // A different second key-part is a DISTINCT identity (different slot).
+    const q = (try s.get(.{ "acme", "guide" })).?;
+    try testing.expect(p1 != q);
+    try testing.expectEqualStrings("B", q.title.slice());
+    try testing.expectEqual(@as(usize, 2), s.managed());
+
+    // A wholly absent composite key → null.
+    try testing.expect((try s.get(.{ "acme", "missing" })) == null);
+}
+
+test "composite PK: dirty-track + flush updates by the full key" {
+    var db = mock.MockBackend.init();
+    var s = Session(TenantDoc, 16).init(db.backend(.sqlite));
+    _ = try s.add(tdoc("acme", "readme", "orig"));
+    _ = try s.add(tdoc("acme", "guide", "sib"));
+    try s.flush();
+    s.reset();
+
+    const a = (try s.get(.{ "acme", "readme" })).?;
+    try testing.expect(!s.isDirty(a));
+    a.title = fields.Text(64).from("edited");
+    try testing.expect(s.isDirty(a));
+    try s.flush();
+    s.reset();
+
+    try testing.expectEqualStrings("edited", (try s.get(.{ "acme", "readme" })).?.title.slice());
+    // Sibling under the same tenant is unaffected.
+    try testing.expectEqualStrings("sib", (try s.get(.{ "acme", "guide" })).?.title.slice());
 }
 
 test "entityEql compares logical values, ignoring buffer tails" {

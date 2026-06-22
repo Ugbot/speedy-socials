@@ -124,7 +124,7 @@ fn fieldWireType(comptime F: type, comptime spec: reflect.ColumnSpec) WireType {
         return switch (T.zorm_kind) {
             .text, .pk_text => .text,
             .bytes => .bytes,
-            .pk_auto => .i64,
+            .pk_auto, .pk_int => .i64,
             .timestamp => .timestamp,
             .decimal => .decimal,
             .uuid => .uuid,

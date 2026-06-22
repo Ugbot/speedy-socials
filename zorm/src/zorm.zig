@@ -54,6 +54,7 @@ pub const Text = fields.Text;
 pub const Bytes = fields.Bytes;
 pub const Pk = fields.Pk;
 pub const AutoPk = fields.AutoPk;
+pub const PkInt = fields.PkInt;
 pub const Timestamp = fields.Timestamp;
 pub const Decimal = fields.Decimal;
 pub const Uuid = fields.Uuid;

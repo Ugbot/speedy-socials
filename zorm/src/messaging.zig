@@ -120,33 +120,44 @@ pub const Queue = struct {
 
 /// Render entity `value`'s primary key as routing-key bytes into `key_buf`,
 /// returning the written prefix. A text/blob PK copies its slice bytes
-/// verbatim; an int/auto PK is formatted as a decimal string. Uses
-/// `bind.bindPk` so the key derivation stays in lock-step with how zorm binds
-/// the PK for storage. Surfaces `error.BufferTooSmall` if `key_buf` cannot
-/// hold the rendered key.
+/// verbatim; an int/auto PK is formatted as a decimal string. For a COMPOSITE
+/// PK, each part is rendered the same way and the parts are joined with `:`
+/// (so `(tenant, 42)` → `tenant:42`) — a deterministic, dialect-free key.
+/// Uses `bind.bindPkAll` so the key derivation stays in lock-step with how
+/// zorm binds the PK for storage. Surfaces `error.BufferTooSmall` if `key_buf`
+/// cannot hold the rendered key.
 pub fn keyFor(comptime T: type, value: *const T, key_buf: []u8) Error![]const u8 {
-    const bv = bind.bindPk(T, value);
-    switch (bv) {
-        .text, .blob => {
-            const s = switch (bv) {
-                .text => |t| t,
-                .blob => |b| b,
-                else => unreachable,
-            };
-            if (s.len > key_buf.len) return Error.BufferTooSmall;
-            @memcpy(key_buf[0..s.len], s);
-            return key_buf[0..s.len];
-        },
-        .int => |i| {
-            return std.fmt.bufPrint(key_buf, "{d}", .{i}) catch return Error.BufferTooSmall;
-        },
-        .real => |r| {
+    var parts: [contract.max_columns]contract.BindValue = undefined;
+    const n = bind.bindPkAll(T, value, &parts);
+    var written: usize = 0;
+    for (parts[0..n], 0..) |bv, i| {
+        if (i > 0) {
+            if (written >= key_buf.len) return Error.BufferTooSmall;
+            key_buf[written] = ':';
+            written += 1;
+        }
+        const seg = key_buf[written..];
+        const rendered: []const u8 = switch (bv) {
+            .text => |t| t,
+            .blob => |b| b,
+            .int => |v| std.fmt.bufPrint(seg, "{d}", .{v}) catch return Error.BufferTooSmall,
             // A real PK is unusual but representable; format it decimally so
             // the key is still deterministic text.
-            return std.fmt.bufPrint(key_buf, "{d}", .{r}) catch return Error.BufferTooSmall;
-        },
-        .null_ => return key_buf[0..0],
+            .real => |r| std.fmt.bufPrint(seg, "{d}", .{r}) catch return Error.BufferTooSmall,
+            .null_ => "",
+        };
+        switch (bv) {
+            .text, .blob => {
+                if (rendered.len > seg.len) return Error.BufferTooSmall;
+                // text/blob borrow the entity's bytes — copy them in.
+                @memcpy(seg[0..rendered.len], rendered);
+                written += rendered.len;
+            },
+            // int/real already formatted into `seg`; null_ wrote nothing.
+            else => written += rendered.len,
+        }
     }
+    return key_buf[0..written];
 }
 
 /// The maximum routing-key length `publish` renders on its internal stack
@@ -499,6 +510,31 @@ test "published key == decimal of an auto/int PK" {
     try testing.expectEqualStrings("0", try keyFor(AutoThing, &z, &kb));
     z.id.value = -42;
     try testing.expectEqualStrings("-42", try keyFor(AutoThing, &z, &kb));
+}
+
+const TenantDoc = struct {
+    pub const zorm_table = "tenant_docs";
+    tenant: fields.Pk(32) = .{},
+    seq: fields.PkInt = .{},
+    title: fields.Text(64) = .{},
+};
+
+test "keyFor: composite PK joins parts with ':' (text + int)" {
+    var d = TenantDoc{
+        .tenant = fields.Pk(32).from("acme"),
+        .seq = .{ .value = 42 },
+        .title = fields.Text(64).from("doc"),
+    };
+    var kb: [64]u8 = undefined;
+    try testing.expectEqualStrings("acme:42", try keyFor(TenantDoc, &d, &kb));
+
+    // A negative int part renders its decimal form.
+    d.seq.value = -7;
+    try testing.expectEqualStrings("acme:-7", try keyFor(TenantDoc, &d, &kb));
+
+    // BufferTooSmall when the rendered composite key overflows key_buf.
+    var tiny: [4]u8 = undefined;
+    try testing.expectError(Error.BufferTooSmall, keyFor(TenantDoc, &d, &tiny));
 }
 
 test "enqueue several, claim a batch, ack removes them" {

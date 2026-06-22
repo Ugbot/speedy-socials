@@ -256,6 +256,141 @@ test "zorm/SQLite: auto-PK id assigned via lastInsertId" {
     try std.testing.expectEqualStrings("created", got.name.slice());
 }
 
+// ── Composite primary key (Z4) — real in-memory SQLite engine ────────────
+
+// A two-column PK entity: (tenant TEXT, seq INTEGER). The pair is the key —
+// proving composite findByPk / update / delete / identity-map against the
+// REAL SqliteBackend (via the zorm_adapter), not just the in-library mock.
+const ZMembership = struct {
+    pub const zorm_table = "zorm_memberships";
+    tenant: zorm.Pk(32) = .{},
+    seq: zorm.PkInt = .{},
+    role: zorm.Text(16) = .{},
+    note: zorm.Text(64) = .{},
+};
+
+test "zorm/SQLite: composite PK CRUD round-trip against the real engine" {
+    const db = try sqlite.openWriter(":memory:");
+    defer sqlite.closeDb(db);
+    var be: storage.SqliteBackend = undefined;
+    var adapter: storage.zorm_adapter.Adapter = undefined;
+    const zb = try sqliteZorm(ZMembership, db, &be, &adapter);
+
+    var prng = std.Random.DefaultPrng.init(0xC0117B05E);
+    const rand = prng.random();
+
+    // Seed a randomized set of (tenant, seq) pairs across a few tenants, all
+    // distinct keys. Track them so we can verify each by its full key.
+    const n = 24;
+    var seeded: [n]ZMembership = undefined;
+    const tenants = [_][]const u8{ "acme", "globex", "initech" };
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        var m: ZMembership = .{};
+        m.tenant.set(tenants[i % tenants.len]);
+        // seq is unique within (tenant) by construction: i / tenants.len gives
+        // a distinct ordinal per tenant.
+        m.seq = .{ .value = @intCast(i / tenants.len) };
+        var rb: [16]u8 = undefined;
+        m.role.set(std.fmt.bufPrint(&rb, "r{x}", .{rand.int(u16)}) catch unreachable);
+        var nb: [64]u8 = undefined;
+        m.note.set(std.fmt.bufPrint(&nb, "note-{x}", .{rand.int(u32)}) catch unreachable);
+        seeded[i] = m;
+        try zorm.insert(ZMembership, zb, &m);
+    }
+
+    // findByPk on the FULL composite key matches the right row; a wrong second
+    // part (same tenant, different seq) misses.
+    for (seeded) |want| {
+        var got: ZMembership = .{};
+        try std.testing.expect(try zorm.findByPk(
+            ZMembership,
+            zb,
+            .{ want.tenant.slice(), want.seq.value },
+            &got,
+        ));
+        try std.testing.expectEqualStrings(want.role.slice(), got.role.slice());
+        try std.testing.expectEqualStrings(want.note.slice(), got.note.slice());
+        try std.testing.expectEqual(want.seq.value, got.seq.value);
+
+        var miss: ZMembership = .{};
+        try std.testing.expect(!try zorm.findByPk(
+            ZMembership,
+            zb,
+            .{ want.tenant.slice(), want.seq.value + 1000 },
+            &miss,
+        ));
+    }
+
+    // Update keyed on the full composite key; a sibling sharing the tenant is
+    // untouched.
+    var upd = seeded[0];
+    upd.role.set("OWNER");
+    try zorm.update(ZMembership, zb, &upd);
+    var got0: ZMembership = .{};
+    try std.testing.expect(try zorm.findByPk(ZMembership, zb, .{ upd.tenant.slice(), upd.seq.value }, &got0));
+    try std.testing.expectEqualStrings("OWNER", got0.role.slice());
+    // seeded[tenants.len] shares seeded[0]'s tenant but a different seq.
+    const sib = seeded[tenants.len];
+    var gotSib: ZMembership = .{};
+    try std.testing.expect(try zorm.findByPk(ZMembership, zb, .{ sib.tenant.slice(), sib.seq.value }, &gotSib));
+    try std.testing.expectEqualStrings(sib.role.slice(), gotSib.role.slice());
+
+    // Delete keyed on the full composite key removes exactly one row.
+    try zorm.deleteByPk(ZMembership, zb, .{ seeded[1].tenant.slice(), seeded[1].seq.value });
+    var gone: ZMembership = .{};
+    try std.testing.expect(!try zorm.findByPk(ZMembership, zb, .{ seeded[1].tenant.slice(), seeded[1].seq.value }, &gone));
+
+    // The whole table now has n-1 rows.
+    var out: [64]ZMembership = undefined;
+    var q = zorm.Query(ZMembership).init(.sqlite);
+    try std.testing.expectEqual(@as(usize, n - 1), try q.all(zb, &out));
+}
+
+test "zorm/SQLite: composite PK identity map returns the same pointer (real engine)" {
+    const db = try sqlite.openWriter(":memory:");
+    defer sqlite.closeDb(db);
+    var be: storage.SqliteBackend = undefined;
+    var adapter: storage.zorm_adapter.Adapter = undefined;
+    const zb = try sqliteZorm(ZMembership, db, &be, &adapter);
+
+    var s = zorm.Session(ZMembership, 16).init(zb);
+
+    // Two rows under the same tenant with distinct seq parts.
+    var a: ZMembership = .{};
+    a.tenant.set("acme");
+    a.seq = .{ .value = 1 };
+    a.role.set("admin");
+    _ = try s.add(a);
+    var b: ZMembership = .{};
+    b.tenant.set("acme");
+    b.seq = .{ .value = 2 };
+    b.role.set("member");
+    _ = try s.add(b);
+    try s.flush();
+    s.reset();
+
+    // Same composite key → same managed pointer.
+    const p1 = (try s.get(.{ "acme", @as(i64, 1) })).?;
+    const p2 = (try s.get(.{ "acme", @as(i64, 1) })).?;
+    try std.testing.expectEqual(p1, p2);
+    try std.testing.expectEqualStrings("admin", p1.role.slice());
+
+    // Different seq part → distinct identity.
+    const q = (try s.get(.{ "acme", @as(i64, 2) })).?;
+    try std.testing.expect(p1 != q);
+    try std.testing.expectEqualStrings("member", q.role.slice());
+
+    // In-flight edit preserved across a repeat get of the same key.
+    p1.role = zorm.Text(16).from("OWNER");
+    const p3 = (try s.get(.{ "acme", @as(i64, 1) })).?;
+    try std.testing.expectEqual(p1, p3);
+    try std.testing.expectEqualStrings("OWNER", p3.role.slice());
+
+    // Absent composite key → null.
+    try std.testing.expect((try s.get(.{ "acme", @as(i64, 99) })) == null);
+}
+
 // ── Postgres (live; skips unless PG_TEST_URL is set) ─────────────────────
 
 fn testPool() ?*pg.Pool {

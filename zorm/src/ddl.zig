@@ -96,12 +96,24 @@ fn buildCreateTable(comptime T: type, comptime dialect: Dialect) []const u8 {
         for (info.columns, 0..) |col, i| {
             if (i > 0) body = body ++ ", ";
             body = body ++ quoteIdent(col.name, dialect) ++ " " ++ sqlType(col, dialect);
-            // Text PK: PRIMARY KEY + implicitly NOT NULL.
-            if (col.is_pk and !col.pk_auto) {
+            // Single text PK: inline `PRIMARY KEY` (+ implicitly NOT NULL).
+            // A composite PK is declared with a table-level clause below; its
+            // columns are individually NOT NULL.
+            if (col.is_pk and !col.pk_auto and !info.composite_pk) {
                 body = body ++ " PRIMARY KEY";
             } else if (!col.nullable and !col.pk_auto) {
                 body = body ++ " NOT NULL";
             }
+        }
+        // Composite PK: a single table-level `PRIMARY KEY (a, b, …)` clause
+        // (identical form on all four dialects).
+        if (info.composite_pk) {
+            var pk_list: []const u8 = "";
+            for (0..info.pk_count) |k| {
+                if (k > 0) pk_list = pk_list ++ ", ";
+                pk_list = pk_list ++ quoteIdent(info.pkColumn(k).name, dialect);
+            }
+            body = body ++ ", PRIMARY KEY (" ++ pk_list ++ ")";
         }
         // Table-level FOREIGN KEY clauses derived from BelongsTo relations.
         // (Table-level form is identical on all four dialects.)
@@ -412,6 +424,40 @@ test "createTable: reserved-word table + column are quoted per dialect" {
     try testing.expectEqualStrings(
         "IF OBJECT_ID(N'order', N'U') IS NULL CREATE TABLE [order] ([id] NVARCHAR(32) PRIMARY KEY, [select] NVARCHAR(16) NOT NULL)",
         createTable(ReservedDdl, .mssql),
+    );
+}
+
+// Composite PK (Z4): a table-level `PRIMARY KEY (a, b)` clause, with each PK
+// column individually NOT NULL (no inline single-column PRIMARY KEY).
+const TenantDoc = struct {
+    pub const zorm_table = "tenant_docs";
+    tenant: fields.Pk(32) = .{},
+    seq: fields.PkInt = .{},
+    title: fields.Text(64) = .{},
+};
+
+test "createTable: composite PK emits a table-level PRIMARY KEY (cols) clause" {
+    try testing.expectEqualStrings(
+        "CREATE TABLE IF NOT EXISTS \"tenant_docs\" (" ++
+            "\"tenant\" TEXT NOT NULL, \"seq\" INTEGER NOT NULL, \"title\" TEXT NOT NULL, " ++
+            "PRIMARY KEY (\"tenant\", \"seq\"))",
+        createTable(TenantDoc, .sqlite),
+    );
+    // No inline per-column PRIMARY KEY for a composite key.
+    try testing.expect(std.mem.indexOf(u8, createTable(TenantDoc, .sqlite), "\"tenant\" TEXT PRIMARY KEY") == null);
+    // MySQL: VARCHAR(N) PK column + BIGINT int part, table-level PK.
+    try testing.expectEqualStrings(
+        "CREATE TABLE IF NOT EXISTS `tenant_docs` (" ++
+            "`tenant` VARCHAR(32) NOT NULL, `seq` BIGINT NOT NULL, `title` VARCHAR(64) NOT NULL, " ++
+            "PRIMARY KEY (`tenant`, `seq`))",
+        createTable(TenantDoc, .mysql),
+    );
+    // MS SQL: OBJECT_ID guard + bracket idents + table-level PK.
+    try testing.expectEqualStrings(
+        "IF OBJECT_ID(N'tenant_docs', N'U') IS NULL CREATE TABLE [tenant_docs] (" ++
+            "[tenant] NVARCHAR(32) NOT NULL, [seq] BIGINT NOT NULL, [title] NVARCHAR(64) NOT NULL, " ++
+            "PRIMARY KEY ([tenant], [seq]))",
+        createTable(TenantDoc, .mssql),
     );
 }
 

@@ -112,6 +112,20 @@ fn buildUpsert(comptime T: type, comptime dialect: Dialect) []const u8 {
         const pk = quoteIdent(info.pk_column.name, dialect);
         const table = quoteIdent(info.table, dialect);
 
+        // The conflict target / merge key: every PK column. For a single PK
+        // this is byte-identical to the old `<pk>` forms.
+        var pk_list: []const u8 = ""; // `pk1, pk2, …` — ON CONFLICT target
+        var merge_on: []const u8 = ""; // `tgt.pk1 = src.pk1 AND …` — MERGE key
+        for (0..info.pk_count) |pk_k| {
+            const c = quoteIdent(info.pkColumn(pk_k).name, dialect);
+            if (pk_k > 0) {
+                pk_list = pk_list ++ ", ";
+                merge_on = merge_on ++ " AND ";
+            }
+            pk_list = pk_list ++ c;
+            merge_on = merge_on ++ "tgt." ++ c ++ " = src." ++ c;
+        }
+
         switch (dialect) {
             // SQLite / Postgres share the ON CONFLICT (<pk>) DO UPDATE SET
             // col = excluded.col form. SQLite spells the pseudo-table
@@ -128,11 +142,11 @@ fn buildUpsert(comptime T: type, comptime dialect: Dialect) []const u8 {
                     m += 1;
                 }
                 var s: []const u8 = "INSERT INTO " ++ table ++ " (" ++ cols ++ ") VALUES (" ++ vals ++ ")" ++
-                    " ON CONFLICT (" ++ pk ++ ") DO UPDATE SET " ++ sets;
+                    " ON CONFLICT (" ++ pk_list ++ ") DO UPDATE SET " ++ sets;
                 // No non-PK columns (a PK-only table): nothing to update on
                 // conflict — fall back to DO NOTHING so the statement is valid.
                 if (m == 0) s = "INSERT INTO " ++ table ++ " (" ++ cols ++ ") VALUES (" ++ vals ++ ")" ++
-                    " ON CONFLICT (" ++ pk ++ ") DO NOTHING";
+                    " ON CONFLICT (" ++ pk_list ++ ") DO NOTHING";
                 return s;
             },
             // MySQL: INSERT … ON DUPLICATE KEY UPDATE col = VALUES(col).
@@ -177,7 +191,7 @@ fn buildUpsert(comptime T: type, comptime dialect: Dialect) []const u8 {
                     m += 1;
                 }
                 var s: []const u8 = "MERGE " ++ table ++ " AS tgt USING (VALUES (" ++ vals ++ ")) AS src (" ++ src_cols ++ ")" ++
-                    " ON tgt." ++ pk ++ " = src." ++ pk;
+                    " ON " ++ merge_on;
                 if (m > 0) s = s ++ " WHEN MATCHED THEN UPDATE SET " ++ sets;
                 s = s ++ " WHEN NOT MATCHED THEN INSERT (" ++ cols ++ ") VALUES (" ++ ins_vals ++ ");";
                 return s;
@@ -186,11 +200,28 @@ fn buildUpsert(comptime T: type, comptime dialect: Dialect) []const u8 {
     }
 }
 
+/// `pk1 = <ph> AND pk2 = <ph> …` — the WHERE clause matching the full
+/// primary key, identifier-quoted, with dialect placeholders numbered from
+/// `start_ph` (1-based). For a single PK this is `pk = <ph>` (byte-identical
+/// to the old shape). The placeholders advance in PK declaration order, which
+/// matches the bind order `bind.bindPkAll`/`bindPkValueAll` produce.
+fn pkWhere(comptime T: type, comptime dialect: Dialect, comptime start_ph: usize) []const u8 {
+    const info = reflect.TableInfo(T);
+    comptime {
+        var s: []const u8 = "";
+        for (0..info.pk_count) |k| {
+            if (k > 0) s = s ++ " AND ";
+            s = s ++ quoteIdent(info.pkColumn(k).name, dialect) ++ " = " ++ dialect.placeholder(start_ph + k);
+        }
+        return s;
+    }
+}
+
 fn buildSelectByPk(comptime T: type, comptime dialect: Dialect) []const u8 {
     const info = reflect.TableInfo(T);
     comptime {
         return "SELECT " ++ columnList(T, dialect) ++ " FROM " ++ quoteIdent(info.table, dialect) ++
-            " WHERE " ++ quoteIdent(info.pk_column.name, dialect) ++ " = " ++ dialect.placeholder(1);
+            " WHERE " ++ pkWhere(T, dialect, 1);
     }
 }
 
@@ -206,7 +237,7 @@ fn buildUpdate(comptime T: type, comptime dialect: Dialect) []const u8 {
             n += 1;
         }
         return "UPDATE " ++ quoteIdent(info.table, dialect) ++ " SET " ++ sets ++
-            " WHERE " ++ quoteIdent(info.pk_column.name, dialect) ++ " = " ++ dialect.placeholder(n + 1);
+            " WHERE " ++ pkWhere(T, dialect, n + 1);
     }
 }
 
@@ -214,7 +245,7 @@ fn buildDeleteByPk(comptime T: type, comptime dialect: Dialect) []const u8 {
     const info = reflect.TableInfo(T);
     comptime {
         return "DELETE FROM " ++ quoteIdent(info.table, dialect) ++
-            " WHERE " ++ quoteIdent(info.pk_column.name, dialect) ++ " = " ++ dialect.placeholder(1);
+            " WHERE " ++ pkWhere(T, dialect, 1);
     }
 }
 
@@ -485,6 +516,106 @@ test "DELETE by PK" {
     try testing.expectEqualStrings(
         "DELETE FROM \"things\" WHERE \"id\" = $1",
         deleteByPk(AutoEntity, .postgres),
+    );
+}
+
+// ── Composite primary key (Z4) ──────────────────────────────────────────
+
+// Composite PK with two TEXT parts (the common multi-tenant shape:
+// (tenant, resource)). Declaring two PK fields forms the composite key; the
+// WHERE / conflict clauses cover BOTH columns in declaration order.
+const TenantDoc = struct {
+    pub const zorm_table = "tenant_docs";
+    tenant: fields.Pk(32) = .{},
+    doc_id: fields.Pk(32) = .{},
+    title: fields.Text(64) = .{},
+};
+
+// A heterogeneous composite PK: (tenant_id TEXT, seq INTEGER) — proves the
+// int-bound PK part in the WHERE clause.
+const Membership = struct {
+    pub const zorm_table = "memberships";
+    tenant_id: fields.Pk(32) = .{},
+    seq: fields.PkInt = .{},
+    role: fields.Text(16) = .{},
+};
+
+test "composite PK (text+int): WHERE binds both, int part included" {
+    try testing.expectEqualStrings(
+        "SELECT \"tenant_id\", \"seq\", \"role\" FROM \"memberships\" WHERE \"tenant_id\" = $1 AND \"seq\" = $2",
+        selectByPk(Membership, .postgres),
+    );
+    try testing.expectEqualStrings(
+        "UPDATE \"memberships\" SET \"role\" = ? WHERE \"tenant_id\" = ? AND \"seq\" = ?",
+        update(Membership, .sqlite),
+    );
+}
+
+test "composite PK: selectByPk WHERE ANDs every PK column (all dialects)" {
+    try testing.expectEqualStrings(
+        "SELECT \"tenant\", \"doc_id\", \"title\" FROM \"tenant_docs\" WHERE \"tenant\" = ? AND \"doc_id\" = ?",
+        selectByPk(TenantDoc, .sqlite),
+    );
+    try testing.expectEqualStrings(
+        "SELECT \"tenant\", \"doc_id\", \"title\" FROM \"tenant_docs\" WHERE \"tenant\" = $1 AND \"doc_id\" = $2",
+        selectByPk(TenantDoc, .postgres),
+    );
+    try testing.expectEqualStrings(
+        "SELECT `tenant`, `doc_id`, `title` FROM `tenant_docs` WHERE `tenant` = ? AND `doc_id` = ?",
+        selectByPk(TenantDoc, .mysql),
+    );
+    try testing.expectEqualStrings(
+        "SELECT [tenant], [doc_id], [title] FROM [tenant_docs] WHERE [tenant] = @p1 AND [doc_id] = @p2",
+        selectByPk(TenantDoc, .mssql),
+    );
+}
+
+test "composite PK: update SETs non-PK then ANDs all PK columns in WHERE" {
+    // SET has 1 col (title → $1); WHERE binds the two PK parts ($2, $3).
+    try testing.expectEqualStrings(
+        "UPDATE \"tenant_docs\" SET \"title\" = $1 WHERE \"tenant\" = $2 AND \"doc_id\" = $3",
+        update(TenantDoc, .postgres),
+    );
+    try testing.expectEqualStrings(
+        "UPDATE \"tenant_docs\" SET \"title\" = ? WHERE \"tenant\" = ? AND \"doc_id\" = ?",
+        update(TenantDoc, .sqlite),
+    );
+    try testing.expectEqualStrings(
+        "UPDATE [tenant_docs] SET [title] = @p1 WHERE [tenant] = @p2 AND [doc_id] = @p3",
+        update(TenantDoc, .mssql),
+    );
+}
+
+test "composite PK: deleteByPk ANDs all PK columns" {
+    try testing.expectEqualStrings(
+        "DELETE FROM \"tenant_docs\" WHERE \"tenant\" = ? AND \"doc_id\" = ?",
+        deleteByPk(TenantDoc, .sqlite),
+    );
+    try testing.expectEqualStrings(
+        "DELETE FROM `tenant_docs` WHERE `tenant` = ? AND `doc_id` = ?",
+        deleteByPk(TenantDoc, .mysql),
+    );
+}
+
+test "composite PK: upsert conflict target / merge key lists every PK column" {
+    // sqlite/postgres: ON CONFLICT (pk1, pk2)
+    try testing.expectEqualStrings(
+        "INSERT INTO \"tenant_docs\" (\"tenant\", \"doc_id\", \"title\") VALUES (?, ?, ?)" ++
+            " ON CONFLICT (\"tenant\", \"doc_id\") DO UPDATE SET \"title\" = excluded.\"title\"",
+        upsert(TenantDoc, .sqlite),
+    );
+    try testing.expectEqualStrings(
+        "INSERT INTO \"tenant_docs\" (\"tenant\", \"doc_id\", \"title\") VALUES ($1, $2, $3)" ++
+            " ON CONFLICT (\"tenant\", \"doc_id\") DO UPDATE SET \"title\" = EXCLUDED.\"title\"",
+        upsert(TenantDoc, .postgres),
+    );
+    // mssql MERGE: ON tgt.pk1 = src.pk1 AND tgt.pk2 = src.pk2
+    try testing.expectEqualStrings(
+        "MERGE [tenant_docs] AS tgt USING (VALUES (@p1, @p2, @p3)) AS src ([tenant], [doc_id], [title])" ++
+            " ON tgt.[tenant] = src.[tenant] AND tgt.[doc_id] = src.[doc_id]" ++
+            " WHEN MATCHED THEN UPDATE SET [title] = src.[title]" ++
+            " WHEN NOT MATCHED THEN INSERT ([tenant], [doc_id], [title]) VALUES (src.[tenant], src.[doc_id], src.[title]);",
+        upsert(TenantDoc, .mssql),
     );
 }
 

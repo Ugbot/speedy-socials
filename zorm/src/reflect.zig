@@ -5,9 +5,13 @@
 //! layers consume.
 //!
 //! Entity contract: a struct with `pub const zorm_table: []const u8` and
-//! exactly one primary-key field (`Pk(N)` or `AutoPk`). ≤16 columns, each
-//! text/blob field ≤1024 bytes (the backend's `Row` limits) — violations
-//! fail the build.
+//! at least one primary-key field (`Pk(N)` / `AutoPk` / `pk_text`). A single
+//! PK is the common case; declaring two or more PK fields forms a COMPOSITE
+//! primary key (every PK field becomes part of the key, in declaration
+//! order). An auto-increment PK (`AutoPk`) may only appear as a SINGLE-column
+//! PK — a composite key is made of caller-supplied (text/explicit) columns.
+//! ≤16 columns, each text/blob field ≤1024 bytes (the backend's `Row`
+//! limits) — violations fail the build.
 
 const std = @import("std");
 const fields = @import("fields.zig");
@@ -91,6 +95,12 @@ pub fn columnSpec(comptime field_name: []const u8, comptime F: type, comptime id
                 spec.is_pk = true;
                 spec.pk_auto = true;
             },
+            .pk_int => {
+                spec.col_type = .integer;
+                spec.bind_kind = .int;
+                spec.is_pk = true;
+                // NOT auto: caller supplies the value (composite-key member).
+            },
             .timestamp => {
                 spec.col_type = .integer;
                 spec.bind_kind = .int;
@@ -168,18 +178,21 @@ pub fn TableInfo(comptime T: type) type {
         }
         const all = std.meta.fields(T);
 
-        // Collect column specs (skipping relation fields).
+        // Collect column specs (skipping relation fields) and the indexes of
+        // every PK column (in declaration order — a composite key keeps that
+        // order for its WHERE clause and bind layout).
         var cols: [all.len]ColumnSpec = undefined;
+        var pk_idxs: [all.len]usize = undefined;
         var n: usize = 0;
-        var pk_idx: ?usize = null;
+        var pk_n: usize = 0;
         var pk_is_auto = false;
         for (all, 0..) |f, i| {
             if (isRelation(f.type)) continue;
             const spec = columnSpec(f.name, f.type, i);
             if (spec.is_pk) {
-                if (pk_idx != null) @compileError("zorm: entity '" ++ @typeName(T) ++ "' has more than one primary key (v1 supports exactly one)");
-                pk_idx = n;
-                pk_is_auto = spec.pk_auto;
+                if (spec.pk_auto) pk_is_auto = true;
+                pk_idxs[pk_n] = n;
+                pk_n += 1;
             }
             if (spec.byte_cap > 1024) @compileError("zorm: field '" ++ spec.name ++ "' capacity exceeds the 1024-byte column limit");
             cols[n] = spec;
@@ -187,17 +200,33 @@ pub fn TableInfo(comptime T: type) type {
         }
         if (n == 0) @compileError("zorm: entity '" ++ @typeName(T) ++ "' has no persisted columns");
         if (n > 16) @compileError("zorm: entity '" ++ @typeName(T) ++ "' has more than 16 columns (the backend Row limit)");
-        if (pk_idx == null) @compileError("zorm: entity '" ++ @typeName(T) ++ "' has no primary key (add a `Pk(N)` or `AutoPk` field)");
+        if (pk_n == 0) @compileError("zorm: entity '" ++ @typeName(T) ++ "' has no primary key (add a `Pk(N)` / `AutoPk` field)");
+        // An auto-increment PK is DB-assigned, so it cannot be one column of a
+        // composite (caller-supplied) key.
+        if (pk_is_auto and pk_n > 1) @compileError("zorm: entity '" ++ @typeName(T) ++ "' mixes an auto-increment PK with other PK columns — a composite key must be all caller-supplied columns");
 
         const final = cols[0..n].*;
+        const final_pk_idxs = pk_idxs[0..pk_n].*;
         return struct {
             pub const Entity = T;
             pub const table: []const u8 = T.zorm_table;
             pub const columns = final;
             pub const column_count = n;
-            pub const pk_index: usize = pk_idx.?;
+            // Composite-PK metadata: indexes (into `columns`) of every PK
+            // column, in declaration order, plus the count.
+            pub const pk_indexes = final_pk_idxs;
+            pub const pk_count: usize = pk_n;
+            pub const composite_pk: bool = pk_n > 1;
+            // Single-PK accessors (the common case): the FIRST PK column. For a
+            // composite key these still resolve to its first part, which is all
+            // the single-PK code paths (auto-PK write-back, FK ref column) need.
+            pub const pk_index: usize = final_pk_idxs[0];
             pub const pk_auto: bool = pk_is_auto;
-            pub const pk_column: ColumnSpec = final[pk_idx.?];
+            pub const pk_column: ColumnSpec = final[final_pk_idxs[0]];
+            /// The ColumnSpec of PK part `k` (0-based, in declaration order).
+            pub fn pkColumn(comptime k: usize) ColumnSpec {
+                return final[final_pk_idxs[k]];
+            }
         };
     }
 }
@@ -301,4 +330,34 @@ test "TableInfo: AutoPk detected as auto primary key" {
     try testing.expectEqual(@as(usize, 2), info.column_count);
     try testing.expect(info.pk_auto);
     try testing.expectEqual(ColType.integer, info.pk_column.col_type);
+    // Single-PK metadata: one PK part, not composite.
+    try testing.expectEqual(@as(usize, 1), info.pk_count);
+    try testing.expect(!info.composite_pk);
+}
+
+const TenantDoc = struct {
+    pub const zorm_table = "tenant_docs";
+    tenant: fields.Pk(32) = .{},
+    seq: fields.PkInt = .{},
+    title: fields.Text(64) = .{},
+};
+
+test "TableInfo: composite PK collects every PK column in declaration order" {
+    const info = TableInfo(TenantDoc);
+    try testing.expectEqual(@as(usize, 3), info.column_count);
+    try testing.expect(info.composite_pk);
+    try testing.expectEqual(@as(usize, 2), info.pk_count);
+    // Indexes into `columns`, in declaration order.
+    try testing.expectEqual(@as(usize, 0), info.pk_indexes[0]);
+    try testing.expectEqual(@as(usize, 1), info.pk_indexes[1]);
+    // pkColumn(k) resolves each PK part; bind kinds differ (text, int).
+    try testing.expectEqualStrings("tenant", info.pkColumn(0).name);
+    try testing.expectEqual(BindKind.text, info.pkColumn(0).bind_kind);
+    try testing.expectEqualStrings("seq", info.pkColumn(1).name);
+    try testing.expectEqual(BindKind.int, info.pkColumn(1).bind_kind);
+    try testing.expect(!info.pkColumn(1).pk_auto); // PkInt is caller-supplied
+    // Single-PK accessors still resolve to the FIRST PK part (compat).
+    try testing.expectEqual(@as(usize, 0), info.pk_index);
+    try testing.expectEqualStrings("tenant", info.pk_column.name);
+    try testing.expect(!info.pk_auto);
 }

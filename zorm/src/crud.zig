@@ -51,9 +51,10 @@ pub fn insert(comptime T: type, backend: Backend, value: *T) Error!void {
 /// (`out` is left untouched).
 pub fn findByPk(comptime T: type, backend: Backend, pk: bind.PkValue(T), out: *T) Error!bool {
     const stmt = sql.selectByPk(T, backend.dialect);
-    const arg = bind.bindPkValue(T, pk);
+    var args: [max_columns]BindValue = undefined;
+    const n = bind.bindPkValueAll(T, pk, &args);
     var row: contract.Row = .{};
-    if (!try backend.queryOne(stmt, &.{arg}, &row)) return false;
+    if (!try backend.queryOne(stmt, args[0..n], &row)) return false;
     bind.rowToEntity(T, &row, out);
     return true;
 }
@@ -82,18 +83,18 @@ pub fn update(comptime T: type, backend: Backend, value: *const T) Error!void {
     try backend.exec(sql.update(T, backend.dialect), args[0..n]);
 }
 
-/// Delete the row with primary key `pk`.
+/// Delete the row with primary key `pk` (single value or composite struct).
 pub fn deleteByPk(comptime T: type, backend: Backend, pk: bind.PkValue(T)) Error!void {
-    const arg = bind.bindPkValue(T, pk);
-    try backend.exec(sql.deleteByPk(T, backend.dialect), &.{arg});
+    var args: [max_columns]BindValue = undefined;
+    const n = bind.bindPkValueAll(T, pk, &args);
+    try backend.exec(sql.deleteByPk(T, backend.dialect), args[0..n]);
 }
 
-/// Delete the row identified by `value`'s PK.
+/// Delete the row identified by `value`'s PK (binds every PK column).
 pub fn delete(comptime T: type, backend: Backend, value: *const T) Error!void {
     var args: [max_columns]BindValue = undefined;
-    const arg = bind.bindPk(T, value);
-    args[0] = arg;
-    try backend.exec(sql.deleteByPk(T, backend.dialect), args[0..1]);
+    const n = bind.bindPkAll(T, value, &args);
+    try backend.exec(sql.deleteByPk(T, backend.dialect), args[0..n]);
 }
 
 /// Write a DB-assigned id into the entity's auto-PK field.
@@ -254,6 +255,142 @@ test "upsert: a brand-new PK simply inserts" {
     try testing.expect(try findByPk(Account, backend, "fresh", &got));
     try testing.expectEqualStrings("h", got.handle.slice());
     try testing.expectEqual(@as(usize, 1), db.rowCount("atp_accounts"));
+}
+
+// ── Composite primary key (Z4) ──────────────────────────────────────────
+
+// Two-column PK: (tenant TEXT, doc_id TEXT). The key is the pair; findByPk /
+// update / deleteByPk all match on BOTH columns.
+const TenantDoc = struct {
+    pub const zorm_table = "tenant_docs";
+    tenant: fields.Pk(32) = .{},
+    doc_id: fields.Pk(32) = .{},
+    title: fields.Text(64) = .{},
+    views: i64 = 0,
+};
+
+fn tdoc(tenant: []const u8, doc: []const u8, title: []const u8) TenantDoc {
+    return .{
+        .tenant = fields.Pk(32).from(tenant),
+        .doc_id = fields.Pk(32).from(doc),
+        .title = fields.Text(64).from(title),
+    };
+}
+
+test "composite PK: insert + findByPk(composite) round-trips" {
+    var db = mock.MockBackend.init();
+    const backend = db.backend(.sqlite);
+
+    var a = tdoc("acme", "readme", "Hello");
+    a.views = 7;
+    try insert(TenantDoc, backend, &a);
+
+    // findByPk takes the composite tuple `.{ tenant, doc_id }`.
+    var got: TenantDoc = .{};
+    try testing.expect(try findByPk(TenantDoc, backend, .{ "acme", "readme" }, &got));
+    try testing.expectEqualStrings("Hello", got.title.slice());
+    try testing.expectEqual(@as(i64, 7), got.views);
+
+    // A non-matching SECOND part must miss (proves both columns are in WHERE).
+    var miss: TenantDoc = .{};
+    try testing.expect(!try findByPk(TenantDoc, backend, .{ "acme", "other" }, &miss));
+    // Same doc_id under a different tenant must also miss.
+    try testing.expect(!try findByPk(TenantDoc, backend, .{ "globex", "readme" }, &miss));
+}
+
+test "composite PK: two rows sharing one key part are distinct" {
+    var db = mock.MockBackend.init();
+    const backend = db.backend(.sqlite);
+
+    var a = tdoc("acme", "readme", "A");
+    var b = tdoc("acme", "guide", "B"); // same tenant, different doc_id
+    var c = tdoc("globex", "readme", "C"); // same doc_id, different tenant
+    try insert(TenantDoc, backend, &a);
+    try insert(TenantDoc, backend, &b);
+    try insert(TenantDoc, backend, &c);
+
+    var got: TenantDoc = .{};
+    try testing.expect(try findByPk(TenantDoc, backend, .{ "acme", "guide" }, &got));
+    try testing.expectEqualStrings("B", got.title.slice());
+    try testing.expect(try findByPk(TenantDoc, backend, .{ "globex", "readme" }, &got));
+    try testing.expectEqualStrings("C", got.title.slice());
+}
+
+test "composite PK: update matches on the full key" {
+    var db = mock.MockBackend.init();
+    const backend = db.backend(.sqlite);
+
+    var a = tdoc("acme", "readme", "old");
+    var sibling = tdoc("acme", "guide", "sib"); // shares tenant
+    try insert(TenantDoc, backend, &a);
+    try insert(TenantDoc, backend, &sibling);
+
+    a.title = fields.Text(64).from("new");
+    a.views = 42;
+    try update(TenantDoc, backend, &a);
+
+    var got: TenantDoc = .{};
+    try testing.expect(try findByPk(TenantDoc, backend, .{ "acme", "readme" }, &got));
+    try testing.expectEqualStrings("new", got.title.slice());
+    try testing.expectEqual(@as(i64, 42), got.views);
+    // The sibling (same tenant) is untouched — the update keyed on BOTH cols.
+    var sib: TenantDoc = .{};
+    try testing.expect(try findByPk(TenantDoc, backend, .{ "acme", "guide" }, &sib));
+    try testing.expectEqualStrings("sib", sib.title.slice());
+}
+
+test "composite PK: deleteByPk removes only the full-key match" {
+    var db = mock.MockBackend.init();
+    const backend = db.backend(.sqlite);
+
+    var a = tdoc("acme", "readme", "A");
+    var b = tdoc("acme", "guide", "B");
+    try insert(TenantDoc, backend, &a);
+    try insert(TenantDoc, backend, &b);
+
+    try deleteByPk(TenantDoc, backend, .{ "acme", "readme" });
+
+    var got: TenantDoc = .{};
+    try testing.expect(!try findByPk(TenantDoc, backend, .{ "acme", "readme" }, &got));
+    // The sibling sharing the tenant survives.
+    try testing.expect(try findByPk(TenantDoc, backend, .{ "acme", "guide" }, &got));
+    try testing.expectEqualStrings("B", got.title.slice());
+    try testing.expectEqual(@as(usize, 1), db.rowCount("tenant_docs"));
+}
+
+// Heterogeneous (text + int) composite key, exercising the int-bound PK part.
+const Membership = struct {
+    pub const zorm_table = "memberships";
+    tenant: fields.Pk(32) = .{},
+    seq: fields.PkInt = .{},
+    role: fields.Text(16) = .{},
+};
+
+test "composite PK (text+int): round-trip with an integer key part" {
+    var db = mock.MockBackend.init();
+    const backend = db.backend(.sqlite);
+
+    var m = Membership{
+        .tenant = fields.Pk(32).from("acme"),
+        .seq = .{ .value = 3 },
+        .role = fields.Text(16).from("admin"),
+    };
+    try insert(Membership, backend, &m);
+
+    var got: Membership = .{};
+    try testing.expect(try findByPk(Membership, backend, .{ "acme", 3 }, &got));
+    try testing.expectEqualStrings("admin", got.role.slice());
+    try testing.expectEqual(@as(i64, 3), got.seq.value);
+    // Wrong int part misses.
+    try testing.expect(!try findByPk(Membership, backend, .{ "acme", 4 }, &got));
+
+    // Update + delete keyed on (text, int).
+    m.role = fields.Text(16).from("member");
+    try update(Membership, backend, &m);
+    try testing.expect(try findByPk(Membership, backend, .{ "acme", 3 }, &got));
+    try testing.expectEqualStrings("member", got.role.slice());
+    try deleteByPk(Membership, backend, .{ "acme", 3 });
+    try testing.expect(!try findByPk(Membership, backend, .{ "acme", 3 }, &got));
 }
 
 test "values with SQL metacharacters survive as data (parameterized binds)" {

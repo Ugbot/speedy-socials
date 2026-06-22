@@ -292,13 +292,16 @@ pub const MockBackend = struct {
     fn doUpdate(self: *MockBackend, sql: []const u8, args: []const BindValue) Error!void {
         const tname = between(sql, "UPDATE ", " SET ") orelse return Error.BadStatement;
         const set_str = between(sql, " SET ", " WHERE ") orelse return Error.BadStatement;
-        const where_col = between(sql, " WHERE ", " = ") orelse return Error.BadStatement;
+        const where = sliceAfter(sql, " WHERE ") orelse return Error.BadStatement;
 
         const t = self.table(tname);
-        // The WHERE pk value is the final bind arg.
-        if (args.len < 1) return Error.BadBinding;
-        const pk_arg = args[args.len - 1];
-        const match = self.findRow(t, where_col, pk_arg) orelse {
+        // Count the SET assignments → the WHERE binds are the trailing args
+        // (one per PK column, AND-joined). This handles a composite key whose
+        // WHERE is `pk1 = ? AND pk2 = ?`.
+        const set_count = countPredicates(set_str);
+        if (args.len < set_count) return Error.BadBinding;
+        const where_args = args[set_count..];
+        const match = self.findRowWhere(t, where, where_args) orelse {
             self.change_count = 0;
             return;
         };
@@ -308,7 +311,7 @@ pub const MockBackend = struct {
         while (it.next()) |assign| : (i += 1) {
             // "<col> = ?" / "<col> = $N"
             const col = between(assign, "", " = ") orelse return Error.BadStatement;
-            if (i >= args.len - 1) return Error.BadBinding;
+            if (i >= set_count) return Error.BadBinding;
             if (match.findCell(col)) |cell| {
                 cell.setFromBind(args[i]);
             } else {
@@ -324,14 +327,14 @@ pub const MockBackend = struct {
 
     fn doDelete(self: *MockBackend, sql: []const u8, args: []const BindValue) Error!void {
         const tname = between(sql, "DELETE FROM ", " WHERE ") orelse return Error.BadStatement;
-        const where_col = between(sql, " WHERE ", " = ") orelse return Error.BadStatement;
+        const where = sliceAfter(sql, " WHERE ") orelse return Error.BadStatement;
         if (args.len < 1) return Error.BadBinding;
         const t = self.table(tname);
 
         var idx: usize = 0;
         while (idx < t.row_count) : (idx += 1) {
             if (!t.rows[idx].present) continue;
-            if (cellForKey(&t.rows[idx], where_col).matchesBind(args[0])) {
+            if (rowMatches(&t.rows[idx], where, args)) {
                 // Compact: shift the tail down.
                 var j = idx;
                 while (j + 1 < t.row_count) : (j += 1) t.rows[j] = t.rows[j + 1];
@@ -341,6 +344,18 @@ pub const MockBackend = struct {
             }
         }
         self.change_count = 0;
+    }
+
+    /// Find the first present row satisfying every `col = ?` predicate in
+    /// `where` (AND-joined, positional binds). Used by composite-PK UPDATE.
+    fn findRowWhere(self: *MockBackend, t: *Table, where: []const u8, args: []const BindValue) ?*Row {
+        _ = self;
+        var i: usize = 0;
+        while (i < t.row_count) : (i += 1) {
+            if (!t.rows[i].present) continue;
+            if (rowMatches(&t.rows[i], where, args)) return &t.rows[i];
+        }
+        return null;
     }
 
     fn findRow(self: *MockBackend, t: *Table, key_col: []const u8, key: BindValue) ?*Row {
@@ -537,6 +552,15 @@ fn conflictKey(sql: []const u8) ?[]const u8 {
 fn firstCol(cols_str: []const u8) ?[]const u8 {
     var it = std.mem.splitSequence(u8, cols_str, ", ");
     return it.next();
+}
+
+/// Number of comma-separated assignments in an UPDATE SET list (each binds
+/// one arg). The PK WHERE binds follow these in the arg list.
+fn countPredicates(set_str: []const u8) usize {
+    var it = std.mem.splitSequence(u8, set_str, ", ");
+    var n: usize = 0;
+    while (it.next()) |_| n += 1;
+    return n;
 }
 
 /// Value of `row`'s key column. If the column wasn't stored (an auto PK
