@@ -25,6 +25,27 @@ const sql_buf_len = 1024;
 
 pub const Dir = enum { asc, desc };
 
+/// Comparison operators usable with `whereOp`.
+pub const Op = enum {
+    eq,
+    ne,
+    lt,
+    lte,
+    gt,
+    gte,
+
+    fn sql(self: Op) []const u8 {
+        return switch (self) {
+            .eq => "=",
+            .ne => "<>",
+            .lt => "<",
+            .lte => "<=",
+            .gt => ">",
+            .gte => ">=",
+        };
+    }
+};
+
 /// Assert at comptime that `name` is a real column of `T`, returning it.
 fn checkColumn(comptime T: type, comptime name: []const u8) []const u8 {
     comptime {
@@ -48,6 +69,7 @@ pub fn Query(comptime T: type) type {
         arg_count: usize = 0,
         has_where: bool = false,
         has_order: bool = false,
+        offset_n: ?usize = null,
 
         pub fn init(dialect: Dialect) Self {
             var q = Self{ .dialect = dialect };
@@ -77,21 +99,80 @@ pub fn Query(comptime T: type) type {
             }
         }
 
+        /// Emit the ` WHERE `/` AND ` join + bare column name, leaving the
+        /// caller to append the operator and (optional) placeholder.
         fn whereColumn(self: *Self, comptime name: []const u8) void {
             self.append(if (self.has_where) " AND " else " WHERE ");
             self.has_where = true;
             self.append(name);
-            self.append(" = ");
-            self.appendPlaceholder();
+        }
+
+        /// Record a single bound parameter into the args array.
+        fn bindArg(self: *Self, value: BindValue) void {
+            std.debug.assert(self.arg_count < max_columns);
+            self.args[self.arg_count] = value;
+            self.arg_count += 1;
         }
 
         // ── predicates (chainable) ──────────────────────────────────────
 
         /// `WHERE <field> = <value>` with an explicit bind value.
         pub fn where(self: *Self, comptime field: []const u8, value: BindValue) *Self {
+            return self.whereOp(field, .eq, value);
+        }
+
+        /// `WHERE <field> <op> <value>` — comparison against a bound value.
+        pub fn whereOp(self: *Self, comptime field: []const u8, op: Op, value: BindValue) *Self {
             self.whereColumn(checkColumn(T, field));
-            self.args[self.arg_count] = value;
-            self.arg_count += 1;
+            self.append(" ");
+            self.append(op.sql());
+            self.append(" ");
+            self.appendPlaceholder();
+            self.bindArg(value);
+            return self;
+        }
+
+        /// `WHERE <field> LIKE <pattern>` — pattern bound as a parameter.
+        pub fn whereLike(self: *Self, comptime field: []const u8, pattern: []const u8) *Self {
+            self.whereColumn(checkColumn(T, field));
+            self.append(" LIKE ");
+            self.appendPlaceholder();
+            self.bindArg(.{ .text = pattern });
+            return self;
+        }
+
+        /// `WHERE <field> IN (<ph>,…)` — each value bound as a parameter.
+        /// An empty `values` list emits the always-false `1 = 0` (no binds),
+        /// so the query is well-formed and returns no rows.
+        pub fn whereIn(self: *Self, comptime field: []const u8, values: []const BindValue) *Self {
+            if (values.len == 0) {
+                self.append(if (self.has_where) " AND " else " WHERE ");
+                self.has_where = true;
+                self.append("1 = 0");
+                return self;
+            }
+            self.whereColumn(checkColumn(T, field));
+            self.append(" IN (");
+            for (values, 0..) |v, i| {
+                if (i != 0) self.append(", ");
+                self.appendPlaceholder();
+                self.bindArg(v);
+            }
+            self.append(")");
+            return self;
+        }
+
+        /// `WHERE <field> IS NULL` — no bound value.
+        pub fn whereNull(self: *Self, comptime field: []const u8) *Self {
+            self.whereColumn(checkColumn(T, field));
+            self.append(" IS NULL");
+            return self;
+        }
+
+        /// `WHERE <field> IS NOT NULL` — no bound value.
+        pub fn whereNotNull(self: *Self, comptime field: []const u8) *Self {
+            self.whereColumn(checkColumn(T, field));
+            self.append(" IS NOT NULL");
             return self;
         }
 
@@ -117,26 +198,74 @@ pub fn Query(comptime T: type) type {
             return self;
         }
 
+        /// Skip the first `n` rows. **Call-order contract: `offset()` must be
+        /// invoked BEFORE `limit()`** — `offset()` only records the value, and
+        /// `limit()` emits the single dialect-correct pagination clause that
+        /// folds the offset in. `offset()` with no following `limit()` emits a
+        /// standalone offset clause for every dialect (T-SQL needs an ORDER BY,
+        /// which is synthesized when absent).
+        pub fn offset(self: *Self, n: usize) *Self {
+            self.offset_n = n;
+            return self;
+        }
+
+        /// Emit the standalone offset clause for an `offset()` that was never
+        /// paired with a `limit()`. Called lazily from `statement()`.
+        fn flushPendingOffset(self: *Self) void {
+            const n = self.offset_n orelse return;
+            self.offset_n = null;
+            if (self.dialect == .mssql) {
+                self.ensureMssqlOrder();
+                var tmp: [32]u8 = undefined;
+                self.append(std.fmt.bufPrint(&tmp, " OFFSET {d} ROWS", .{n}) catch unreachable);
+                return;
+            }
+            // sqlite/mysql/postgres: a bare OFFSET is invalid without a LIMIT;
+            // SQLite/MySQL accept a sentinel "all rows" limit, so emit one.
+            var tmp: [48]u8 = undefined;
+            const lim: []const u8 = switch (self.dialect) {
+                .sqlite, .postgres => " LIMIT -1 OFFSET ",
+                .mysql => " LIMIT 18446744073709551615 OFFSET ",
+                .mssql => unreachable,
+            };
+            self.append(lim);
+            self.append(std.fmt.bufPrint(&tmp, "{d}", .{n}) catch unreachable);
+        }
+
+        /// T-SQL OFFSET/FETCH requires an ORDER BY; synthesize a no-op one when
+        /// the caller set none.
+        fn ensureMssqlOrder(self: *Self) void {
+            if (!self.has_order) {
+                self.append(" ORDER BY (SELECT NULL)");
+                self.has_order = true;
+            }
+        }
+
         pub fn limit(self: *Self, n: usize) *Self {
+            const off = self.offset_n orelse 0;
+            self.offset_n = null; // consumed — offset() must precede limit()
             // T-SQL has no LIMIT — it uses OFFSET … FETCH, which requires an
             // ORDER BY; synthesize a no-op order when the caller set none.
             if (self.dialect == .mssql) {
-                if (!self.has_order) {
-                    self.append(" ORDER BY (SELECT NULL)");
-                    self.has_order = true;
-                }
-                var tmp: [48]u8 = undefined;
-                const s = std.fmt.bufPrint(&tmp, " OFFSET 0 ROWS FETCH NEXT {d} ROWS ONLY", .{n}) catch unreachable;
+                self.ensureMssqlOrder();
+                var tmp: [64]u8 = undefined;
+                const s = std.fmt.bufPrint(&tmp, " OFFSET {d} ROWS FETCH NEXT {d} ROWS ONLY", .{ off, n }) catch unreachable;
                 self.append(s);
                 return self;
             }
-            var tmp: [24]u8 = undefined;
-            const s = std.fmt.bufPrint(&tmp, " LIMIT {d}", .{n}) catch unreachable;
+            var tmp: [48]u8 = undefined;
+            const s = if (off == 0)
+                std.fmt.bufPrint(&tmp, " LIMIT {d}", .{n}) catch unreachable
+            else
+                std.fmt.bufPrint(&tmp, " LIMIT {d} OFFSET {d}", .{ n, off }) catch unreachable;
             self.append(s);
             return self;
         }
 
-        fn statement(self: *const Self) []const u8 {
+        /// Finalize and return the SQL text. Flushes any `offset()` that was
+        /// recorded without a following `limit()`.
+        fn statement(self: *Self) []const u8 {
+            self.flushPendingOffset();
             return self.buf[0..self.len];
         }
 
@@ -278,6 +407,229 @@ test "MS SQL: @pN placeholders + OFFSET/FETCH for limit" {
     try testing.expectEqualStrings(
         "SELECT id, handle, role, age FROM atp_accounts WHERE id = @p1 ORDER BY (SELECT NULL) OFFSET 0 ROWS FETCH NEXT 1 ROWS ONLY",
         q2.buf[0..q2.len],
+    );
+}
+
+test "whereOp emits each comparison operator (sqlite/postgres/mssql)" {
+    const cases = [_]struct { op: Op, sym: []const u8 }{
+        .{ .op = .eq, .sym = "=" },
+        .{ .op = .ne, .sym = "<>" },
+        .{ .op = .lt, .sym = "<" },
+        .{ .op = .lte, .sym = "<=" },
+        .{ .op = .gt, .sym = ">" },
+        .{ .op = .gte, .sym = ">=" },
+    };
+    inline for (cases) |c| {
+        var qs = Query(Account).init(.sqlite);
+        _ = qs.whereOp("age", c.op, .{ .int = 18 });
+        var buf: [256]u8 = undefined;
+        const want_s = std.fmt.bufPrint(&buf, "SELECT id, handle, role, age FROM atp_accounts WHERE age {s} ?", .{c.sym}) catch unreachable;
+        try testing.expectEqualStrings(want_s, qs.buf[0..qs.len]);
+
+        var qp = Query(Account).init(.postgres);
+        _ = qp.whereOp("age", c.op, .{ .int = 18 });
+        var buf2: [256]u8 = undefined;
+        const want_p = std.fmt.bufPrint(&buf2, "SELECT id, handle, role, age FROM atp_accounts WHERE age {s} $1", .{c.sym}) catch unreachable;
+        try testing.expectEqualStrings(want_p, qp.buf[0..qp.len]);
+
+        var qm = Query(Account).init(.mssql);
+        _ = qm.whereOp("age", c.op, .{ .int = 18 });
+        var buf3: [256]u8 = undefined;
+        const want_m = std.fmt.bufPrint(&buf3, "SELECT id, handle, role, age FROM atp_accounts WHERE age {s} @p1", .{c.sym}) catch unreachable;
+        try testing.expectEqualStrings(want_m, qm.buf[0..qm.len]);
+        try testing.expectEqual(@as(i64, 18), qm.args[0].int);
+    }
+}
+
+test "whereOp chains with AND and binds in order" {
+    var q = Query(Account).init(.postgres);
+    _ = q.whereOp("age", .gte, .{ .int = 18 }).whereOp("age", .lt, .{ .int = 65 });
+    try testing.expectEqualStrings(
+        "SELECT id, handle, role, age FROM atp_accounts WHERE age >= $1 AND age < $2",
+        q.buf[0..q.len],
+    );
+    try testing.expectEqual(@as(usize, 2), q.arg_count);
+    try testing.expectEqual(@as(i64, 18), q.args[0].int);
+    try testing.expectEqual(@as(i64, 65), q.args[1].int);
+}
+
+test "whereLike emits LIKE with a bound pattern (all placeholder styles)" {
+    var qs = Query(Account).init(.sqlite);
+    _ = qs.whereLike("handle", "a%");
+    try testing.expectEqualStrings(
+        "SELECT id, handle, role, age FROM atp_accounts WHERE handle LIKE ?",
+        qs.buf[0..qs.len],
+    );
+    try testing.expectEqualStrings("a%", qs.args[0].text);
+
+    var qp = Query(Account).init(.postgres);
+    _ = qp.whereLike("handle", "%bob%");
+    try testing.expectEqualStrings(
+        "SELECT id, handle, role, age FROM atp_accounts WHERE handle LIKE $1",
+        qp.buf[0..qp.len],
+    );
+
+    var qm = Query(Account).init(.mssql);
+    _ = qm.whereLike("handle", "z_");
+    try testing.expectEqualStrings(
+        "SELECT id, handle, role, age FROM atp_accounts WHERE handle LIKE @p1",
+        qm.buf[0..qm.len],
+    );
+}
+
+test "whereIn with three values binds each as a placeholder" {
+    var qs = Query(Account).init(.sqlite);
+    const vals = [_]BindValue{ .{ .text = "1" }, .{ .text = "2" }, .{ .text = "3" } };
+    _ = qs.whereIn("id", &vals);
+    try testing.expectEqualStrings(
+        "SELECT id, handle, role, age FROM atp_accounts WHERE id IN (?, ?, ?)",
+        qs.buf[0..qs.len],
+    );
+    try testing.expectEqual(@as(usize, 3), qs.arg_count);
+
+    var qp = Query(Account).init(.postgres);
+    _ = qp.whereIn("id", &vals);
+    try testing.expectEqualStrings(
+        "SELECT id, handle, role, age FROM atp_accounts WHERE id IN ($1, $2, $3)",
+        qp.buf[0..qp.len],
+    );
+
+    var qm = Query(Account).init(.mssql);
+    _ = qm.whereIn("id", &vals);
+    try testing.expectEqualStrings(
+        "SELECT id, handle, role, age FROM atp_accounts WHERE id IN (@p1, @p2, @p3)",
+        qm.buf[0..qm.len],
+    );
+}
+
+test "whereIn empty list emits the always-false 1 = 0 with no binds" {
+    var q = Query(Account).init(.postgres);
+    const empty = [_]BindValue{};
+    _ = q.whereIn("id", &empty);
+    try testing.expectEqualStrings(
+        "SELECT id, handle, role, age FROM atp_accounts WHERE 1 = 0",
+        q.buf[0..q.len],
+    );
+    try testing.expectEqual(@as(usize, 0), q.arg_count);
+
+    // Chains correctly with a following predicate (joined via AND).
+    var q2 = Query(Account).init(.sqlite);
+    _ = q2.whereIn("id", &empty).whereText("handle", "x");
+    try testing.expectEqualStrings(
+        "SELECT id, handle, role, age FROM atp_accounts WHERE 1 = 0 AND handle = ?",
+        q2.buf[0..q2.len],
+    );
+}
+
+test "whereNull / whereNotNull emit IS NULL / IS NOT NULL with no binds" {
+    var q = Query(Account).init(.sqlite);
+    _ = q.whereNull("handle").whereNotNull("age");
+    try testing.expectEqualStrings(
+        "SELECT id, handle, role, age FROM atp_accounts WHERE handle IS NULL AND age IS NOT NULL",
+        q.buf[0..q.len],
+    );
+    try testing.expectEqual(@as(usize, 0), q.arg_count);
+
+    var qp = Query(Account).init(.postgres);
+    _ = qp.whereNotNull("handle");
+    try testing.expectEqualStrings(
+        "SELECT id, handle, role, age FROM atp_accounts WHERE handle IS NOT NULL",
+        qp.buf[0..qp.len],
+    );
+}
+
+test "offset + limit combined is dialect-correct on all four dialects" {
+    // sqlite: LIMIT k OFFSET n
+    var qs = Query(Account).init(.sqlite);
+    _ = qs.orderBy("age", .asc).offset(20).limit(10);
+    try testing.expectEqualStrings(
+        "SELECT id, handle, role, age FROM atp_accounts ORDER BY age ASC LIMIT 10 OFFSET 20",
+        qs.buf[0..qs.len],
+    );
+
+    // postgres: identical LIMIT/OFFSET tail
+    var qp = Query(Account).init(.postgres);
+    _ = qp.orderBy("age", .asc).offset(20).limit(10);
+    try testing.expectEqualStrings(
+        "SELECT id, handle, role, age FROM atp_accounts ORDER BY age ASC LIMIT 10 OFFSET 20",
+        qp.buf[0..qp.len],
+    );
+
+    // mysql: identical LIMIT/OFFSET tail
+    var qy = Query(Account).init(.mysql);
+    _ = qy.orderBy("age", .asc).offset(20).limit(10);
+    try testing.expectEqualStrings(
+        "SELECT id, handle, role, age FROM atp_accounts ORDER BY age ASC LIMIT 10 OFFSET 20",
+        qy.buf[0..qy.len],
+    );
+
+    // mssql: single OFFSET n ROWS FETCH NEXT k ROWS ONLY clause
+    var qm = Query(Account).init(.mssql);
+    _ = qm.orderBy("age", .asc).offset(20).limit(10);
+    try testing.expectEqualStrings(
+        "SELECT id, handle, role, age FROM atp_accounts ORDER BY age ASC OFFSET 20 ROWS FETCH NEXT 10 ROWS ONLY",
+        qm.buf[0..qm.len],
+    );
+}
+
+test "limit without offset is unchanged across dialects" {
+    var qs = Query(Account).init(.sqlite);
+    _ = qs.limit(5);
+    try testing.expectEqualStrings(
+        "SELECT id, handle, role, age FROM atp_accounts LIMIT 5",
+        qs.buf[0..qs.len],
+    );
+
+    // mssql with no order still synthesizes ORDER BY (SELECT NULL), OFFSET 0.
+    var qm = Query(Account).init(.mssql);
+    _ = qm.limit(5);
+    try testing.expectEqualStrings(
+        "SELECT id, handle, role, age FROM atp_accounts ORDER BY (SELECT NULL) OFFSET 0 ROWS FETCH NEXT 5 ROWS ONLY",
+        qm.buf[0..qm.len],
+    );
+}
+
+test "offset without limit flushes a standalone clause at statement()" {
+    var db = mock.MockBackend.init();
+
+    // sqlite: LIMIT -1 OFFSET n
+    var qs = Query(Account).init(.sqlite);
+    _ = qs.orderBy("age", .asc).offset(7);
+    var out: [4]Account = undefined;
+    _ = try qs.all(db.backend(.sqlite), &out);
+    try testing.expectEqualStrings(
+        "SELECT id, handle, role, age FROM atp_accounts ORDER BY age ASC LIMIT -1 OFFSET 7",
+        qs.buf[0..qs.len],
+    );
+
+    // postgres: LIMIT -1 OFFSET n
+    var qp = Query(Account).init(.postgres);
+    _ = qp.offset(7);
+    var out2: [4]Account = undefined;
+    _ = try qp.all(db.backend(.postgres), &out2);
+    try testing.expectEqualStrings(
+        "SELECT id, handle, role, age FROM atp_accounts LIMIT -1 OFFSET 7",
+        qp.buf[0..qp.len],
+    );
+
+    // mysql: sentinel max-LIMIT idiom
+    var qy = Query(Account).init(.mysql);
+    _ = qy.offset(7);
+    var out3: [4]Account = undefined;
+    _ = try qy.all(db.backend(.mysql), &out3);
+    try testing.expectEqualStrings(
+        "SELECT id, handle, role, age FROM atp_accounts LIMIT 18446744073709551615 OFFSET 7",
+        qy.buf[0..qy.len],
+    );
+
+    // mssql: OFFSET n ROWS with a synthesized order
+    var qm = Query(Account).init(.mssql);
+    _ = qm.offset(7);
+    var out4: [4]Account = undefined;
+    _ = try qm.all(db.backend(.mssql), &out4);
+    try testing.expectEqualStrings(
+        "SELECT id, handle, role, age FROM atp_accounts ORDER BY (SELECT NULL) OFFSET 7 ROWS",
+        qm.buf[0..qm.len],
     );
 }
 
