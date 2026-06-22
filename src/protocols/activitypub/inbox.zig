@@ -85,7 +85,10 @@ pub const SideEffect = union(enum) {
     tombstone_object: struct { id: []const u8, former_type: []const u8 },
     update_object: struct { id: []const u8, kind: []const u8 },
     record_announce: struct { actor: []const u8, object: []const u8 },
-    record_like: struct { actor: []const u8, object: []const u8 },
+    /// FEP-c0e0: `reaction` carries the emoji shortcode when the Like
+    /// is an emoji reaction (Pleroma / Misskey `EmojiReact`); empty for
+    /// a plain Like. The drainer persists it in `ap_reactions`.
+    record_like: struct { actor: []const u8, object: []const u8, reaction: []const u8 = &.{} },
     increment_counter: struct { name: []const u8 },
     /// AP-6: reverse the side-effects of a prior Follow/Like/Announce
     /// referenced by its IRI. The drainer looks up the original
@@ -587,6 +590,9 @@ fn runLike(env: *const Envelope, eff: *SideEffectBuffer) ApError!void {
                 try eff.push(.{ .record_like = .{
                     .actor = env.activity.actor,
                     .object = env.activity.object_id,
+                    // FEP-c0e0: carry the emoji shortcode (if any) so the
+                    // drainer can persist this Like as an emoji reaction.
+                    .reaction = env.activity.reaction_content,
                 } });
                 try eff.push(.{ .store_activity = .{
                     .id = env.activity.id,
@@ -1178,6 +1184,44 @@ test "Like records like" {
         },
         else => return error.TestExpectedLike,
     }
+}
+
+test "FEP-c0e0: EmojiReact records like with reaction emoji" {
+    var rng = Rng.init(7);
+    var sc = SimClock.init(0);
+    const act = try activity.parse(
+        \\{"id":"r1","type":"EmojiReact","actor":"https://a/u","object":"https://a/p","content":"🦊"}
+    );
+    try std.testing.expect(act.activity_type == .like);
+    var env = buildEnvelope(act, false, sc.clock(), &rng);
+    var eff: SideEffectBuffer = .{};
+    try dispatch(&env, &eff);
+    var found = false;
+    for (eff.slice()) |e| switch (e) {
+        .record_like => |l| {
+            try std.testing.expectEqualStrings("https://a/u", l.actor);
+            try std.testing.expectEqualStrings("https://a/p", l.object);
+            try std.testing.expectEqualStrings("🦊", l.reaction);
+            found = true;
+        },
+        else => {},
+    };
+    try std.testing.expect(found);
+}
+
+test "FEP-c0e0: plain Like carries empty reaction" {
+    var rng = Rng.init(8);
+    var sc = SimClock.init(0);
+    const act = try activity.parse(
+        \\{"id":"l9","type":"Like","actor":"https://a/u","object":"https://a/p"}
+    );
+    var env = buildEnvelope(act, false, sc.clock(), &rng);
+    var eff: SideEffectBuffer = .{};
+    try dispatch(&env, &eff);
+    for (eff.slice()) |e| switch (e) {
+        .record_like => |l| try std.testing.expectEqual(@as(usize, 0), l.reaction.len),
+        else => {},
+    };
 }
 
 test "SideEffectBuffer overflow is rejected" {

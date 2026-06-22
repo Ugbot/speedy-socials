@@ -63,6 +63,10 @@ pub const ActivityType = enum {
         if (std.ascii.eqlIgnoreCase(s, "Reject")) return .reject;
         if (std.ascii.eqlIgnoreCase(s, "Announce")) return .announce;
         if (std.ascii.eqlIgnoreCase(s, "Like")) return .like;
+        // FEP-c0e0: an `EmojiReact` is a Like carrying an emoji in
+        // `content`; route it through the Like state machine so the
+        // reaction is recorded with its emoji.
+        if (std.ascii.eqlIgnoreCase(s, "EmojiReact")) return .like;
         if (std.ascii.eqlIgnoreCase(s, "Undo")) return .undo;
         if (std.ascii.eqlIgnoreCase(s, "Move")) return .move;
         if (std.ascii.eqlIgnoreCase(s, "Block")) return .block;

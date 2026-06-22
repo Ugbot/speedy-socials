@@ -312,6 +312,26 @@ pub const attachments_migration: Migration = .{
     .down = "DROP TABLE ap_attachments;",
 };
 
+// FEP-c0e0: emoji reactions. A `Like`/`EmojiReact` carrying a
+// `content` shortcode (e.g. `🦊` or `:blobcat:`) records the emoji
+// alongside the (actor, object) pair so reactions are stored with
+// their emoji. Idempotent on (actor, object, content).
+pub const reactions_migration: Migration = .{
+    .id = 1019,
+    .name = "activitypub:reactions",
+    .up =
+    \\CREATE TABLE IF NOT EXISTS ap_reactions (
+    \\    actor      TEXT NOT NULL,
+    \\    object_iri TEXT NOT NULL,
+    \\    content    TEXT NOT NULL,
+    \\    created_at INTEGER NOT NULL,
+    \\    PRIMARY KEY (actor, object_iri, content)
+    \\) STRICT;
+    \\CREATE INDEX IF NOT EXISTS ap_reactions_obj_idx ON ap_reactions (object_iri);
+    ,
+    .down = "DROP TABLE ap_reactions;",
+};
+
 pub const all_migrations = [_]Migration{
     users_migration,
     actor_type_migration,
@@ -331,6 +351,7 @@ pub const all_migrations = [_]Migration{
     blocks_migration,
     moves_migration,
     multikey_migration,
+    reactions_migration,
 };
 
 /// Plugin entrypoint: push every migration onto the shared schema.

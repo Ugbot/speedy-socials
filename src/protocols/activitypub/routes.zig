@@ -331,6 +331,42 @@ fn handleNodeInfoJrd(hc: *HandlerContext) anyerror!void {
     try writeJson(hc, .ok, out);
 }
 
+// FEP-67ff: machine-readable FEDERATION doc served at
+// `/.well-known/fediverse`. Advertises the instance name and a small
+// set of federation policies as a JSON-LD document so peers can
+// discover how this node federates. Instance name is the configured
+// hostname; the protocol list reflects what this node speaks
+// (ActivityPub, plus ATProto when the AT plugin is loaded).
+fn handleFediverse(hc: *HandlerContext) anyerror!void {
+    var body: [1024]u8 = undefined;
+    const out = writeFederationInfo(
+        state_mod.get().hostname(),
+        state_mod.advertiseAtproto(),
+        state_mod.isStrictHttpSig(),
+        &body,
+    ) catch return writeJson(hc, .internal, "{\"error\":\"fediverse buf\"}");
+    try writeJsonLd(hc, .ok, out);
+}
+
+/// FEP-67ff: render the FederationInfo JSON-LD document. Pure: takes
+/// instance name + policy knobs, writes into a caller buffer.
+fn writeFederationInfo(host: []const u8, atproto: bool, signed_fetch: bool, out: []u8) ![]const u8 {
+    const protocols: []const u8 = if (atproto) "\"activitypub\",\"atproto\"" else "\"activitypub\"";
+    return std.fmt.bufPrint(out,
+        "{{\"@context\":[\"https://www.w3.org/ns/activitystreams\"," ++
+        "{{\"fediverse\":\"https://w3id.org/fep/67ff#\"}}]," ++
+        "\"type\":\"FederationInfo\"," ++
+        "\"name\":\"{s}\"," ++
+        "\"protocols\":[{s}]," ++
+        "\"policies\":{{" ++
+        "\"openRegistrations\":false," ++
+        "\"manualFollowApproval\":false," ++
+        "\"federation\":\"open\"," ++
+        "\"signedFetch\":{s}}}}}",
+        .{ host, protocols, if (signed_fetch) "true" else "false" },
+    );
+}
+
 fn handleNodeInfo21(hc: *HandlerContext) anyerror!void {
     const st = state_mod.get();
     var stats: nodeinfo.Stats = .{};
@@ -396,6 +432,12 @@ fn handleUserActor(hc: *HandlerContext) anyerror!void {
     var mb_buf: [80]u8 = undefined;
     const assertion_mb = actorKeyMultibase(user.pem(), &mb_buf) orelse "";
 
+    // AP-15: load any published rotation keys and advertise each as an
+    // additional `#key-N` Multikey (FEP-d36d). Verification of these
+    // keys already works via `verifyWithExtraKey`; this advertises them.
+    var extra_store: ExtraKeyStore = .{};
+    const extra_keys = loadExtraKeys(db, user.username(), &extra_store);
+
     var body: [max_response_bytes]u8 = undefined;
     const out = actor_mod.writePerson(.{
         .hostname = st.hostname(),
@@ -409,6 +451,7 @@ fn handleUserActor(hc: *HandlerContext) anyerror!void {
         // AP-10: honour the per-user actor type (defaults to Person).
         .actor_type = actor_mod.ActorType.parse(user.actorType()) orelse .person,
         .assertion_multibase = assertion_mb,
+        .extra_keys = extra_keys,
     }, &body) catch return writeJson(hc, .internal, "{\"error\":\"actor buf\"}");
     try writeJsonLd(hc, .ok, out);
 }
@@ -640,6 +683,14 @@ fn drainSideEffects(db: *c.sqlite3, st: *state_mod.State, raw_body: []const u8, 
             .record_attachment => |a| {
                 _ = recordAttachment(db, a.object_iri, a.url, a.media_type, a.name) catch {};
             },
+            .record_like => |l| {
+                // FEP-c0e0: persist emoji reactions with their emoji.
+                // Plain Likes (no emoji) are counted/audited via
+                // store_activity; only emoji-bearing ones land here.
+                if (l.reaction.len > 0) {
+                    _ = recordReaction(db, st.clock, l.actor, l.object, l.reaction) catch {};
+                }
+            },
             else => {},
         }
     }
@@ -659,6 +710,56 @@ fn recordPollVote(db: *c.sqlite3, clock: core.clock.Clock, activity_iri: []const
     _ = c.sqlite3_step(stmt.?);
 }
 
+// AP-16: poll-vote tally. A bounded set of (option, count) pairs for a
+// Question IRI — ready for embedding each option's
+// `oneOf[].replies.totalItems` in the rendered Question object.
+pub const max_poll_options: usize = 16;
+
+pub const PollTally = struct {
+    /// Fixed-size storage for option names (no allocator).
+    name_bufs: [max_poll_options][96]u8 = undefined,
+    name_lens: [max_poll_options]usize = [_]usize{0} ** max_poll_options,
+    counts: [max_poll_options]i64 = [_]i64{0} ** max_poll_options,
+    len: usize = 0,
+
+    pub fn option(self: *const PollTally, i: usize) []const u8 {
+        return self.name_bufs[i][0..self.name_lens[i]];
+    }
+
+    /// Total votes across all options (poll `votersCount` proxy).
+    pub fn totalVotes(self: *const PollTally) i64 {
+        var sum: i64 = 0;
+        var i: usize = 0;
+        while (i < self.len) : (i += 1) sum += self.counts[i];
+        return sum;
+    }
+};
+
+/// Tally poll votes for `question_iri`, grouped by option. Returns a
+/// bounded `PollTally`. Tiger Style: capped at `max_poll_options`.
+fn tallyPollVotes(db: *c.sqlite3, question_iri: []const u8, tally: *PollTally) void {
+    var stmt: ?*c.sqlite3_stmt = null;
+    const sql = "SELECT option_name, COUNT(*) FROM ap_poll_votes WHERE question_iri = ? GROUP BY option_name ORDER BY option_name";
+    if (c.sqlite3_prepare_v2(db, sql, -1, &stmt, null) != c.SQLITE_OK) {
+        if (stmt != null) _ = c.sqlite3_finalize(stmt);
+        return;
+    }
+    defer _ = c.sqlite3_finalize(stmt);
+    _ = c.sqlite3_bind_text(stmt, 1, question_iri.ptr, @intCast(question_iri.len), c.sqliteTransientAsDestructor());
+    var guard: u32 = 0;
+    while (tally.len < max_poll_options and guard < 256) : (guard += 1) {
+        if (c.sqlite3_step(stmt.?) != c.SQLITE_ROW) break;
+        const p = c.sqlite3_column_text(stmt, 0);
+        const n: usize = @intCast(c.sqlite3_column_bytes(stmt, 0));
+        if (p == null) continue;
+        const cap = @min(n, tally.name_bufs[tally.len].len);
+        if (cap > 0) @memcpy(tally.name_bufs[tally.len][0..cap], p[0..cap]);
+        tally.name_lens[tally.len] = cap;
+        tally.counts[tally.len] = c.sqlite3_column_int64(stmt, 1);
+        tally.len += 1;
+    }
+}
+
 // AP-23: record a media attachment for an inbound object (idempotent on
 // (object_iri, url)).
 fn recordAttachment(db: *c.sqlite3, object_iri: []const u8, url: []const u8, media_type: []const u8, name: []const u8) !void {
@@ -670,6 +771,20 @@ fn recordAttachment(db: *c.sqlite3, object_iri: []const u8, url: []const u8, med
     _ = c.sqlite3_bind_text(stmt, 2, url.ptr, @intCast(url.len), c.sqliteTransientAsDestructor());
     _ = c.sqlite3_bind_text(stmt, 3, media_type.ptr, @intCast(media_type.len), c.sqliteTransientAsDestructor());
     _ = c.sqlite3_bind_text(stmt, 4, name.ptr, @intCast(name.len), c.sqliteTransientAsDestructor());
+    _ = c.sqlite3_step(stmt.?);
+}
+
+// FEP-c0e0: persist an emoji reaction (idempotent on
+// (actor, object, content)).
+fn recordReaction(db: *c.sqlite3, clock: core.clock.Clock, actor: []const u8, object_iri: []const u8, content: []const u8) !void {
+    var stmt: ?*c.sqlite3_stmt = null;
+    const sql = "INSERT OR IGNORE INTO ap_reactions (actor, object_iri, content, created_at) VALUES (?,?,?,?)";
+    if (c.sqlite3_prepare_v2(db, sql, -1, &stmt, null) != c.SQLITE_OK) return;
+    defer _ = c.sqlite3_finalize(stmt);
+    _ = c.sqlite3_bind_text(stmt, 1, actor.ptr, @intCast(actor.len), c.sqliteTransientAsDestructor());
+    _ = c.sqlite3_bind_text(stmt, 2, object_iri.ptr, @intCast(object_iri.len), c.sqliteTransientAsDestructor());
+    _ = c.sqlite3_bind_text(stmt, 3, content.ptr, @intCast(content.len), c.sqliteTransientAsDestructor());
+    _ = c.sqlite3_bind_int64(stmt, 4, clock.wallUnix());
     _ = c.sqlite3_step(stmt.?);
 }
 
@@ -833,13 +948,15 @@ fn collectionAdd(db: *c.sqlite3, clock: core.clock.Clock, collection: []const u8
 
 // AP-14: count Like activities authored by the actor. Used by
 // `/users/:u/liked` (FEP-c648).
-fn countLikedByActor(db: *c.sqlite3, actor_iri: []const u8) i64 {
-    // `ap_activities` stores `type` as a tag string; we recorded
-    // `'like'` via `@tagName(.like)`. Filter on that + the actor IRI.
-    _ = actor_iri; // current schema doesn't index activities by actor IRI directly
+fn countLikedByActor(db: *c.sqlite3, actor_id: i64) i64 {
+    // FEP-c648: the `liked` collection is scoped to the owning actor.
+    // `ap_activities` stores `type` as a tag string (`'like'` via
+    // `@tagName(.like)`) and the owning actor in `actor_id`. Filter on
+    // both so one actor's likes don't leak into another's collection.
     var stmt: ?*c.sqlite3_stmt = null;
-    if (c.sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM ap_activities WHERE type = 'like'", -1, &stmt, null) != c.SQLITE_OK) return 0;
+    if (c.sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM ap_activities WHERE type = 'like' AND actor_id = ?", -1, &stmt, null) != c.SQLITE_OK) return 0;
     defer _ = c.sqlite3_finalize(stmt);
+    _ = c.sqlite3_bind_int64(stmt, 1, actor_id);
     if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return 0;
     return c.sqlite3_column_int64(stmt, 0);
 }
@@ -1150,13 +1267,18 @@ fn preparePageStmt(
             _ = c.sqlite3_bind_int64(stmt, 3, offset);
         },
         .liked => {
-            // Mirrors `countLikedByActor`'s current schema limitation
-            // (Like activities aren't indexed by actor IRI yet).
-            const sql = "SELECT object_id FROM ap_activities WHERE type = 'like' AND object_id IS NOT NULL ORDER BY published DESC, id DESC LIMIT ? OFFSET ?";
+            // FEP-c648: scope the liked collection to the owning actor
+            // (`actor_id`) so likes are not shared across actors.
+            const sql = "SELECT object_id FROM ap_activities WHERE type = 'like' AND actor_id = ? AND object_id IS NOT NULL ORDER BY published DESC, id DESC LIMIT ? OFFSET ?";
             if (c.sqlite3_prepare_v2(db, sql, -1, &stmt, null) != c.SQLITE_OK) return null;
-            _ = c.sqlite3_bind_int64(stmt, 1, limit);
-            _ = c.sqlite3_bind_int64(stmt, 2, offset);
+            _ = c.sqlite3_bind_int64(stmt, 1, actor_id);
+            _ = c.sqlite3_bind_int64(stmt, 2, limit);
+            _ = c.sqlite3_bind_int64(stmt, 3, offset);
         },
+        // The per-object replies collection has its own handler
+        // (`handleReplies` → `prepareRepliesStmt`); it never reaches
+        // the per-actor `renderCollection` path.
+        .replies => return null,
     }
     return stmt;
 }
@@ -1177,6 +1299,44 @@ fn actorKeyMultibase(pem: []const u8, out: []u8) ?[]const u8 {
     out[0] = 'z';
     const n = core.crypto.multibase.base58btcEncode(&mc, out[1..]) catch return null;
     return out[0 .. 1 + n];
+}
+
+/// AP-15: bounded storage for an actor's published rotation keys
+/// (FEP-d36d). PEMs are converted to `z6Mk…` multibase and parked in
+/// fixed buffers so the actor doc can advertise each as a `#key-N`
+/// Multikey without an allocator. Tiger Style: capped at
+/// `actor_mod.max_extra_keys`.
+const ExtraKeyStore = struct {
+    mb_bufs: [actor_mod.max_extra_keys][80]u8 = undefined,
+    keys: [actor_mod.max_extra_keys]actor_mod.ExtraKey = undefined,
+    len: usize = 0,
+};
+
+/// Query `ap_actor_extra_keys` for `username`, convert each Ed25519
+/// public PEM to multibase, and return a bounded slice of
+/// `actor_mod.ExtraKey`. Non-Ed25519 / unparseable rows are skipped.
+fn loadExtraKeys(db: *c.sqlite3, username: []const u8, store: *ExtraKeyStore) []const actor_mod.ExtraKey {
+    var stmt: ?*c.sqlite3_stmt = null;
+    const sql = "SELECT public_pem FROM ap_actor_extra_keys WHERE username = ? ORDER BY key_id";
+    if (c.sqlite3_prepare_v2(db, sql, -1, &stmt, null) != c.SQLITE_OK) {
+        if (stmt != null) _ = c.sqlite3_finalize(stmt);
+        return store.keys[0..0];
+    }
+    defer _ = c.sqlite3_finalize(stmt);
+    _ = c.sqlite3_bind_text(stmt, 1, username.ptr, @intCast(username.len), c.sqliteTransientAsDestructor());
+
+    var guard: u32 = 0;
+    while (store.len < actor_mod.max_extra_keys and guard < 64) : (guard += 1) {
+        if (c.sqlite3_step(stmt.?) != c.SQLITE_ROW) break;
+        const p = c.sqlite3_column_text(stmt, 0);
+        const n: usize = @intCast(c.sqlite3_column_bytes(stmt, 0));
+        if (p == null or n == 0) continue;
+        const pem = p[0..n];
+        const mb = actorKeyMultibase(pem, &store.mb_bufs[store.len]) orelse continue;
+        store.keys[store.len] = .{ .multibase = mb };
+        store.len += 1;
+    }
+    return store.keys[0..store.len];
 }
 
 fn renderCollection(hc: *HandlerContext, kind: collections.CollectionKind) !void {
@@ -1224,8 +1384,11 @@ fn renderCollection(hc: *HandlerContext, kind: collections.CollectionKind) !void
         .followers => @intCast(countFollows(db, "followee", actor_uri)),
         .following => @intCast(countFollows(db, "follower", actor_uri)),
         .featured => @intCast(countCollectionItems(db, featured_uri)),
-        // AP-14: count Like activities issued by this actor.
-        .liked => @intCast(countLikedByActor(db, actor_uri)),
+        // AP-14 / FEP-c648: count Like activities issued by this actor,
+        // scoped to its `actor_id`.
+        .liked => @intCast(countLikedByActor(db, user.id)),
+        // Replies use the dedicated `handleReplies` path.
+        .replies => 0,
     };
 
     var body: [max_response_bytes]u8 = undefined;
@@ -1255,9 +1418,36 @@ fn handleUserStatus(hc: *HandlerContext) anyerror!void {
     const uri = std.fmt.bufPrint(&uri_buf, "https://{s}/users/{s}/statuses/{s}", .{ st.hostname(), username, id }) catch
         return writeJson(hc, .internal, "{\"error\":\"uri buf\"}");
     if (isTombstoned(db, uri)) return writeTombstone(hc, db, uri);
+    // If we have a Create activity that produced this object, serve a
+    // minimal AS2 object stub carrying the `replies` collection link
+    // (the Mastodon API serves the full object; here we only need to
+    // advertise the per-object replies collection). Otherwise 404.
+    if (objectExists(db, uri)) {
+        var body: [640]u8 = undefined;
+        const out = std.fmt.bufPrint(&body,
+            "{{\"@context\":\"https://www.w3.org/ns/activitystreams\"," ++
+            "\"id\":\"{s}\",\"type\":\"Note\"," ++
+            "\"replies\":\"{s}/replies\"}}",
+            .{ uri, uri },
+        ) catch return writeJson(hc, .internal, "{\"error\":\"obj buf\"}");
+        return writeJsonLd(hc, .ok, out);
+    }
     // Today we don't render local statuses via AP — the Mastodon API
     // handles object responses. Surface a 404 here rather than 410.
     return writeJson(hc, .not_found, "{\"error\":\"unknown\"}");
+}
+
+// True when some Create activity recorded `object_iri` as its object —
+// i.e. the object IRI is locally known and we can advertise its replies.
+fn objectExists(db: *c.sqlite3, object_iri: []const u8) bool {
+    var stmt: ?*c.sqlite3_stmt = null;
+    if (c.sqlite3_prepare_v2(db, "SELECT 1 FROM ap_activities WHERE type = 'create' AND object_id = ? LIMIT 1", -1, &stmt, null) != c.SQLITE_OK) {
+        if (stmt != null) _ = c.sqlite3_finalize(stmt);
+        return false;
+    }
+    defer _ = c.sqlite3_finalize(stmt);
+    _ = c.sqlite3_bind_text(stmt, 1, object_iri.ptr, @intCast(object_iri.len), c.sqliteTransientAsDestructor());
+    return c.sqlite3_step(stmt) == c.SQLITE_ROW;
 }
 
 fn handleUserActivity(hc: *HandlerContext) anyerror!void {
@@ -1272,9 +1462,87 @@ fn handleUserActivity(hc: *HandlerContext) anyerror!void {
     return writeJson(hc, .not_found, "{\"error\":\"unknown\"}");
 }
 
+// Per-object replies collection. Serves `OrderedCollection` /
+// `OrderedCollectionPage` of Create activities whose `object_id`
+// targets the status's object IRI (`inReplyTo` matching is recorded
+// by the inbox via the `object_id` column). The collection id URL is
+// `https://{host}/users/{u}/statuses/{id}/replies`.
+fn handleReplies(hc: *HandlerContext) anyerror!void {
+    const st = state_mod.get();
+    const db = st.dbHandle() orelse return writeJson(hc, .service_unavailable, "{\"error\":\"db not ready\"}");
+    const username = hc.params.get("u") orelse return writeJson(hc, .bad_request, "{\"error\":\"missing user\"}");
+    const id = hc.params.get("id") orelse return writeJson(hc, .bad_request, "{\"error\":\"missing id\"}");
+    _ = loadUser(db, username) orelse return writeJson(hc, .not_found, "{\"error\":\"unknown user\"}");
+
+    // The status's object IRI — what a reply's `inReplyTo` points at,
+    // captured as the Create activity's `object_id`.
+    var obj_buf: [320]u8 = undefined;
+    const object_iri = std.fmt.bufPrint(&obj_buf, "https://{s}/users/{s}/statuses/{s}", .{ st.hostname(), username, id }) catch
+        return writeJson(hc, .internal, "{\"error\":\"uri buf\"}");
+
+    // The replies collection's own path (host-relative, no leading slash).
+    var path_buf: [320]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buf, "users/{s}/statuses/{s}/replies", .{ username, id }) catch
+        return writeJson(hc, .internal, "{\"error\":\"path buf\"}");
+
+    if (queryParam(hc.request.pathAndQuery().query, "page")) |page_str| {
+        const parsed = std.fmt.parseInt(u32, page_str, 10) catch 1;
+        const page: u32 = if (parsed == 0) 1 else parsed;
+        const offset: i64 = @intCast((page - 1) * collections.max_page_items);
+        const limit: i64 = collections.max_page_items + 1;
+        const stmt = prepareRepliesStmt(db, object_iri, limit, offset) orelse
+            return writeJson(hc, .internal, "{\"error\":\"page query\"}");
+        defer _ = c.sqlite3_finalize(stmt);
+        var iter = PageIter{ .stmt = stmt };
+        var page_body: [max_response_bytes]u8 = undefined;
+        const page_out = collections.writePage(.{
+            .hostname = st.hostname(),
+            .actor_username = username,
+            .kind = .replies,
+            .total_items = 0,
+            .path = path,
+        }, page, @ptrCast(&iter), PageIter.next, &page_body) catch return writeJson(hc, .internal, "{\"error\":\"collection buf\"}");
+        return writeJsonLd(hc, .ok, page_out);
+    }
+
+    const total: u64 = @intCast(countReplies(db, object_iri));
+    var body: [max_response_bytes]u8 = undefined;
+    const out = collections.writeIndex(.{
+        .hostname = st.hostname(),
+        .actor_username = username,
+        .kind = .replies,
+        .total_items = total,
+        .path = path,
+    }, &body) catch return writeJson(hc, .internal, "{\"error\":\"collection buf\"}");
+    try writeJsonLd(hc, .ok, out);
+}
+
+fn prepareRepliesStmt(db: *c.sqlite3, object_iri: []const u8, limit: i64, offset: i64) ?*c.sqlite3_stmt {
+    var stmt: ?*c.sqlite3_stmt = null;
+    const sql = "SELECT ap_id FROM ap_activities WHERE type = 'create' AND object_id = ? ORDER BY published DESC, id DESC LIMIT ? OFFSET ?";
+    if (c.sqlite3_prepare_v2(db, sql, -1, &stmt, null) != c.SQLITE_OK) {
+        if (stmt != null) _ = c.sqlite3_finalize(stmt);
+        return null;
+    }
+    _ = c.sqlite3_bind_text(stmt, 1, object_iri.ptr, @intCast(object_iri.len), c.sqliteTransientAsDestructor());
+    _ = c.sqlite3_bind_int64(stmt, 2, limit);
+    _ = c.sqlite3_bind_int64(stmt, 3, offset);
+    return stmt;
+}
+
+fn countReplies(db: *c.sqlite3, object_iri: []const u8) i64 {
+    var stmt: ?*c.sqlite3_stmt = null;
+    if (c.sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM ap_activities WHERE type = 'create' AND object_id = ?", -1, &stmt, null) != c.SQLITE_OK) return 0;
+    defer _ = c.sqlite3_finalize(stmt);
+    _ = c.sqlite3_bind_text(stmt, 1, object_iri.ptr, @intCast(object_iri.len), c.sqliteTransientAsDestructor());
+    if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return 0;
+    return c.sqlite3_column_int64(stmt, 0);
+}
+
 pub fn register(router: *Router, plugin_index: u16) !void {
     try router.register(.get, "/.well-known/webfinger", handleWebFinger, plugin_index);
     try router.register(.get, "/.well-known/nodeinfo", handleNodeInfoJrd, plugin_index);
+    try router.register(.get, "/.well-known/fediverse", handleFediverse, plugin_index); // FEP-67ff
     try router.register(.get, "/nodeinfo/2.1", handleNodeInfo21, plugin_index);
     try router.register(.get, "/users/:u", handleUserActor, plugin_index);
     try router.register(.post, "/users/:u/inbox", handleUserInbox, plugin_index);
@@ -1284,6 +1552,7 @@ pub fn register(router: *Router, plugin_index: u16) !void {
     try router.register(.get, "/users/:u/following", handleFollowing, plugin_index);
     try router.register(.get, "/users/:u/collections/featured", handleFeatured, plugin_index);
     try router.register(.get, "/users/:u/liked", handleLiked, plugin_index); // AP-14
+    try router.register(.get, "/users/:u/statuses/:id/replies", handleReplies, plugin_index); // per-object replies
     try router.register(.get, "/users/:u/statuses/:id", handleUserStatus, plugin_index); // AP-30
     try router.register(.get, "/users/:u/statuses/:id/activity", handleUserActivity, plugin_index); // AP-30
     try router.register(.post, "/inbox", handleSharedInbox, plugin_index);
@@ -1318,8 +1587,9 @@ test "getQueryParam extracts named value" {
 test "register binds the expected route count" {
     var r = Router.init();
     try register(&r, 0);
-    // 10 base + AP-30 (×2 status/activity) + AP-14 (liked) + AP-1 outbox POST.
-    try testing.expectEqual(@as(u32, 14), r.count);
+    // 10 base + AP-30 (×2 status/activity) + AP-14 (liked) + AP-1 outbox POST
+    // + per-object replies + FEP-67ff fediverse.
+    try testing.expectEqual(@as(u32, 16), r.count);
 }
 
 test "loadUser returns null on missing user" {
@@ -1592,4 +1862,263 @@ test "AP-15: verifyWithExtraKey accepts a signature from a published rotation ke
     var p2 = p;
     p2.key_id = "other";
     try testing.expect(!verifyWithExtraKey(db, &p2, &req));
+}
+
+test "FEP-c648: countLikedByActor scopes by actor_id" {
+    const sqlite_mod = core.storage.sqlite;
+    const db = try sqlite_mod.openWriter(":memory:");
+    defer sqlite_mod.closeDb(db);
+    try @import("schema.zig").applyAllForTests(db);
+
+    // Randomize how many likes each of two actors authored.
+    var prng = std.Random.DefaultPrng.init(0x1234);
+    const rnd = prng.random();
+    const alice_id: i64 = 1;
+    const bob_id: i64 = 2;
+    const n_alice: u32 = 1 + rnd.uintLessThan(u32, 12);
+    const n_bob: u32 = 1 + rnd.uintLessThan(u32, 12);
+
+    var ins: ?*c.sqlite3_stmt = null;
+    try testing.expect(c.sqlite3_prepare_v2(db,
+        "INSERT INTO ap_activities(ap_id,actor_id,type,object_id,published,raw) VALUES (?,?,'like',?,0,X'7B7D')",
+        -1, &ins, null) == c.SQLITE_OK);
+    defer _ = c.sqlite3_finalize(ins);
+
+    var i: u32 = 0;
+    var keybuf: [64]u8 = undefined;
+    var objbuf: [64]u8 = undefined;
+    while (i < n_alice) : (i += 1) {
+        const ap_id = try std.fmt.bufPrint(&keybuf, "https://h/a/like/{d}", .{i});
+        const obj = try std.fmt.bufPrint(&objbuf, "https://peer/p/{d}", .{i});
+        _ = c.sqlite3_reset(ins);
+        _ = c.sqlite3_clear_bindings(ins);
+        _ = c.sqlite3_bind_text(ins, 1, ap_id.ptr, @intCast(ap_id.len), c.sqliteTransientAsDestructor());
+        _ = c.sqlite3_bind_int64(ins, 2, alice_id);
+        _ = c.sqlite3_bind_text(ins, 3, obj.ptr, @intCast(obj.len), c.sqliteTransientAsDestructor());
+        try testing.expect(c.sqlite3_step(ins.?) == c.SQLITE_DONE);
+    }
+    i = 0;
+    while (i < n_bob) : (i += 1) {
+        const ap_id = try std.fmt.bufPrint(&keybuf, "https://h/b/like/{d}", .{i});
+        const obj = try std.fmt.bufPrint(&objbuf, "https://peer/q/{d}", .{i});
+        _ = c.sqlite3_reset(ins);
+        _ = c.sqlite3_clear_bindings(ins);
+        _ = c.sqlite3_bind_text(ins, 1, ap_id.ptr, @intCast(ap_id.len), c.sqliteTransientAsDestructor());
+        _ = c.sqlite3_bind_int64(ins, 2, bob_id);
+        _ = c.sqlite3_bind_text(ins, 3, obj.ptr, @intCast(obj.len), c.sqliteTransientAsDestructor());
+        try testing.expect(c.sqlite3_step(ins.?) == c.SQLITE_DONE);
+    }
+
+    try testing.expectEqual(@as(i64, n_alice), countLikedByActor(db, alice_id));
+    try testing.expectEqual(@as(i64, n_bob), countLikedByActor(db, bob_id));
+    // An actor with no likes gets zero.
+    try testing.expectEqual(@as(i64, 0), countLikedByActor(db, 99));
+
+    // The page query is also actor-scoped: alice's page yields only her objects.
+    const stmt = preparePageStmt(db, .liked, alice_id, "", "", 100, 0).?;
+    defer _ = c.sqlite3_finalize(stmt);
+    var iter = PageIter{ .stmt = stmt };
+    var buf: [max_response_bytes]u8 = undefined;
+    const out = try collections.writePage(.{
+        .hostname = "h", .actor_username = "alice", .kind = .liked, .total_items = 0,
+    }, 1, @ptrCast(&iter), PageIter.next, &buf);
+    try testing.expect(std.mem.indexOf(u8, out, "https://peer/p/0") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "https://peer/q/0") == null);
+}
+
+test "per-object replies: countReplies + page query filter by object_id" {
+    const sqlite_mod = core.storage.sqlite;
+    const db = try sqlite_mod.openWriter(":memory:");
+    defer sqlite_mod.closeDb(db);
+    try @import("schema.zig").applyAllForTests(db);
+
+    const target = "https://h/users/alice/statuses/42";
+    const other = "https://h/users/alice/statuses/99";
+
+    var prng = std.Random.DefaultPrng.init(0x77);
+    const rnd = prng.random();
+    const n_replies: u32 = 1 + rnd.uintLessThan(u32, 10);
+
+    var ins: ?*c.sqlite3_stmt = null;
+    try testing.expect(c.sqlite3_prepare_v2(db,
+        "INSERT INTO ap_activities(ap_id,actor_id,type,object_id,published,raw) VALUES (?,0,'create',?,?,X'7B7D')",
+        -1, &ins, null) == c.SQLITE_OK);
+    defer _ = c.sqlite3_finalize(ins);
+
+    var i: u32 = 0;
+    var keybuf: [64]u8 = undefined;
+    while (i < n_replies) : (i += 1) {
+        const ap_id = try std.fmt.bufPrint(&keybuf, "https://peer/reply/{d}", .{i});
+        _ = c.sqlite3_reset(ins);
+        _ = c.sqlite3_clear_bindings(ins);
+        _ = c.sqlite3_bind_text(ins, 1, ap_id.ptr, @intCast(ap_id.len), c.sqliteTransientAsDestructor());
+        _ = c.sqlite3_bind_text(ins, 2, target.ptr, @intCast(target.len), c.sqliteTransientAsDestructor());
+        _ = c.sqlite3_bind_int64(ins, 3, @intCast(i));
+        try testing.expect(c.sqlite3_step(ins.?) == c.SQLITE_DONE);
+    }
+    // A reply to a different status must not leak in.
+    {
+        _ = c.sqlite3_reset(ins);
+        _ = c.sqlite3_clear_bindings(ins);
+        _ = c.sqlite3_bind_text(ins, 1, "https://peer/reply/other", 24, c.sqliteTransientAsDestructor());
+        _ = c.sqlite3_bind_text(ins, 2, other.ptr, @intCast(other.len), c.sqliteTransientAsDestructor());
+        _ = c.sqlite3_bind_int64(ins, 3, 0);
+        try testing.expect(c.sqlite3_step(ins.?) == c.SQLITE_DONE);
+    }
+
+    try testing.expectEqual(@as(i64, n_replies), countReplies(db, target));
+    try testing.expectEqual(@as(i64, 1), countReplies(db, other));
+
+    const stmt = prepareRepliesStmt(db, target, 100, 0).?;
+    defer _ = c.sqlite3_finalize(stmt);
+    var iter = PageIter{ .stmt = stmt };
+    var buf: [max_response_bytes]u8 = undefined;
+    const out = try collections.writePage(.{
+        .hostname = "h", .actor_username = "alice", .kind = .replies, .total_items = 0,
+        .path = "users/alice/statuses/42/replies",
+    }, 1, @ptrCast(&iter), PageIter.next, &buf);
+    try testing.expect(std.mem.indexOf(u8, out, "https://peer/reply/0") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "https://peer/reply/other") == null);
+    try testing.expect(std.mem.indexOf(u8, out, "users/alice/statuses/42/replies") != null);
+}
+
+test "AP-16: tallyPollVotes groups by option_name" {
+    const sqlite_mod = core.storage.sqlite;
+    const db = try sqlite_mod.openWriter(":memory:");
+    defer sqlite_mod.closeDb(db);
+    try @import("schema.zig").applyAllForTests(db);
+
+    var sc = core.clock.SimClock.init(0);
+    const clock = sc.clock();
+    const q = "https://h/users/alice/statuses/poll1";
+
+    // Randomized vote distribution across two options.
+    var prng = std.Random.DefaultPrng.init(0xABCD);
+    const rnd = prng.random();
+    const a_votes: u32 = 1 + rnd.uintLessThan(u32, 20);
+    const b_votes: u32 = 1 + rnd.uintLessThan(u32, 20);
+
+    var i: u32 = 0;
+    var abuf: [64]u8 = undefined;
+    var vbuf: [64]u8 = undefined;
+    while (i < a_votes) : (i += 1) {
+        const ai = try std.fmt.bufPrint(&abuf, "https://h/act/a{d}", .{i});
+        const voter = try std.fmt.bufPrint(&vbuf, "https://peer/voterA{d}", .{i});
+        try recordPollVote(db, clock, ai, q, voter, "Apple");
+    }
+    i = 0;
+    while (i < b_votes) : (i += 1) {
+        const ai = try std.fmt.bufPrint(&abuf, "https://h/act/b{d}", .{i});
+        const voter = try std.fmt.bufPrint(&vbuf, "https://peer/voterB{d}", .{i});
+        try recordPollVote(db, clock, ai, q, voter, "Banana");
+    }
+
+    var tally: PollTally = .{};
+    tallyPollVotes(db, q, &tally);
+    try testing.expectEqual(@as(usize, 2), tally.len);
+    // ORDER BY option_name → Apple first, then Banana.
+    try testing.expectEqualStrings("Apple", tally.option(0));
+    try testing.expectEqual(@as(i64, a_votes), tally.counts[0]);
+    try testing.expectEqualStrings("Banana", tally.option(1));
+    try testing.expectEqual(@as(i64, b_votes), tally.counts[1]);
+    try testing.expectEqual(@as(i64, a_votes + b_votes), tally.totalVotes());
+}
+
+test "FEP-c0e0: recordReaction persists the emoji" {
+    const sqlite_mod = core.storage.sqlite;
+    const db = try sqlite_mod.openWriter(":memory:");
+    defer sqlite_mod.closeDb(db);
+    try @import("schema.zig").applyAllForTests(db);
+
+    var sc = core.clock.SimClock.init(0);
+    const clock = sc.clock();
+
+    // Drain a record_like effect carrying an emoji and verify the row.
+    const effects = [_]inbox.SideEffect{
+        .{ .record_like = .{ .actor = "https://a/u", .object = "https://a/p", .reaction = "🦊" } },
+        // A plain like (no emoji) must NOT create a reaction row.
+        .{ .record_like = .{ .actor = "https://a/v", .object = "https://a/p", .reaction = "" } },
+    };
+    var st = state_mod.State{};
+    st.clock = clock;
+    try drainSideEffects(db, &st, "{}", effects[0..]);
+
+    var stmt: ?*c.sqlite3_stmt = null;
+    _ = c.sqlite3_prepare_v2(db, "SELECT actor, content FROM ap_reactions", -1, &stmt, null);
+    defer _ = c.sqlite3_finalize(stmt);
+    try testing.expect(c.sqlite3_step(stmt) == c.SQLITE_ROW);
+    const ap = c.sqlite3_column_text(stmt, 0);
+    const al: usize = @intCast(c.sqlite3_column_bytes(stmt, 0));
+    try testing.expectEqualStrings("https://a/u", ap[0..al]);
+    const ep = c.sqlite3_column_text(stmt, 1);
+    const el: usize = @intCast(c.sqlite3_column_bytes(stmt, 1));
+    try testing.expectEqualStrings("🦊", ep[0..el]);
+    // Exactly one row (the empty-reaction like was skipped).
+    try testing.expect(c.sqlite3_step(stmt) == c.SQLITE_DONE);
+}
+
+test "AP-15: loadExtraKeys converts published PEMs to multibase #key-N entries" {
+    const sqlite_mod = core.storage.sqlite;
+    const db = try sqlite_mod.openWriter(":memory:");
+    defer sqlite_mod.closeDb(db);
+    try @import("schema.zig").applyAllForTests(db);
+
+    // Publish two Ed25519 rotation keys for alice.
+    var ins: ?*c.sqlite3_stmt = null;
+    try testing.expect(c.sqlite3_prepare_v2(db,
+        "INSERT INTO ap_actor_extra_keys(username, key_id, key_type, public_pem, created_at) VALUES ('alice',?,'ed25519',?,0)",
+        -1, &ins, null) == c.SQLITE_OK);
+    defer _ = c.sqlite3_finalize(ins);
+
+    var n: u8 = 1;
+    while (n <= 2) : (n += 1) {
+        const kid = try keys.KeyId.fromSlice("kid");
+        const pair = try keys.generateEd25519FromSeed(kid, keys.testSeed(n));
+        var pem_buf: [256]u8 = undefined;
+        const pem_len = try keys.writeEd25519PublicPem(pair.public.ed25519Bytes(), &pem_buf);
+        var idbuf: [16]u8 = undefined;
+        const key_id = try std.fmt.bufPrint(&idbuf, "rot-{d}", .{n});
+        _ = c.sqlite3_reset(ins);
+        _ = c.sqlite3_clear_bindings(ins);
+        _ = c.sqlite3_bind_text(ins, 1, key_id.ptr, @intCast(key_id.len), c.sqliteTransientAsDestructor());
+        _ = c.sqlite3_bind_text(ins, 2, pem_buf[0..pem_len].ptr, @intCast(pem_len), c.sqliteTransientAsDestructor());
+        try testing.expect(c.sqlite3_step(ins.?) == c.SQLITE_DONE);
+    }
+
+    var store: ExtraKeyStore = .{};
+    const extras = loadExtraKeys(db, "alice", &store);
+    try testing.expectEqual(@as(usize, 2), extras.len);
+    for (extras) |e| try testing.expect(e.multibase.len > 1 and e.multibase[0] == 'z');
+
+    // And the actor doc advertises them under #key-1 / #key-2.
+    var body: [max_response_bytes]u8 = undefined;
+    const out = try actor_mod.writePerson(.{
+        .hostname = "h", .username = "alice", .public_key_pem = "", .extra_keys = extras,
+    }, &body);
+    try testing.expect(std.mem.indexOf(u8, out, "#key-1") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "#key-2") != null);
+}
+
+test "FEP-67ff: writeFederationInfo body shape" {
+    var body: [1024]u8 = undefined;
+
+    // AP-only, soft signatures.
+    {
+        const out = try writeFederationInfo("speedy.example", false, false, &body);
+        try testing.expect(std.mem.indexOf(u8, out, "\"type\":\"FederationInfo\"") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "\"name\":\"speedy.example\"") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "fep/67ff") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "\"protocols\":[\"activitypub\"]") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "\"signedFetch\":false") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "atproto") == null);
+    }
+    // ATProto advertised + strict signed fetch.
+    {
+        const out = try writeFederationInfo("dual.example", true, true, &body);
+        try testing.expect(std.mem.indexOf(u8, out, "\"atproto\"") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "\"signedFetch\":true") != null);
+    }
+    // Tiny buffer fails cleanly.
+    var tiny: [8]u8 = undefined;
+    try testing.expectError(error.NoSpaceLeft, writeFederationInfo("h", false, false, &tiny));
 }

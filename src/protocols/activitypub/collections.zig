@@ -26,6 +26,10 @@ pub const CollectionKind = enum {
     /// AP-14: collection of Like activities the actor produced
     /// (FEP-c648).
     liked,
+    /// Per-object reply collection — `/users/{u}/statuses/{id}/replies`.
+    /// Its path segment is supplied via `Config.path` because it embeds
+    /// the status id, unlike the fixed per-actor collections.
+    replies,
 
     pub fn collectionId(self: CollectionKind) []const u8 {
         return switch (self) {
@@ -34,6 +38,7 @@ pub const CollectionKind = enum {
             .following => "following",
             .featured => "collections/featured",
             .liked => "liked",
+            .replies => "replies",
         };
     }
 };
@@ -53,6 +58,20 @@ pub const Config = struct {
     /// Total item count for the `totalItems` field (storage knows the
     /// count; we publish it).
     total_items: u64,
+    /// Optional path segment override (relative to the host, no leading
+    /// slash). When empty the URL is `/users/{username}/{collectionId}`.
+    /// Used by the per-object `replies` collection whose path embeds a
+    /// status id (`users/{u}/statuses/{id}/replies`).
+    path: []const u8 = "",
+
+    /// Write the collection's host-relative path (without leading slash).
+    fn writePath(self: Config, w: *W) WriteError!void {
+        if (self.path.len > 0) {
+            try w.writeAll(self.path);
+        } else {
+            try w.print("users/{s}/{s}", .{ self.actor_username, self.kind.collectionId() });
+        }
+    }
 };
 
 pub const WriteError = error{ BufferTooSmall, IteratorTooLarge };
@@ -83,12 +102,15 @@ pub fn writeIndex(cfg: Config, out: []u8) WriteError![]const u8 {
     var w = W{ .buf = out };
     try w.writeAll("{\"@context\":\"https://www.w3.org/ns/activitystreams\",\"id\":\"https://");
     try w.writeAll(cfg.hostname);
-    try w.print("/users/{s}/{s}", .{ cfg.actor_username, cfg.kind.collectionId() });
+    try w.writeAll("/");
+    try cfg.writePath(&w);
     try w.writeAll("\",\"type\":\"OrderedCollection\",\"totalItems\":");
     try w.print("{d}", .{cfg.total_items});
     try w.writeAll(",\"first\":\"https://");
     try w.writeAll(cfg.hostname);
-    try w.print("/users/{s}/{s}?page=1", .{ cfg.actor_username, cfg.kind.collectionId() });
+    try w.writeAll("/");
+    try cfg.writePath(&w);
+    try w.writeAll("?page=1");
     try w.writeAll("\"}");
     return w.slice();
 }
@@ -110,10 +132,13 @@ pub fn writePage(
     var w = W{ .buf = out };
     try w.writeAll("{\"@context\":\"https://www.w3.org/ns/activitystreams\",\"id\":\"https://");
     try w.writeAll(cfg.hostname);
-    try w.print("/users/{s}/{s}?page={d}", .{ cfg.actor_username, cfg.kind.collectionId(), page_n });
+    try w.writeAll("/");
+    try cfg.writePath(&w);
+    try w.print("?page={d}", .{page_n});
     try w.writeAll("\",\"type\":\"OrderedCollectionPage\",\"partOf\":\"https://");
     try w.writeAll(cfg.hostname);
-    try w.print("/users/{s}/{s}", .{ cfg.actor_username, cfg.kind.collectionId() });
+    try w.writeAll("/");
+    try cfg.writePath(&w);
     try w.writeAll("\",\"orderedItems\":[");
 
     var scratch: [1024]u8 = undefined;
@@ -134,13 +159,17 @@ pub fn writePage(
     if (has_more) {
         try w.writeAll(",\"next\":\"https://");
         try w.writeAll(cfg.hostname);
-        try w.print("/users/{s}/{s}?page={d}", .{ cfg.actor_username, cfg.kind.collectionId(), page_n + 1 });
+        try w.writeAll("/");
+        try cfg.writePath(&w);
+        try w.print("?page={d}", .{page_n + 1});
         try w.writeAll("\"");
     }
     if (page_n > 1) {
         try w.writeAll(",\"prev\":\"https://");
         try w.writeAll(cfg.hostname);
-        try w.print("/users/{s}/{s}?page={d}", .{ cfg.actor_username, cfg.kind.collectionId(), page_n - 1 });
+        try w.writeAll("/");
+        try cfg.writePath(&w);
+        try w.print("?page={d}", .{page_n - 1});
         try w.writeAll("\"");
     }
 
@@ -263,6 +292,44 @@ test "kind URL paths cover all four collections" {
     try std.testing.expectEqualStrings("followers", CollectionKind.followers.collectionId());
     try std.testing.expectEqualStrings("following", CollectionKind.following.collectionId());
     try std.testing.expectEqualStrings("collections/featured", CollectionKind.featured.collectionId());
+}
+
+test "replies collection uses the per-object path override" {
+    // Randomize the status id so the URL is built from the path, not a
+    // hardcoded happy path.
+    var prng = std.Random.DefaultPrng.init(0xBEEF);
+    const id = prng.random().int(u32);
+    var path_buf: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "users/bob/statuses/{d}/replies", .{id});
+
+    var buf: [1024]u8 = undefined;
+    const out = try writeIndex(.{
+        .hostname = "example.com",
+        .actor_username = "bob",
+        .kind = .replies,
+        .total_items = 3,
+        .path = path,
+    }, &buf);
+    var want_buf: [192]u8 = undefined;
+    const want = try std.fmt.bufPrint(&want_buf, "https://example.com/users/bob/statuses/{d}/replies", .{id});
+    try std.testing.expect(std.mem.indexOf(u8, out, want) != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"totalItems\":3") != null);
+    // The default `/users/bob/replies` shape must NOT appear.
+    try std.testing.expect(std.mem.indexOf(u8, out, "users/bob/replies") == null);
+}
+
+test "replies page emits per-object next/prev paths" {
+    var it = TestIter{ .items = .{ "https://a/1", "https://a/2", "https://a/3" } };
+    var buf: [2048]u8 = undefined;
+    const out = try writePage(.{
+        .hostname = "example.com",
+        .actor_username = "bob",
+        .kind = .replies,
+        .total_items = 3,
+        .path = "users/bob/statuses/77/replies",
+    }, 2, @ptrCast(&it), TestIter.next, &buf);
+    try std.testing.expect(std.mem.indexOf(u8, out, "https://example.com/users/bob/statuses/77/replies?page=2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"prev\":\"https://example.com/users/bob/statuses/77/replies?page=1\"") != null);
 }
 
 test "writeIndex refuses too-small buffer" {

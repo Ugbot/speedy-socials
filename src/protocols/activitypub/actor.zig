@@ -44,6 +44,18 @@ pub const ActorType = enum {
     }
 };
 
+/// AP-15: a single additional published Ed25519 key (FEP-d36d
+/// Multikey rotation). The actor advertises these alongside its
+/// primary `#main-key` as `#key-N` Multikeys so verifiers can find a
+/// rotation key. `multibase` is the `z6Mk…` form.
+pub const ExtraKey = struct {
+    multibase: []const u8,
+};
+
+/// Bound on how many extra rotation keys we advertise in one actor
+/// document — keeps the output buffer bounded (Tiger Style).
+pub const max_extra_keys: usize = 8;
+
 pub const Config = struct {
     hostname: []const u8,
     username: []const u8,
@@ -60,6 +72,10 @@ pub const Config = struct {
     /// (`z6Mk…` — base58btc of multicodec-prefixed key). When set, the
     /// actor advertises an `assertionMethod` Multikey (FEP-d36d).
     assertion_multibase: []const u8 = "",
+    /// AP-15: additional published rotation keys (FEP-d36d). Each is
+    /// emitted as a `#key-N` Multikey in both `assertionMethod` and
+    /// `verificationMethod`. Bounded by `max_extra_keys`.
+    extra_keys: []const ExtraKey = &.{},
 };
 
 pub fn writePerson(cfg: Config, out: []u8) WriteError![]const u8 {
@@ -120,14 +136,18 @@ pub fn writePerson(cfg: Config, out: []u8) WriteError![]const u8 {
     // PEM contains newlines — JSON-escape them to `\n`.
     w += try escapePem(out[w..], cfg.public_key_pem);
     w += try copy(out[w..], "\"}"); // close publicKeyPem string + publicKey object
-    // AP-15: advertise the signing key as a Multikey assertionMethod
-    // (FEP-d36d) so verifiers that prefer Multikey can find it.
-    if (cfg.assertion_multibase.len > 0) {
-        w += try fmtInto(out[w..],
-            ",\"assertionMethod\":[{{\"id\":\"https://{s}/users/{s}#main-key\"," ++
-            "\"type\":\"Multikey\",\"controller\":\"https://{s}/users/{s}\"," ++
-            "\"publicKeyMultibase\":\"{s}\"}}]",
-            .{ cfg.hostname, cfg.username, cfg.hostname, cfg.username, cfg.assertion_multibase });
+    // AP-15: advertise the signing key (and any published rotation
+    // keys) as Multikeys (FEP-d36d). We emit the same Multikey array
+    // under both `assertionMethod` and `verificationMethod` so
+    // verifiers that look up either property can find the keys.
+    if (cfg.extra_keys.len > max_extra_keys) return error.BufferTooSmall;
+    const has_primary = cfg.assertion_multibase.len > 0;
+    if (has_primary or cfg.extra_keys.len > 0) {
+        // Build the shared Multikey array body once.
+        w += try copy(out[w..], ",\"assertionMethod\":");
+        w += try writeMultikeyArray(out[w..], cfg, has_primary);
+        w += try copy(out[w..], ",\"verificationMethod\":");
+        w += try writeMultikeyArray(out[w..], cfg, has_primary);
     }
     w += try copy(out[w..], "}"); // close actor object
     return out[0..w];
@@ -187,6 +207,36 @@ pub fn writeSyntheticPerson(cfg: SyntheticConfig, out: []u8) WriteError![]const 
     w += try escapePem(out[w..], cfg.public_key_pem);
     w += try copy(out[w..], "\"}}");
     return out[0..w];
+}
+
+/// AP-15: write the JSON array of Multikey entries (FEP-d36d). The
+/// primary `#main-key` is emitted first when `with_primary`; each
+/// extra key is emitted as `#key-N` (1-indexed). Tiger Style: bounded
+/// by `max_extra_keys`, fixed output slice.
+fn writeMultikeyArray(dest: []u8, cfg: Config, with_primary: bool) WriteError!usize {
+    var w: usize = 0;
+    w += try copy(dest[w..], "[");
+    var wrote_one = false;
+    if (with_primary) {
+        w += try fmtInto(dest[w..],
+            "{{\"id\":\"https://{s}/users/{s}#main-key\"," ++
+            "\"type\":\"Multikey\",\"controller\":\"https://{s}/users/{s}\"," ++
+            "\"publicKeyMultibase\":\"{s}\"}}",
+            .{ cfg.hostname, cfg.username, cfg.hostname, cfg.username, cfg.assertion_multibase });
+        wrote_one = true;
+    }
+    var idx: usize = 0;
+    while (idx < cfg.extra_keys.len) : (idx += 1) {
+        if (wrote_one) w += try copy(dest[w..], ",");
+        w += try fmtInto(dest[w..],
+            "{{\"id\":\"https://{s}/users/{s}#key-{d}\"," ++
+            "\"type\":\"Multikey\",\"controller\":\"https://{s}/users/{s}\"," ++
+            "\"publicKeyMultibase\":\"{s}\"}}",
+            .{ cfg.hostname, cfg.username, idx + 1, cfg.hostname, cfg.username, cfg.extra_keys[idx].multibase });
+        wrote_one = true;
+    }
+    w += try copy(dest[w..], "]");
+    return w;
 }
 
 fn copy(dest: []u8, src: []const u8) WriteError!usize {
@@ -266,4 +316,67 @@ test "writePerson with empty optional fields" {
 test "writePerson fails when buffer too small" {
     var tiny: [16]u8 = undefined;
     try testing.expectError(error.BufferTooSmall, writePerson(.{ .hostname = "h", .username = "u" }, &tiny));
+}
+
+test "AP-15: writePerson advertises extra Multikeys as #key-N in both methods" {
+    // Randomize the count of extra keys (1..max_extra_keys) and the
+    // multibase contents to avoid a hardcoded happy path.
+    var prng = std.Random.DefaultPrng.init(0xC0FFEE);
+    const rnd = prng.random();
+    const n: usize = 1 + rnd.uintLessThan(usize, max_extra_keys);
+
+    var mb_storage: [max_extra_keys][24]u8 = undefined;
+    var extras: [max_extra_keys]ExtraKey = undefined;
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        mb_storage[i][0] = 'z';
+        var j: usize = 1;
+        while (j < mb_storage[i].len) : (j += 1) {
+            // base58btc-ish alphabet subset; content is arbitrary here.
+            const alphabet = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+            mb_storage[i][j] = alphabet[rnd.uintLessThan(usize, alphabet.len)];
+        }
+        extras[i] = .{ .multibase = mb_storage[i][0..] };
+    }
+
+    var buf: [8192]u8 = undefined;
+    const out = try writePerson(.{
+        .hostname = "h.example",
+        .username = "alice",
+        .public_key_pem = "",
+        .assertion_multibase = "z6MkPRIMARYxxxxxxxxxxxxx",
+        .extra_keys = extras[0..n],
+    }, &buf);
+
+    // Primary main-key + every extra #key-N appears, under both methods.
+    try testing.expect(std.mem.indexOf(u8, out, "\"assertionMethod\":[") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "\"verificationMethod\":[") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "#main-key") != null);
+    var k: usize = 0;
+    while (k < n) : (k += 1) {
+        var idbuf: [32]u8 = undefined;
+        const frag = try std.fmt.bufPrint(&idbuf, "#key-{d}", .{k + 1});
+        try testing.expect(std.mem.indexOf(u8, out, frag) != null);
+    }
+    // Multikey type appears (primary + n extras) under both methods:
+    // total occurrences = 2 * (1 + n).
+    const wanted: usize = 2 * (1 + n);
+    var count: usize = 0;
+    var pos: usize = 0;
+    while (std.mem.indexOfPos(u8, out, pos, "\"type\":\"Multikey\"")) |at| {
+        count += 1;
+        pos = at + 1;
+    }
+    try testing.expectEqual(wanted, count);
+}
+
+test "AP-15: too many extra keys is rejected" {
+    var extras: [max_extra_keys + 1]ExtraKey = undefined;
+    for (&extras) |*e| e.* = .{ .multibase = "z6Mkxxxx" };
+    var buf: [8192]u8 = undefined;
+    try testing.expectError(error.BufferTooSmall, writePerson(.{
+        .hostname = "h",
+        .username = "u",
+        .extra_keys = extras[0..],
+    }, &buf));
 }
