@@ -30,13 +30,15 @@ pub const Dialect = enum {
     sqlite,
     postgres,
     mysql,
+    mssql,
 
     /// Positional parameter placeholder for the n-th (1-based) bind.
-    /// SQLite and MySQL use `?`; Postgres uses `$N`.
+    /// SQLite and MySQL use `?`; Postgres uses `$N`; SQL Server uses `@pN`.
     pub fn placeholder(self: Dialect, comptime n: usize) []const u8 {
         return switch (self) {
             .sqlite, .mysql => "?",
             .postgres => std.fmt.comptimePrint("${d}", .{n}),
+            .mssql => std.fmt.comptimePrint("@p{d}", .{n}),
         };
     }
 };

@@ -47,6 +47,7 @@ pub fn Query(comptime T: type) type {
         args: [max_columns]BindValue = undefined,
         arg_count: usize = 0,
         has_where: bool = false,
+        has_order: bool = false,
 
         pub fn init(dialect: Dialect) Self {
             var q = Self{ .dialect = dialect };
@@ -66,6 +67,11 @@ pub fn Query(comptime T: type) type {
                 .postgres => {
                     var tmp: [16]u8 = undefined;
                     const s = std.fmt.bufPrint(&tmp, "${d}", .{self.arg_count + 1}) catch unreachable;
+                    self.append(s);
+                },
+                .mssql => {
+                    var tmp: [16]u8 = undefined;
+                    const s = std.fmt.bufPrint(&tmp, "@p{d}", .{self.arg_count + 1}) catch unreachable;
                     self.append(s);
                 },
             }
@@ -107,10 +113,23 @@ pub fn Query(comptime T: type) type {
             self.append(" ORDER BY ");
             self.append(checkColumn(T, field));
             self.append(if (dir == .desc) " DESC" else " ASC");
+            self.has_order = true;
             return self;
         }
 
         pub fn limit(self: *Self, n: usize) *Self {
+            // T-SQL has no LIMIT — it uses OFFSET … FETCH, which requires an
+            // ORDER BY; synthesize a no-op order when the caller set none.
+            if (self.dialect == .mssql) {
+                if (!self.has_order) {
+                    self.append(" ORDER BY (SELECT NULL)");
+                    self.has_order = true;
+                }
+                var tmp: [48]u8 = undefined;
+                const s = std.fmt.bufPrint(&tmp, " OFFSET 0 ROWS FETCH NEXT {d} ROWS ONLY", .{n}) catch unreachable;
+                self.append(s);
+                return self;
+            }
             var tmp: [24]u8 = undefined;
             const s = std.fmt.bufPrint(&tmp, " LIMIT {d}", .{n}) catch unreachable;
             self.append(s);
@@ -243,6 +262,23 @@ test "orderBy + limit append correctly" {
         q.buf[0..q.len],
     );
     try testing.expectEqualStrings("admin", q.args[0].text);
+}
+
+test "MS SQL: @pN placeholders + OFFSET/FETCH for limit" {
+    // limit with an explicit order → OFFSET/FETCH after the ORDER BY.
+    var q = Query(Account).init(.mssql);
+    _ = q.whereText("handle", "a").whereInt("age", 9).orderBy("age", .desc).limit(5);
+    try testing.expectEqualStrings(
+        "SELECT id, handle, role, age FROM atp_accounts WHERE handle = @p1 AND age = @p2 ORDER BY age DESC OFFSET 0 ROWS FETCH NEXT 5 ROWS ONLY",
+        q.buf[0..q.len],
+    );
+    // limit WITHOUT an order → a synthesized no-op ORDER BY (T-SQL requires one).
+    var q2 = Query(Account).init(.mssql);
+    _ = q2.whereText("id", "x").limit(1);
+    try testing.expectEqualStrings(
+        "SELECT id, handle, role, age FROM atp_accounts WHERE id = @p1 ORDER BY (SELECT NULL) OFFSET 0 ROWS FETCH NEXT 1 ROWS ONLY",
+        q2.buf[0..q2.len],
+    );
 }
 
 test "all() fills a bounded slice and matches the predicate" {

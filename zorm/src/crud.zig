@@ -28,8 +28,9 @@ pub fn insert(comptime T: type, backend: Backend, value: *T) Error!void {
 
     if (info.pk_auto) {
         switch (backend.dialect) {
-            .postgres => {
-                // `… RETURNING <pk>` yields one row, one integer column.
+            // Postgres `… RETURNING <pk>` and SQL Server `… OUTPUT INSERTED.<pk>`
+            // both yield one row, one integer column.
+            .postgres, .mssql => {
                 var row: contract.Row = .{};
                 if (!try backend.queryOne(stmt, args[0..n], &row)) return Error.StepFailed;
                 setAutoPk(T, value, row.columns[0].int_val);

@@ -44,9 +44,15 @@ fn buildInsert(comptime T: type, comptime dialect: Dialect) []const u8 {
             vals = vals ++ dialect.placeholder(n + 1);
             n += 1;
         }
-        var sql: []const u8 = "INSERT INTO " ++ info.table ++ " (" ++ cols ++ ") VALUES (" ++ vals ++ ")";
-        // Postgres assigns the auto PK and returns it; SQLite uses
-        // lastInsertId(). Text PKs are supplied by the caller (no RETURNING).
+        var sql: []const u8 = "INSERT INTO " ++ info.table ++ " (" ++ cols ++ ")";
+        // SQL Server returns the assigned id via an OUTPUT clause placed
+        // between the column list and VALUES.
+        if (info.pk_auto and dialect == .mssql) {
+            sql = sql ++ " OUTPUT INSERTED." ++ info.pk_column.name;
+        }
+        sql = sql ++ " VALUES (" ++ vals ++ ")";
+        // Postgres assigns the auto PK and returns it via RETURNING; SQLite +
+        // MySQL use lastInsertId(). Text PKs are caller-supplied (no clause).
         if (info.pk_auto and dialect == .postgres) {
             sql = sql ++ " RETURNING " ++ info.pk_column.name;
         }
@@ -95,6 +101,7 @@ pub fn insert(comptime T: type, dialect: Dialect) []const u8 {
         .sqlite => comptime buildInsert(T, .sqlite),
         .postgres => comptime buildInsert(T, .postgres),
         .mysql => comptime buildInsert(T, .mysql),
+        .mssql => comptime buildInsert(T, .mssql),
     };
 }
 
@@ -116,6 +123,7 @@ pub fn selectByPk(comptime T: type, dialect: Dialect) []const u8 {
         .sqlite => comptime buildSelectByPk(T, .sqlite),
         .postgres => comptime buildSelectByPk(T, .postgres),
         .mysql => comptime buildSelectByPk(T, .mysql),
+        .mssql => comptime buildSelectByPk(T, .mssql),
     };
 }
 
@@ -125,6 +133,7 @@ pub fn update(comptime T: type, dialect: Dialect) []const u8 {
         .sqlite => comptime buildUpdate(T, .sqlite),
         .postgres => comptime buildUpdate(T, .postgres),
         .mysql => comptime buildUpdate(T, .mysql),
+        .mssql => comptime buildUpdate(T, .mssql),
     };
 }
 
@@ -134,6 +143,7 @@ pub fn deleteByPk(comptime T: type, dialect: Dialect) []const u8 {
         .sqlite => comptime buildDeleteByPk(T, .sqlite),
         .postgres => comptime buildDeleteByPk(T, .postgres),
         .mysql => comptime buildDeleteByPk(T, .mysql),
+        .mssql => comptime buildDeleteByPk(T, .mssql),
     };
 }
 
@@ -203,6 +213,30 @@ test "MySQL: ? placeholders, no RETURNING (auto PK via lastInsertId)" {
     try testing.expectEqualStrings(
         "DELETE FROM things WHERE id = ?",
         deleteByPk(AutoEntity, .mysql),
+    );
+}
+
+test "MS SQL: @pN placeholders, OUTPUT INSERTED for auto PK" {
+    try testing.expectEqualStrings(
+        "INSERT INTO atp_accounts (id, handle, email, role) VALUES (@p1, @p2, @p3, @p4)",
+        insert(Account, .mssql),
+    );
+    // Auto-PK INSERT: OUTPUT INSERTED.<pk> sits between the column list + VALUES.
+    try testing.expectEqualStrings(
+        "INSERT INTO things (name) OUTPUT INSERTED.id VALUES (@p1)",
+        insert(AutoEntity, .mssql),
+    );
+    try testing.expectEqualStrings(
+        "SELECT id, handle, email, role FROM atp_accounts WHERE id = @p1",
+        selectByPk(Account, .mssql),
+    );
+    try testing.expectEqualStrings(
+        "UPDATE atp_accounts SET handle = @p1, email = @p2, role = @p3 WHERE id = @p4",
+        update(Account, .mssql),
+    );
+    try testing.expectEqualStrings(
+        "DELETE FROM things WHERE id = @p1",
+        deleteByPk(AutoEntity, .mssql),
     );
 }
 

@@ -114,6 +114,13 @@ pub fn columnSpec(comptime field_name: []const u8, comptime F: type, comptime id
             spec.col_type = .text;
             spec.bind_kind = .text;
             spec.is_enum = true;
+            // Capacity = longest tag name, so dialects that need a length
+            // (MySQL VARCHAR(N) / MSSQL NVARCHAR(N)) emit a valid, tight type.
+            var max_tag: usize = 1;
+            for (std.meta.fields(T)) |ef| {
+                if (ef.name.len > max_tag) max_tag = ef.name.len;
+            }
+            spec.byte_cap = max_tag;
         },
         else => @compileError("zorm: unsupported field type '" ++ @typeName(T) ++ "' for field '" ++ field_name ++ "' — use a zorm field type, an int/float/bool, or an enum"),
     }

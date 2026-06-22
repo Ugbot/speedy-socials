@@ -58,7 +58,7 @@ pub fn initialMigration(comptime T: type, id: u32, dialect: Dialect) Migration {
 
 fn buildInitialUp(comptime T: type, comptime dialect: Dialect) []const []const u8 {
     const out = comptime blk: {
-        const idx = ddl.foreignKeyIndexes(T);
+        const idx = ddl.foreignKeyIndexes(T, dialect);
         var up: [1 + idx.len][]const u8 = undefined;
         up[0] = ddl.createTable(T, dialect);
         for (idx, 0..) |s, i| up[i + 1] = s;
@@ -119,6 +119,7 @@ pub const Migrator = struct {
             .sqlite => "CREATE TABLE IF NOT EXISTS zorm_migrations (id INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at INTEGER NOT NULL)",
             .postgres => "CREATE TABLE IF NOT EXISTS zorm_migrations (id BIGINT PRIMARY KEY, name TEXT NOT NULL, applied_at BIGINT NOT NULL)",
             .mysql => "CREATE TABLE IF NOT EXISTS zorm_migrations (id BIGINT PRIMARY KEY, name VARCHAR(255) NOT NULL, applied_at BIGINT NOT NULL)",
+            .mssql => "IF OBJECT_ID(N'zorm_migrations', N'U') IS NULL CREATE TABLE zorm_migrations (id BIGINT PRIMARY KEY, name NVARCHAR(255) NOT NULL, applied_at BIGINT NOT NULL)",
         };
         try backend.exec(sql, &.{});
     }
@@ -127,6 +128,7 @@ pub const Migrator = struct {
         const sql = switch (backend.dialect) {
             .sqlite, .mysql => "SELECT 1 FROM zorm_migrations WHERE id = ?",
             .postgres => "SELECT 1 FROM zorm_migrations WHERE id = $1",
+            .mssql => "SELECT 1 FROM zorm_migrations WHERE id = @p1",
         };
         var row: contract.Row = .{};
         return backend.queryOne(sql, &.{.{ .int = @intCast(id) }}, &row);
@@ -136,6 +138,7 @@ pub const Migrator = struct {
         return switch (dialect) {
             .sqlite, .mysql => "INSERT INTO zorm_migrations (id, name, applied_at) VALUES (?, ?, ?)",
             .postgres => "INSERT INTO zorm_migrations (id, name, applied_at) VALUES ($1, $2, $3)",
+            .mssql => "INSERT INTO zorm_migrations (id, name, applied_at) VALUES (@p1, @p2, @p3)",
         };
     }
 };
