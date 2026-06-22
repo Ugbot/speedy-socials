@@ -139,6 +139,17 @@ fn refreshSession(hc: *HandlerContext) anyerror!void {
         return xrpc.writeError(hc, .unauthorized, "AuthenticationRequired", "not a refresh token");
     }
 
+    // Reject tokens revoked by a prior deleteSession (logout). The
+    // deny-list is keyed by the refresh jti; a revoked session can never
+    // be rotated back to life.
+    if (st.dbHandle()) |db| {
+        if (auth_mod.isSessionRevoked(db, claims.jti())) {
+            return xrpc.writeError(hc, .unauthorized, "AuthenticationRequired", "session revoked");
+        }
+    } else {
+        return xrpc.writeError(hc, .service_unavailable, "ServiceUnavailable", "db not ready");
+    }
+
     // Rotate.
     var new_access_jti_buf: [16]u8 = undefined;
     var new_refresh_jti_buf: [16]u8 = undefined;
@@ -164,6 +175,40 @@ fn refreshSession(hc: *HandlerContext) anyerror!void {
         .{ claims.sub(), claims.sub(), access, refresh },
     ) catch return error.OutOfMemory;
     try xrpc.writeJsonBody(hc, .ok, body);
+}
+
+// ── deleteSession (logout) ────────────────────────────────────────
+// Authenticated with the refresh JWT (the Bearer token), same as
+// refreshSession. Revokes that session by recording its refresh jti in
+// the deny-list so a later refreshSession with the same token is
+// rejected. Returns an empty 200 on success (idempotent: logging out an
+// already-revoked session still succeeds).
+fn deleteSession(hc: *HandlerContext) anyerror!void {
+    const st = State.get();
+    const auth_header = hc.request.header("Authorization") orelse {
+        return xrpc.writeError(hc, .unauthorized, "AuthenticationRequired", "missing bearer");
+    };
+    if (!std.mem.startsWith(u8, auth_header, "Bearer ")) {
+        return xrpc.writeError(hc, .unauthorized, "AuthenticationRequired", "bad scheme");
+    }
+    const token = auth_header[7..];
+
+    const now = st.clock.wallUnix();
+    var claims: auth_mod.Claims = .{ .scope = .access, .iat = 0, .exp = 0 };
+    auth_mod.verify(token, st.jwt_key.public_key, now, &claims) catch {
+        return xrpc.writeError(hc, .unauthorized, "AuthenticationRequired", "invalid refresh");
+    };
+    if (claims.scope != .refresh) {
+        return xrpc.writeError(hc, .unauthorized, "AuthenticationRequired", "not a refresh token");
+    }
+
+    const db = st.dbHandle() orelse {
+        return xrpc.writeError(hc, .service_unavailable, "ServiceUnavailable", "db not ready");
+    };
+    auth_mod.revokeSession(db, claims.sub(), claims.jti(), now, claims.exp) catch {
+        return xrpc.writeError(hc, .internal, "InternalError", "revoke");
+    };
+    try xrpc.writeJsonBody(hc, .ok, "{}");
 }
 
 fn fillJti(out: []u8, seed: i64, salt: u8) void {
@@ -1710,6 +1755,7 @@ pub fn register(router: *Router, plugin_index: u16) !void {
     try router.register(.get, "/xrpc/com.atproto.server.describeServer", describeServer, plugin_index);
     try router.register(.post, "/xrpc/com.atproto.server.createSession", createSession, plugin_index);
     try router.register(.post, "/xrpc/com.atproto.server.refreshSession", refreshSession, plugin_index);
+    try router.register(.post, "/xrpc/com.atproto.server.deleteSession", deleteSession, plugin_index);
 
     try router.register(.post, "/xrpc/com.atproto.repo.createRecord", createRecord, plugin_index);
     try router.register(.post, "/xrpc/com.atproto.repo.putRecord", createRecord, plugin_index);

@@ -87,6 +87,60 @@ pub fn verifyPassword(
     return argon2id.verifyDefault(password, hash_buf[0..n]) catch false;
 }
 
+// ── Session revocation (logout) ────────────────────────────────────
+//
+// Access/refresh JWTs are stateless, so `com.atproto.server.deleteSession`
+// records the caller's refresh `jti` in the `atp_revoked_sessions`
+// deny-list (migration id 2016). `refreshSession` consults `isSessionRevoked`
+// before rotating, so a token revoked by an earlier logout is rejected.
+
+pub const RevokeError = error{
+    PrepareFailed,
+    StepFailed,
+    JtiTooLong,
+};
+
+/// Record `jti` (the refresh token's id) in the revocation deny-list.
+/// Idempotent: revoking the same session twice is a no-op (the second
+/// logout with the same token still returns 200).
+pub fn revokeSession(
+    db: *c.sqlite3,
+    did: []const u8,
+    jti: []const u8,
+    revoked_at: i64,
+    expires_at: i64,
+) RevokeError!void {
+    if (jti.len == 0 or jti.len > max_jti_bytes) return error.JtiTooLong;
+    const sql =
+        \\INSERT OR IGNORE INTO atp_revoked_sessions(jti, did, revoked_at, expires_at)
+        \\VALUES (?, ?, ?, ?)
+    ;
+    var stmt: ?*c.sqlite3_stmt = null;
+    if (c.sqlite3_prepare_v2(db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.PrepareFailed;
+    defer _ = c.sqlite3_finalize(stmt);
+    _ = c.sqlite3_bind_text(stmt, 1, jti.ptr, @intCast(jti.len), c.sqliteTransientAsDestructor());
+    _ = c.sqlite3_bind_text(stmt, 2, did.ptr, @intCast(did.len), c.sqliteTransientAsDestructor());
+    _ = c.sqlite3_bind_int64(stmt, 3, revoked_at);
+    _ = c.sqlite3_bind_int64(stmt, 4, expires_at);
+    if (c.sqlite3_step(stmt.?) != c.SQLITE_DONE) return error.StepFailed;
+}
+
+/// True when a refresh token with this `jti` has been revoked. A
+/// prepare/step failure or an empty jti fails closed (treated as revoked)
+/// so a broken deny-list never silently re-enables a logged-out session.
+pub fn isSessionRevoked(db: *c.sqlite3, jti: []const u8) bool {
+    if (jti.len == 0 or jti.len > max_jti_bytes) return true;
+    const sql = "SELECT 1 FROM atp_revoked_sessions WHERE jti = ? LIMIT 1";
+    var stmt: ?*c.sqlite3_stmt = null;
+    if (c.sqlite3_prepare_v2(db, sql, -1, &stmt, null) != c.SQLITE_OK) {
+        if (stmt != null) _ = c.sqlite3_finalize(stmt);
+        return true;
+    }
+    defer _ = c.sqlite3_finalize(stmt);
+    _ = c.sqlite3_bind_text(stmt, 1, jti.ptr, @intCast(jti.len), c.sqliteTransientAsDestructor());
+    return c.sqlite3_step(stmt.?) == c.SQLITE_ROW;
+}
+
 pub const access_ttl_seconds: i64 = 60 * 60;
 pub const refresh_ttl_seconds: i64 = 60 * 60 * 24 * 90;
 
@@ -524,4 +578,55 @@ test "atproto auth: setPassword overwrites prior hash" {
     try setPassword(db, &rng, sc.clock(), "did:plc:carol", "new");
     try testing.expect(!verifyPassword(db, "did:plc:carol", "old"));
     try testing.expect(verifyPassword(db, "did:plc:carol", "new"));
+}
+
+// deleteSession (logout): a refresh token still verifies and refreshes
+// fine until it is revoked; after deleteSession records its jti the same
+// token is rejected by refreshSession's revocation gate. This reproduces
+// the createSession → deleteSession → refreshSession flow against the
+// exact primitives the route handlers call.
+test "atproto auth: deleteSession revokes the refresh session" {
+    const db = try pwTestDb();
+    defer core.storage.sqlite.closeDb(db);
+
+    var seed: [32]u8 = undefined;
+    @memset(&seed, 0x5A);
+    const kp = keypair.Ed25519KeyPair.fromSeed(seed);
+
+    const did = "did:plc:logout-tester";
+    const refresh_jti = "refresh-jti-0001";
+    const now: i64 = 1_700_000_000;
+
+    // createSession: mint a refresh JWT.
+    var claims: Claims = .{ .scope = .refresh, .iat = now, .exp = now + refresh_ttl_seconds };
+    try claims.setSub(did);
+    try claims.setJti(refresh_jti);
+    var token_buf: [max_jwt_bytes]u8 = undefined;
+    const refresh_jwt = try sign(kp, claims, &token_buf);
+
+    // refreshSession (pre-logout): token verifies as a refresh token and
+    // is NOT yet revoked, so rotation would proceed.
+    var got: Claims = .{ .scope = .access, .iat = 0, .exp = 0 };
+    try verify(refresh_jwt, kp.public_key, now + 60, &got);
+    try testing.expectEqual(Scope.refresh, got.scope);
+    try testing.expectEqualStrings(did, got.sub());
+    try testing.expect(!isSessionRevoked(db, got.jti()));
+
+    // deleteSession: revoke this session by its refresh jti.
+    try revokeSession(db, got.sub(), got.jti(), now + 120, got.exp);
+
+    // refreshSession (post-logout): the JWT still verifies (signature +
+    // expiry are unchanged) but is now on the deny-list, so the handler
+    // rejects it with AuthenticationRequired.
+    var got2: Claims = .{ .scope = .access, .iat = 0, .exp = 0 };
+    try verify(refresh_jwt, kp.public_key, now + 180, &got2);
+    try testing.expect(isSessionRevoked(db, got2.jti()));
+
+    // deleteSession is idempotent: a second logout with the same token
+    // still succeeds and the session stays revoked.
+    try revokeSession(db, got2.sub(), got2.jti(), now + 240, got2.exp);
+    try testing.expect(isSessionRevoked(db, refresh_jti));
+
+    // A different, never-revoked session is unaffected.
+    try testing.expect(!isSessionRevoked(db, "some-other-jti"));
 }

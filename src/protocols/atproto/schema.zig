@@ -251,6 +251,27 @@ pub const crawl_subscriptions_migration: Migration = .{
     .down = "DROP TABLE atp_crawl_subscriptions;",
 };
 
+// `com.atproto.server.deleteSession` (logout). Access/refresh tokens are
+// stateless Ed25519 JWTs, so revocation needs server-side state: a
+// deny-list keyed by the refresh token's `jti`. `deleteSession` inserts
+// the caller's refresh jti here; `refreshSession` rejects any token whose
+// jti is present. `expires_at` mirrors the token `exp` so an operator
+// can prune rows once they can no longer be presented (a revoked token
+// past its own expiry is already rejected by the JWT expiry check).
+pub const revoked_sessions_migration: Migration = .{
+    .id = 2016,
+    .name = "atproto:revoked_sessions",
+    .up =
+    \\CREATE TABLE IF NOT EXISTS atp_revoked_sessions (
+    \\    jti        TEXT PRIMARY KEY,
+    \\    did        TEXT NOT NULL,
+    \\    revoked_at INTEGER NOT NULL,
+    \\    expires_at INTEGER NOT NULL
+    \\) STRICT;
+    ,
+    .down = "DROP TABLE atp_revoked_sessions;",
+};
+
 pub const all_migrations = [_]Migration{
     repos_migration,
     commits_migration,
@@ -267,4 +288,5 @@ pub const all_migrations = [_]Migration{
     oauth_par_migration,
     oauth_codes_migration,
     crawl_subscriptions_migration,
+    revoked_sessions_migration,
 };
