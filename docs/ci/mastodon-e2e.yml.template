@@ -1,5 +1,11 @@
 # J5 — Mastodon dev-pod end-to-end integration test (GitHub Actions).
 #
+# SUPERSEDED: this early sketch referenced a shell harness
+# (tests/e2e/mastodon_roundtrip.sh) that was never written. The runnable
+# job now lives at `docs/ci/mastodon-e2e.yml`, which drives the gated Zig
+# integration test `tests/e2e/mastodon_roundtrip.zig` instead. This file is
+# retained only for historical diff context; prefer the .yml.
+#
 # Bring up a Mastodon dev image, point speedy-socials at it, exercise
 # one Create + Like + Follow round trip. Skippable on PRs that don't
 # touch federation paths.

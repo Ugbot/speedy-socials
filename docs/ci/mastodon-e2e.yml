@@ -1,0 +1,177 @@
+# J5 — Mastodon dev-pod end-to-end federation round-trip (GitHub Actions).
+#
+# Brings up a real Mastodon dev pod (Postgres + Redis + web), boots
+# speedy-socials pointed at it, and exercises ONE federation round trip —
+# a Follow + a Create(Note) + a Like delivered from the speedy-socials
+# bridge to the Mastodon pod's inbox (HTTP-signed application/activity+json),
+# plus a pod->bridge reachability check (WebFinger + actor fetch + NodeInfo).
+# The round trip itself lives in the gated Zig integration test
+# `tests/e2e/mastodon_roundtrip.zig`, which is INERT unless `MASTODON_E2E_URL`
+# is set — so it never runs on offline branches.
+#
+# ── Activation ────────────────────────────────────────────────────────────
+# The repo's automation credential lacks the `workflow` OAuth scope, so this
+# file ships under docs/ci/ as a template (same convention as
+# `github-actions.yml.template`). To enable it:
+#
+#     mkdir -p .github/workflows
+#     cp docs/ci/mastodon-e2e.yml .github/workflows/mastodon-e2e.yml
+#     git add .github/workflows/mastodon-e2e.yml
+#     git commit -m "ci: enable Mastodon e2e job"
+#     git push   # requires a credential with the `workflow` scope
+#
+# ── Skippability (offline branches) ─────────────────────────────────────────
+# The job NEVER runs by default. It is gated three ways:
+#   1. `workflow_dispatch` — manual opt-in from the Actions tab, OR
+#   2. the `e2e-mastodon` PR label (add the label to a PR to opt in), AND
+#   3. the `RUN_E2E_MASTODON` repo variable must equal "1" (a global kill
+#      switch so a fork or an offline mirror never spins up the pod).
+# When the job does not run, `tests/e2e/mastodon_roundtrip.zig` is still
+# compiled by the normal `zig build test` job but self-skips (it returns
+# error.SkipZigTest because MASTODON_E2E_URL is unset).
+
+name: e2e-mastodon
+
+on:
+  workflow_dispatch:
+    inputs:
+      acct:
+        description: 'Target acct on the pod (user@host). Default admin@localhost:3000'
+        required: false
+        default: 'admin@localhost:3000'
+  pull_request:
+    types: [labeled, synchronize, reopened]
+    paths:
+      - 'src/protocols/activitypub/**'
+      - 'src/protocols/relay/**'
+      - 'tests/e2e/**'
+
+jobs:
+  mastodon-e2e:
+    runs-on: ubuntu-latest
+    # Gate: run only on manual dispatch, or on a PR that carries the
+    # `e2e-mastodon` label, AND only when the kill switch is armed.
+    if: >-
+      vars.RUN_E2E_MASTODON == '1' &&
+      ( github.event_name == 'workflow_dispatch' ||
+        contains(github.event.pull_request.labels.*.name, 'e2e-mastodon') )
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: mastodon
+          POSTGRES_USER: mastodon
+          POSTGRES_DB: mastodon_development
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+      mastodon:
+        image: tootsuite/mastodon:v4.5
+        env:
+          DB_HOST: postgres
+          DB_USER: mastodon
+          DB_PASS: mastodon
+          REDIS_HOST: redis
+          LOCAL_DOMAIN: localhost:3000
+          LOCAL_HTTPS: 'false'
+          OTP_SECRET: dummy_otp_secret_for_ci_only_not_a_real_secret
+          SECRET_KEY_BASE: dummy_secret_key_base_for_ci_only_not_a_real_secret
+          # Single-process web for CI: serve + run migrations on boot.
+          RAILS_ENV: development
+        ports:
+          - 3000:3000
+
+    env:
+      # Consumed by tests/e2e/mastodon_roundtrip.zig. Presence of
+      # MASTODON_E2E_URL is what flips the test from "skip" to "run".
+      MASTODON_E2E_URL: http://localhost:3000
+      MASTODON_E2E_ACCT: ${{ github.event.inputs.acct || 'admin@localhost:3000' }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Zig 0.16.0
+        uses: mlugg/setup-zig@v1
+        with:
+          version: 0.16.0
+
+      - name: Build speedy-socials
+        run: zig build
+
+      - name: Prepare Mastodon database
+        run: |
+          # The web container needs its schema before it can serve.
+          docker exec "$(docker ps -qf ancestor=tootsuite/mastodon:v4.5)" \
+            bash -lc 'RAILS_ENV=development bundle exec rails db:setup' || \
+            echo "db:setup may already be applied"
+
+      - name: Wait for Mastodon to be ready
+        run: |
+          for i in $(seq 1 60); do
+            if curl -fsS http://localhost:3000/.well-known/nodeinfo >/dev/null; then
+              echo "Mastodon ready"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "Mastodon failed to boot"
+          exit 1
+
+      - name: Create the target account on the pod
+        run: |
+          CID="$(docker ps -qf ancestor=tootsuite/mastodon:v4.5)"
+          docker exec "$CID" bash -lc \
+            'RAILS_ENV=development bin/tootctl accounts create admin \
+               --email admin@localhost --confirmed --role Owner' || \
+            echo "account 'admin' may already exist"
+
+      - name: Boot speedy-socials pointed at the pod (background)
+        run: |
+          # The bridge advertises itself under AP_HOSTNAME and is configured
+          # to bridge AT->AP toward the pod's shared inbox. The gated Zig test
+          # signs + POSTs directly, but booting the binary proves the build
+          # runs against the live pod and surfaces boot-time config errors.
+          AP_HOSTNAME=localhost:3000 \
+          RELAY_BRIDGE_AP_TARGET=http://localhost:3000/inbox \
+          ./zig-out/bin/speedy-socials > /tmp/speedy-socials.log 2>&1 &
+          sleep 5
+          echo "speedy-socials pid $!"
+
+      - name: Round trip — Follow + Create + Like (gated Zig integration test)
+        run: |
+          # MASTODON_E2E_URL is set in the job env, so this test now RUNS
+          # (instead of self-skipping). It performs the signed round trip and
+          # asserts the pod accepts each delivery + is reachable both ways.
+          zig build test --summary all 2>&1 | tee /tmp/zig-e2e.log
+          # Fail loudly if the e2e test somehow skipped despite the env var.
+          if grep -q "mastodon e2e" /tmp/zig-e2e.log && \
+             grep -qE "0 pass, 1 skip" /tmp/zig-e2e.log; then
+            echo "::error::e2e test skipped despite MASTODON_E2E_URL being set"
+            exit 1
+          fi
+
+      - name: Capture speedy-socials logs on failure
+        if: failure()
+        run: |
+          echo "=== speedy-socials log ==="
+          tail -200 /tmp/speedy-socials.log || true
+          echo "=== mastodon log ==="
+          docker logs "$(docker ps -aqf ancestor=tootsuite/mastodon:v4.5)" 2>&1 | tail -200 || true

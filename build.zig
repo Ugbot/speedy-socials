@@ -562,7 +562,20 @@ pub fn build(b: *std.Build) void {
             .imports = &sim_imports,
         }),
     });
+    // J5 — Mastodon dev-pod federation round-trip. Self-contained and
+    // env-gated: skips (error.SkipZigTest) unless MASTODON_E2E_URL is set,
+    // so it is inert under the default `zig build test`. Reuses sim_imports
+    // (core + protocol_activitypub + sqlite) — no new module plumbing.
+    const e2e_mastodon_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/e2e/mastodon_roundtrip.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &sim_imports,
+        }),
+    });
     test_step.dependOn(&b.addRunArtifact(sim_tr_replay_tests).step);
+    test_step.dependOn(&b.addRunArtifact(e2e_mastodon_tests).step);
 
     // ── benchmarks (continued) ─────────────────────────────────────
     const echo_bench = b.addExecutable(.{
