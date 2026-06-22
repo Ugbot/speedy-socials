@@ -42,6 +42,13 @@ actor-scoping, per-object replies, poll tally, emoji reactions, FEDERATION.md (A
 NodeInfo `atproto` protocol (AP3) · zorm typed constraint errors (Z1) · zorm per-dialect
 identifier quoting (Z2). The corresponding bullets below are now done.
 
+## ✅ Shipped 2026-06-23 — Wave 2 (on `main`, 1094 tests green)
+AT sync reads getLatestCommit/listBlobs/listMissingBlobs (AT2) · H3 tenant lifecycle routes
+`POST/PATCH/DELETE /admin/tenants` (C1) · downstream relay subscription — consume an external
+relay's firehose → translate → ingest, with cursor/reconnect (R1) · zorm query BETWEEN /
+OR-grouping / count() (Z7) · zorm upserts ON CONFLICT/DUPLICATE/MERGE (Z3) · zorm column types
+Decimal/Uuid/Json/Date/DateTime (Z5).
+
 ---
 
 # Track 1 — Run the node correctly (the original AP/AT target)
