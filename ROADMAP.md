@@ -88,17 +88,19 @@ integration, and net-new capability (zorm MS SQL + features)** — not core gaps
 
 # Track 2 — zorm completeness (Postgres · MySQL · MS SQL)
 
-**Shipped today** (do NOT re-do): 3 dialects (sqlite/postgres/mysql), `createTable`+FK
-clauses+FK indexes, `createIndex`/`addColumn`/`dropColumn`, `Migration`+`Migrator`,
-`Session`/`Repository`/identity-map/unit-of-work, `Query` (equality `WHERE` + `LIMIT`),
-relations, codec + typed messaging.
+**Shipped today** (do NOT re-do): **4 dialects (sqlite/postgres/mysql/mssql)**,
+`createTable`+FK clauses+FK indexes, `createIndex`/`addColumn`/`dropColumn`,
+`Migration`+`Migrator`, `Session`/`Repository`/identity-map/unit-of-work, `Query`
+(equality `WHERE` + dialect-correct `LIMIT`), relations, codec + typed messaging.
 
-## P0 — MS SQL Server (T-SQL) dialect  ← the headline ask
-Add `mssql` to `Dialect`. Forces the generator past simple keyword swaps:
-`@p1` params · `BIGINT IDENTITY(1,1)` + `OUTPUT INSERTED.id` (no `RETURNING`) ·
-`NVARCHAR(N)`/`VARBINARY(N)`/`BIT`/`FLOAT` · **no `CREATE TABLE/INDEX IF NOT EXISTS`**
-(needs `IF OBJECT_ID(...)/sys.indexes` guards) · `LIMIT`→`OFFSET…FETCH`/`TOP` ·
-`[bracket]` quoting. Validate live against `mcr.microsoft.com/mssql/server`.
+## ~~P0 — MS SQL Server (T-SQL) dialect~~ ✅ DONE (M5)
+Shipped: `mssql` Dialect — `@pN` params · `BIGINT IDENTITY(1,1)` + `OUTPUT INSERTED.id`
+(no `RETURNING`) · `NVARCHAR(N)`/`VARBINARY(N)`/`FLOAT`/`BIGINT` · `IF OBJECT_ID/sys.indexes`
+guards (T-SQL has no `IF NOT EXISTS`) · `LIMIT`→`OFFSET…FETCH` (with synthesized
+`ORDER BY (SELECT NULL)`). 1003 tests lock the generated SQL. **Remaining for mssql:**
+`[bracket]` identifier quoting (folded into the P1 quoting item) and a **live round-trip
+against `mcr.microsoft.com/mssql/server`** — deferred (the podman VM disk was full of
+other containers in the dev env; the T-SQL is standard and unit-locked).
 
 ## P1 — correctness foundations + query depth
 - **Identifier quoting** per dialect (`"x"`/`` `x` ``/`[x]`) — today names are unquoted
@@ -134,12 +136,13 @@ Add `mssql` to `Dialect`. Forces the generator past simple keyword swaps:
 ---
 
 # Recommended sequence
-1. **Track 2 P0 — zorm MS SQL dialect** (your stated direction; self-contained).
+1. ~~**Track 2 P0 — zorm MS SQL dialect**~~ ✅ DONE (M5).
 2. **Track 1 P0 — federation correctness** (DAG-CBOR re-encode, AP recipient resolution,
-   external identity resolution, firehose completeness) — makes us a *correct* node.
-3. **zorm P1** (quoting, typed errors, query ops, upserts, composite PK) — and use it to
-   harden **H1/H3 multi-tenancy**.
+   external identity resolution, firehose completeness) — makes us a *correct* node. ← next
+3. **zorm P1** (identifier quoting incl. mssql brackets, typed errors, query ops + OFFSET,
+   upserts, composite PK) — and use it to harden **H1/H3 multi-tenancy**.
 4. **Track 1 P1** spec/client polish, then **P2/testing**.
+5. (when a disk-headroom env is available) live SQL Server round-trip to close out M5.
 
 # Doc map (post-reconciliation)
 - **ROADMAP.md** (this file) — the single forward plan. Update here first.
