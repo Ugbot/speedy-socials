@@ -1701,7 +1701,11 @@ fn identityUpdateHandle(hc: *HandlerContext) anyerror!void {
     };
 
     if (st.dbHandle()) |db| {
-        _ = firehose.appendIdentity(db, sub, new_handle, st.clock.wallUnix()) catch {};
+        const now = st.clock.wallUnix();
+        _ = firehose.appendIdentity(db, sub, new_handle, now) catch {};
+        // AT1: also emit the deprecated `#handle` frame so older AppViews
+        // that don't consume `#identity` still see the handle change.
+        _ = firehose.appendHandle(db, sub, new_handle, now) catch {};
     }
     try xrpc.writeJsonBody(hc, .ok, "{}");
 }

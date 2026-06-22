@@ -187,6 +187,9 @@ fn sendCommitForSeq(ctx: *WsUpgradeContext, db: *c.sqlite3, seq: i64) !void {
         .identity => "#identity",
         .account => "#account",
         .tombstone => "#tombstone",
+        .handle => "#handle",
+        .migrate => "#migrate",
+        .info => "#info",
     };
     // Frame header: { op: 1, t: "<label>" }
     enc.writeMapHeader(2) catch return error.EncodeFailed;
@@ -222,7 +225,7 @@ fn sendCommitForSeq(ctx: *WsUpgradeContext, db: *c.sqlite3, seq: i64) !void {
             enc.writeText("blocks") catch return error.EncodeFailed;
             enc.writeBytesValue(body_buf[0..body_len]) catch return error.EncodeFailed;
         },
-        .identity, .account, .tombstone => {
+        .identity, .account, .tombstone, .handle, .migrate, .info => {
             // For non-commit kinds the stored body is already the
             // canonical event body (encoded by `firehose.appendX`).
             // Re-emit the body bytes verbatim — they already contain

@@ -47,6 +47,9 @@ pub const EventKind = enum {
     identity,
     account,
     tombstone,
+    handle,
+    migrate,
+    info,
 
     pub fn columnString(self: EventKind) []const u8 {
         return switch (self) {
@@ -54,6 +57,9 @@ pub const EventKind = enum {
             .identity => "identity",
             .account => "account",
             .tombstone => "tombstone",
+            .handle => "handle",
+            .migrate => "migrate",
+            .info => "info",
         };
     }
 
@@ -61,6 +67,9 @@ pub const EventKind = enum {
         if (std.mem.eql(u8, s, "identity")) return .identity;
         if (std.mem.eql(u8, s, "account")) return .account;
         if (std.mem.eql(u8, s, "tombstone")) return .tombstone;
+        if (std.mem.eql(u8, s, "handle")) return .handle;
+        if (std.mem.eql(u8, s, "migrate")) return .migrate;
+        if (std.mem.eql(u8, s, "info")) return .info;
         return .commit;
     }
 };
@@ -168,6 +177,51 @@ pub fn appendTombstone(
     return appendKind(db, .tombstone, did, "", body, ts);
 }
 
+/// AT1: emit a `#handle` event (deprecated in newer atproto, superseded
+/// by `#identity`, but still consumed by older AppViews). Signals that a
+/// repo's primary handle changed. Body: `{did, handle, time}`.
+pub fn appendHandle(
+    db: *c.sqlite3,
+    did: []const u8,
+    new_handle: []const u8,
+    ts: i64,
+) StorageError!i64 {
+    var buf: [512]u8 = undefined;
+    const body = encodeHandleBody(did, new_handle, &buf) catch return error.StepFailed;
+    return appendKind(db, .handle, did, "", body, ts);
+}
+
+/// AT1: emit a `#migrate` event (deprecated in newer atproto) signalling
+/// that a repo migrated to another PDS. `migrate_to` is the target
+/// service DID and may be empty, in which case the lexicon-mandated
+/// `migrateTo` key is encoded as an explicit CBOR null. Body:
+/// `{did, migrateTo, time}`.
+pub fn appendMigrate(
+    db: *c.sqlite3,
+    did: []const u8,
+    migrate_to: []const u8,
+    ts: i64,
+) StorageError!i64 {
+    var buf: [512]u8 = undefined;
+    const body = encodeMigrateBody(did, migrate_to, &buf) catch return error.StepFailed;
+    return appendKind(db, .migrate, did, "", body, ts);
+}
+
+/// AT1: emit an `#info` event — an out-of-band notice the relay sends a
+/// subscriber (e.g. `OutdatedCursor`). It carries no DID, so the row's
+/// `did` column holds the empty string. `message` is optional. Body:
+/// `{name, message?}`.
+pub fn appendInfo(
+    db: *c.sqlite3,
+    name: []const u8,
+    message: []const u8,
+    ts: i64,
+) StorageError!i64 {
+    var buf: [512]u8 = undefined;
+    const body = encodeInfoBody(name, message, &buf) catch return error.StepFailed;
+    return appendKind(db, .info, "", "", body, ts);
+}
+
 const dag = @import("dag_cbor.zig");
 
 fn encodeIdentityBody(did: []const u8, handle: []const u8, out: []u8) !([]const u8) {
@@ -212,6 +266,52 @@ fn encodeTombstoneBody(did: []const u8, out: []u8) !([]const u8) {
     try enc.writeText(did);
     try enc.writeText("time");
     try enc.writeText("");
+    return enc.written();
+}
+
+fn encodeHandleBody(did: []const u8, handle: []const u8, out: []u8) !([]const u8) {
+    var enc = dag.Encoder.init(out);
+    // Keys (length-then-lex): "did" (3) < "time" (4) < "handle" (6).
+    try enc.writeMapHeader(3);
+    try enc.writeText("did");
+    try enc.writeText(did);
+    try enc.writeText("time");
+    try enc.writeText("");
+    try enc.writeText("handle");
+    try enc.writeText(handle);
+    return enc.written();
+}
+
+fn encodeMigrateBody(did: []const u8, migrate_to: []const u8, out: []u8) !([]const u8) {
+    var enc = dag.Encoder.init(out);
+    // Keys (length-then-lex): "did" (3) < "time" (4) < "migrateTo" (9).
+    // The lexicon types `migrateTo` as a nullable string; when no target
+    // is known we encode an explicit null rather than omitting the key.
+    try enc.writeMapHeader(3);
+    try enc.writeText("did");
+    try enc.writeText(did);
+    try enc.writeText("time");
+    try enc.writeText("");
+    try enc.writeText("migrateTo");
+    if (migrate_to.len > 0) {
+        try enc.writeText(migrate_to);
+    } else {
+        try enc.writeNull();
+    }
+    return enc.written();
+}
+
+fn encodeInfoBody(name: []const u8, message: []const u8, out: []u8) !([]const u8) {
+    var enc = dag.Encoder.init(out);
+    const have_message = message.len > 0;
+    // Keys (length-then-lex): "name" (4) < "message" (7).
+    try enc.writeMapHeader(if (have_message) 2 else 1);
+    try enc.writeText("name");
+    try enc.writeText(name);
+    if (have_message) {
+        try enc.writeText("message");
+        try enc.writeText(message);
+    }
     return enc.written();
 }
 
@@ -435,4 +535,217 @@ test "AT-3: encodeIdentityBody omits handle when empty" {
     // Map of length 2 → 0xA2
     try testing.expectEqual(@as(u8, 0xA2), body[0]);
     try testing.expect(std.mem.indexOf(u8, body, "handle") == null);
+}
+
+// AT1: read a single event's raw CBOR body for a given seq. Test-only;
+// `readSince` deliberately omits the body to keep the live-tail Event
+// struct fixed-size, so we go straight to the persistent table here.
+fn readBodyForSeq(db: *c.sqlite3, seq: i64, out: []u8) StorageError![]const u8 {
+    const sql = "SELECT body FROM atp_firehose_events WHERE seq = ?";
+    var stmt: ?*c.sqlite3_stmt = null;
+    if (c.sqlite3_prepare_v2(db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.PrepareFailed;
+    defer _ = c.sqlite3_finalize(stmt);
+    _ = c.sqlite3_bind_int64(stmt, 1, seq);
+    if (c.sqlite3_step(stmt.?) != c.SQLITE_ROW) return error.StepFailed;
+    const ptr = c.sqlite3_column_blob(stmt, 0);
+    const len: usize = @intCast(c.sqlite3_column_bytes(stmt, 0));
+    if (len == 0 or ptr == null) return out[0..0];
+    const cap = @min(len, out.len);
+    const src: [*]const u8 = @ptrCast(ptr);
+    @memcpy(out[0..cap], src[0..cap]);
+    return out[0..cap];
+}
+
+/// AT1: result of scanning a flat CBOR map body for one key's value.
+const FieldResult = struct {
+    found: bool = false,
+    found_null: bool = false,
+    value_buf: [256]u8 = undefined,
+    value_len: usize = 0,
+
+    fn value(self: *const FieldResult) []const u8 {
+        return self.value_buf[0..self.value_len];
+    }
+};
+
+/// AT1: decode a flat CBOR map (`{key: <text|null|...>}`) and capture
+/// the value bound to `key`. Map values in these firehose bodies are
+/// only text or null, so we read each key, then its value event, pairing
+/// them positionally. Used by tests to verify body shapes.
+fn grabField(body: []const u8, key: []const u8) FieldResult {
+    var res: FieldResult = .{};
+    var dec = dag.Decoder.init(body);
+    const head = dec.nextEvent() catch return res;
+    const pairs = switch (head) {
+        .map_start => |n| n,
+        else => return res,
+    };
+    var i: u64 = 0;
+    while (i < pairs) : (i += 1) {
+        const k_ev = dec.nextEvent() catch return res;
+        const k = switch (k_ev) {
+            .text => |s| s,
+            else => return res, // DAG-CBOR map keys are always text
+        };
+        const v_ev = dec.nextEvent() catch return res;
+        if (std.mem.eql(u8, k, key)) {
+            switch (v_ev) {
+                .text => |s| {
+                    const cap = @min(s.len, res.value_buf.len);
+                    @memcpy(res.value_buf[0..cap], s[0..cap]);
+                    res.value_len = cap;
+                    res.found = true;
+                },
+                .null_ => {
+                    res.found = true;
+                    res.found_null = true;
+                },
+                else => res.found = true,
+            }
+            return res;
+        }
+    }
+    return res;
+}
+
+fn randAlpha(rand: std.Random, out: []u8) []const u8 {
+    const len = 6 + rand.intRangeAtMost(usize, 0, out.len - 6);
+    for (out[0..len]) |*ch| ch.* = "abcdefghijklmnopqrstuvwxyz0123456789"[rand.intRangeLessThan(usize, 0, 36)];
+    return out[0..len];
+}
+
+test "AT1: appendHandle writes #handle row with decodable {did,handle,time}" {
+    const db = try setupDb();
+    defer core.storage.sqlite.closeDb(db);
+
+    var prng = std.Random.DefaultPrng.init(0xA1_C0_FF_EE);
+    const rand = prng.random();
+    var did_buf: [40]u8 = undefined;
+    var hdl_buf: [40]u8 = undefined;
+    @memcpy(did_buf[0..8], "did:plc:");
+    const did_tail = randAlpha(rand, did_buf[8..]);
+    const did = did_buf[0 .. 8 + did_tail.len];
+    const handle = randAlpha(rand, &hdl_buf);
+
+    const seq = try appendHandle(db, did, handle, @intCast(rand.int(u32)));
+
+    var out: [4]Event = undefined;
+    const n = try readSince(db, seq - 1, &out);
+    try testing.expectEqual(@as(u32, 1), n);
+    try testing.expectEqual(EventKind.handle, out[0].kind);
+    try testing.expectEqualStrings(did, out[0].did());
+
+    var body_buf: [512]u8 = undefined;
+    const body = try readBodyForSeq(db, seq, &body_buf);
+    try testing.expectEqual(@as(u8, 0xA3), body[0]); // map(3)
+    const fdid = grabField(body, "did");
+    const fhandle = grabField(body, "handle");
+    try testing.expect(fdid.found and fhandle.found);
+    try testing.expectEqualStrings(did, fdid.value());
+    try testing.expectEqualStrings(handle, fhandle.value());
+}
+
+test "AT1: appendMigrate encodes migrateTo string when target known" {
+    const db = try setupDb();
+    defer core.storage.sqlite.closeDb(db);
+
+    var prng = std.Random.DefaultPrng.init(0xB2_D0_CA_FE);
+    const rand = prng.random();
+    var did_buf: [40]u8 = undefined;
+    var tgt_buf: [40]u8 = undefined;
+    @memcpy(did_buf[0..8], "did:plc:");
+    const did_tail = randAlpha(rand, did_buf[8..]);
+    const did = did_buf[0 .. 8 + did_tail.len];
+    @memcpy(tgt_buf[0..8], "did:web:");
+    const tgt_tail = randAlpha(rand, tgt_buf[8..]);
+    const target = tgt_buf[0 .. 8 + tgt_tail.len];
+
+    const seq = try appendMigrate(db, did, target, @intCast(rand.int(u32)));
+
+    var out: [4]Event = undefined;
+    const n = try readSince(db, seq - 1, &out);
+    try testing.expectEqual(@as(u32, 1), n);
+    try testing.expectEqual(EventKind.migrate, out[0].kind);
+
+    var body_buf: [512]u8 = undefined;
+    const body = try readBodyForSeq(db, seq, &body_buf);
+    try testing.expectEqual(@as(u8, 0xA3), body[0]); // map(3)
+    const fdid = grabField(body, "did");
+    const ftarget = grabField(body, "migrateTo");
+    try testing.expect(fdid.found and ftarget.found);
+    try testing.expect(!ftarget.found_null);
+    try testing.expectEqualStrings(did, fdid.value());
+    try testing.expectEqualStrings(target, ftarget.value());
+}
+
+test "AT1: appendMigrate encodes migrateTo null when target absent" {
+    const db = try setupDb();
+    defer core.storage.sqlite.closeDb(db);
+
+    var prng = std.Random.DefaultPrng.init(0xC3_E0_FA_CE);
+    const rand = prng.random();
+    var did_buf: [40]u8 = undefined;
+    @memcpy(did_buf[0..8], "did:plc:");
+    const did_tail = randAlpha(rand, did_buf[8..]);
+    const did = did_buf[0 .. 8 + did_tail.len];
+
+    const seq = try appendMigrate(db, did, "", @intCast(rand.int(u32)));
+
+    var body_buf: [512]u8 = undefined;
+    const body = try readBodyForSeq(db, seq, &body_buf);
+    try testing.expectEqual(@as(u8, 0xA3), body[0]); // map(3)
+    // Explicit CBOR null (0xf6) present in the body.
+    try testing.expect(std.mem.indexOfScalar(u8, body, 0xf6) != null);
+    const ftarget = grabField(body, "migrateTo");
+    try testing.expect(ftarget.found and ftarget.found_null);
+}
+
+test "AT1: appendInfo emits #info row with name + optional message" {
+    const db = try setupDb();
+    defer core.storage.sqlite.closeDb(db);
+
+    var prng = std.Random.DefaultPrng.init(0xD4_F0_DE_AD);
+    const rand = prng.random();
+    var name_buf: [40]u8 = undefined;
+    var msg_buf: [40]u8 = undefined;
+    const name = randAlpha(rand, &name_buf);
+    const message = randAlpha(rand, &msg_buf);
+
+    const seq = try appendInfo(db, name, message, @intCast(rand.int(u32)));
+
+    var out: [4]Event = undefined;
+    const n = try readSince(db, seq - 1, &out);
+    try testing.expectEqual(@as(u32, 1), n);
+    try testing.expectEqual(EventKind.info, out[0].kind);
+    // #info carries no DID.
+    try testing.expectEqualStrings("", out[0].did());
+
+    var body_buf: [512]u8 = undefined;
+    const body = try readBodyForSeq(db, seq, &body_buf);
+    try testing.expectEqual(@as(u8, 0xA2), body[0]); // map(2)
+    const fname = grabField(body, "name");
+    const fmsg = grabField(body, "message");
+    try testing.expect(fname.found and fmsg.found);
+    try testing.expectEqualStrings(name, fname.value());
+    try testing.expectEqualStrings(message, fmsg.value());
+}
+
+test "AT1: appendInfo omits message when empty (map of 1)" {
+    const db = try setupDb();
+    defer core.storage.sqlite.closeDb(db);
+
+    var prng = std.Random.DefaultPrng.init(0xE5_AB_CD_01);
+    const rand = prng.random();
+    var name_buf: [40]u8 = undefined;
+    const name = randAlpha(rand, &name_buf);
+
+    const seq = try appendInfo(db, name, "", @intCast(rand.int(u32)));
+
+    var body_buf: [512]u8 = undefined;
+    const body = try readBodyForSeq(db, seq, &body_buf);
+    try testing.expectEqual(@as(u8, 0xA1), body[0]); // map(1)
+    try testing.expect(std.mem.indexOf(u8, body, "message") == null);
+    const fname = grabField(body, "name");
+    try testing.expect(fname.found);
+    try testing.expectEqualStrings(name, fname.value());
 }
