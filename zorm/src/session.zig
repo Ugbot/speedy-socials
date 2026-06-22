@@ -114,6 +114,16 @@ pub fn Session(comptime T: type, comptime capacity: usize) type {
             return &slot.live;
         }
 
+        /// Insert `value`, or update its non-PK columns on a PK collision
+        /// (an upsert), executed immediately against the backend — it does
+        /// NOT go through the unit-of-work batch. This bypasses the identity
+        /// map and dirty tracking (the conflict resolution happens in the
+        /// engine), so it is a direct, side-effecting write distinct from the
+        /// `add`/`flush` path; existing flush semantics are untouched.
+        pub fn upsert(self: *Self, value: *T) Error!void {
+            return crud.upsert(T, self.backend, value);
+        }
+
         /// Mark a managed entity for deletion on the next `flush`.
         pub fn remove(self: *Self, entity: *T) void {
             for (self.slots[0..]) |*s| {
@@ -354,6 +364,28 @@ test "unit of work: insert + update + delete batched in one flush" {
     try testing.expectEqualStrings("kept", (try s.get("keep")).?.handle.slice());
     try testing.expect((try s.get("drop")) == null);
     try testing.expectEqualStrings("f", (try s.get("fresh")).?.handle.slice());
+}
+
+test "Session.upsert: insert then upsert the same PK updates, no duplicate" {
+    var db = mock.MockBackend.init();
+    var s = Session(Account, 16).init(db.backend(.sqlite));
+
+    var a = newAccount("dup", "before");
+    a.role = .member;
+    try s.upsert(&a);
+
+    var a2 = newAccount("dup", "after");
+    a2.role = .admin;
+    a2.score = 4.25;
+    try s.upsert(&a2);
+
+    // Reload through the session's identity map: the row is updated.
+    const got = (try s.get("dup")).?;
+    try testing.expectEqualStrings("after", got.handle.slice());
+    try testing.expectEqual(Role.admin, got.role);
+    try testing.expectEqual(@as(f64, 4.25), got.score);
+    // Exactly one physical row for that PK.
+    try testing.expectEqual(@as(usize, 1), db.rowCount("atp_accounts"));
 }
 
 test "entityEql compares logical values, ignoring buffer tails" {

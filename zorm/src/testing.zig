@@ -134,7 +134,11 @@ pub const MockBackend = struct {
 
     fn execImpl(ptr: *anyopaque, sql: []const u8, args: []const BindValue) Error!void {
         const self: *MockBackend = @ptrCast(@alignCast(ptr));
-        if (std.mem.startsWith(u8, sql, "INSERT INTO ")) {
+        if (std.mem.startsWith(u8, sql, "MERGE ")) {
+            try self.doUpsertMerge(sql, args);
+        } else if (std.mem.startsWith(u8, sql, "INSERT INTO ") and isUpsert(sql)) {
+            try self.doUpsertInsert(sql, args);
+        } else if (std.mem.startsWith(u8, sql, "INSERT INTO ")) {
             _ = try self.doInsert(sql, args);
         } else if (std.mem.startsWith(u8, sql, "UPDATE ")) {
             try self.doUpdate(sql, args);
@@ -348,7 +352,192 @@ pub const MockBackend = struct {
         }
         return null;
     }
+
+    /// Number of present rows in `table_name` (0 if the table is unknown).
+    /// Test helper for asserting that an upsert updated rather than appended.
+    /// Identifier-quote insensitive: the mock stores tables under their
+    /// quoted name (e.g. `"atp_accounts"`), so callers may pass either form.
+    pub fn rowCount(self: *MockBackend, table_name: []const u8) usize {
+        const want = unquote(table_name);
+        var i: usize = 0;
+        while (i < self.table_count) : (i += 1) {
+            if (!std.mem.eql(u8, unquote(self.tables[i].nameSlice()), want)) continue;
+            var n: usize = 0;
+            var r: usize = 0;
+            while (r < self.tables[i].row_count) : (r += 1) {
+                if (self.tables[i].rows[r].present) n += 1;
+            }
+            return n;
+        }
+        return 0;
+    }
+
+    /// `INSERT … (cols) VALUES (…) ON CONFLICT (<pk>) DO UPDATE SET …` (or
+    /// MySQL's `ON DUPLICATE KEY UPDATE`). Resolved by the PK (the first
+    /// column zorm emits for an upsert): if a row with that key exists, its
+    /// supplied columns are overwritten; otherwise a new row is inserted.
+    /// The bind order is identical to a plain INSERT (cols, in order).
+    fn doUpsertInsert(self: *MockBackend, sql: []const u8, args: []const BindValue) Error!void {
+        const tname = between(sql, "INSERT INTO ", " (") orelse return Error.BadStatement;
+        const cols_str = between(sql, " (", ")") orelse return Error.BadStatement;
+        // The conflict key column: ON CONFLICT ("pk") for sqlite/postgres.
+        // MySQL keys on whatever UNIQUE/PK collides; zorm always lists the PK
+        // first in the column list, so use it as the key for the mock.
+        const key_col = conflictKey(sql) orelse firstCol(cols_str) orelse return Error.BadStatement;
+        const t = self.table(tname);
+
+        // Locate the key's bind value by its position in the column list.
+        var key_idx: ?usize = null;
+        {
+            var it = std.mem.splitSequence(u8, cols_str, ", ");
+            var i: usize = 0;
+            while (it.next()) |c| : (i += 1) {
+                if (std.mem.eql(u8, c, key_col)) {
+                    key_idx = i;
+                    break;
+                }
+            }
+        }
+        const existing: ?*Row = if (key_idx) |ki|
+            (if (ki < args.len) self.findRow(t, key_col, args[ki]) else null)
+        else
+            null;
+
+        if (existing) |row| {
+            // Conflict → overwrite every supplied column on the existing row.
+            var it = std.mem.splitSequence(u8, cols_str, ", ");
+            var i: usize = 0;
+            while (it.next()) |col_name| : (i += 1) {
+                if (i >= args.len) return Error.BadBinding;
+                if (row.findCell(col_name)) |cell| {
+                    cell.setFromBind(args[i]);
+                } else {
+                    var cell = &row.cells[row.cell_count];
+                    cell.* = .{};
+                    cell.setName(col_name);
+                    cell.setFromBind(args[i]);
+                    row.cell_count += 1;
+                }
+            }
+            self.change_count = 1;
+            return;
+        }
+        // No conflict → behave exactly like an INSERT (cols list only).
+        std.debug.assert(t.row_count < max_rows);
+        self.next_rowid += 1;
+        const rowid = self.next_rowid;
+        self.last_insert = rowid;
+        var row = &t.rows[t.row_count];
+        row.* = .{ .rowid = rowid, .present = true };
+        var it = std.mem.splitSequence(u8, cols_str, ", ");
+        var i: usize = 0;
+        while (it.next()) |col_name| : (i += 1) {
+            if (i >= args.len) return Error.BadBinding;
+            var cell = &row.cells[row.cell_count];
+            cell.* = .{};
+            cell.setName(col_name);
+            cell.setFromBind(args[i]);
+            row.cell_count += 1;
+        }
+        t.row_count += 1;
+        self.change_count = 1;
+    }
+
+    /// `MERGE <t> AS tgt USING (VALUES(…)) AS src (cols) ON tgt.<pk>=src.<pk>
+    /// WHEN MATCHED … WHEN NOT MATCHED THEN INSERT (cols) VALUES (…)` — the
+    /// SQL Server upsert. Same resolution as `doUpsertInsert`: match on the
+    /// PK, overwrite the supplied columns or insert a fresh row.
+    fn doUpsertMerge(self: *MockBackend, sql: []const u8, args: []const BindValue) Error!void {
+        const tname = between(sql, "MERGE ", " AS tgt") orelse return Error.BadStatement;
+        const cols_str = between(sql, " AS src (", ")") orelse return Error.BadStatement;
+        // ON tgt.<pk> = src.<pk> → grab the bracketed pk after "ON tgt.".
+        const key_col = between(sql, " ON tgt.", " = src.") orelse return Error.BadStatement;
+        const t = self.table(tname);
+
+        var key_idx: ?usize = null;
+        {
+            var it = std.mem.splitSequence(u8, cols_str, ", ");
+            var i: usize = 0;
+            while (it.next()) |c| : (i += 1) {
+                if (std.mem.eql(u8, c, key_col)) {
+                    key_idx = i;
+                    break;
+                }
+            }
+        }
+        const existing: ?*Row = if (key_idx) |ki|
+            (if (ki < args.len) self.findRow(t, key_col, args[ki]) else null)
+        else
+            null;
+
+        if (existing) |row| {
+            var it = std.mem.splitSequence(u8, cols_str, ", ");
+            var i: usize = 0;
+            while (it.next()) |col_name| : (i += 1) {
+                if (i >= args.len) return Error.BadBinding;
+                if (row.findCell(col_name)) |cell| {
+                    cell.setFromBind(args[i]);
+                } else {
+                    var cell = &row.cells[row.cell_count];
+                    cell.* = .{};
+                    cell.setName(col_name);
+                    cell.setFromBind(args[i]);
+                    row.cell_count += 1;
+                }
+            }
+            self.change_count = 1;
+            return;
+        }
+        std.debug.assert(t.row_count < max_rows);
+        self.next_rowid += 1;
+        const rowid = self.next_rowid;
+        self.last_insert = rowid;
+        var row = &t.rows[t.row_count];
+        row.* = .{ .rowid = rowid, .present = true };
+        var it = std.mem.splitSequence(u8, cols_str, ", ");
+        var i: usize = 0;
+        while (it.next()) |col_name| : (i += 1) {
+            if (i >= args.len) return Error.BadBinding;
+            var cell = &row.cells[row.cell_count];
+            cell.* = .{};
+            cell.setName(col_name);
+            cell.setFromBind(args[i]);
+            row.cell_count += 1;
+        }
+        t.row_count += 1;
+        self.change_count = 1;
+    }
 };
+
+/// Strip one layer of identifier quoting (`"x"`, `` `x` ``, `[x]`).
+fn unquote(name: []const u8) []const u8 {
+    if (name.len >= 2) {
+        const a = name[0];
+        const b = name[name.len - 1];
+        if ((a == '"' and b == '"') or (a == '`' and b == '`') or (a == '[' and b == ']')) {
+            return name[1 .. name.len - 1];
+        }
+    }
+    return name;
+}
+
+/// Is this INSERT actually an upsert (carries a conflict-resolution clause)?
+fn isUpsert(sql: []const u8) bool {
+    return std.mem.indexOf(u8, sql, " ON CONFLICT ") != null or
+        std.mem.indexOf(u8, sql, " ON DUPLICATE KEY UPDATE ") != null;
+}
+
+/// The conflict key column for an `ON CONFLICT (<col>)` clause (null for
+/// MySQL's `ON DUPLICATE KEY UPDATE`, which names no column).
+fn conflictKey(sql: []const u8) ?[]const u8 {
+    return between(sql, " ON CONFLICT (", ")");
+}
+
+/// First column name in a `"a", "b", …` column list.
+fn firstCol(cols_str: []const u8) ?[]const u8 {
+    var it = std.mem.splitSequence(u8, cols_str, ", ");
+    return it.next();
+}
 
 /// Value of `row`'s key column. If the column wasn't stored (an auto PK
 /// omitted at INSERT), the row's synthetic rowid stands in.

@@ -73,6 +73,119 @@ fn buildInsert(comptime T: type, comptime dialect: Dialect) []const u8 {
     }
 }
 
+/// `INSERT … <conflict resolution on PK>` — an upsert. The row is supplied
+/// in full (every non-auto-PK column, same bind order as `buildInsert`), and
+/// on a PK collision the NON-PK columns are overwritten with the incoming
+/// values; the PK itself is the conflict key (never in the SET list).
+///
+/// Auto-PK note: an `AutoPk` entity has its id DB-assigned and omitted from
+/// the INSERT column list, so the conflict target is that auto id. A freshly
+/// added row (id unset) can never collide with an existing auto id, so for
+/// auto-PK entities `upsert` degrades to a plain INSERT-with-new-id; it only
+/// updates when the caller re-supplies a known id (not expressible through
+/// the auto-PK INSERT, which omits id). Upsert is therefore meaningful for
+/// text / explicit PKs; for auto PKs it is a safe INSERT. The conflict clause
+/// is still emitted so a caller who DOES write the id (via a non-auto path)
+/// gets correct semantics.
+fn buildUpsert(comptime T: type, comptime dialect: Dialect) []const u8 {
+    const info = reflect.TableInfo(T);
+    comptime {
+        // Column list + value placeholders, identical to buildInsert: every
+        // non-auto-PK column in TableInfo order.
+        var cols: []const u8 = "";
+        var vals: []const u8 = "";
+        var src_cols: []const u8 = ""; // MERGE source column aliases
+        var n: usize = 0;
+        for (info.columns) |col| {
+            if (col.pk_auto) continue;
+            if (n > 0) {
+                cols = cols ++ ", ";
+                vals = vals ++ ", ";
+                src_cols = src_cols ++ ", ";
+            }
+            cols = cols ++ quoteIdent(col.name, dialect);
+            vals = vals ++ dialect.placeholder(n + 1);
+            src_cols = src_cols ++ quoteIdent(col.name, dialect);
+            n += 1;
+        }
+
+        const pk = quoteIdent(info.pk_column.name, dialect);
+        const table = quoteIdent(info.table, dialect);
+
+        switch (dialect) {
+            // SQLite / Postgres share the ON CONFLICT (<pk>) DO UPDATE SET
+            // col = excluded.col form. SQLite spells the pseudo-table
+            // `excluded`, Postgres `EXCLUDED`.
+            .sqlite, .postgres => {
+                const ref = if (dialect == .sqlite) "excluded." else "EXCLUDED.";
+                var sets: []const u8 = "";
+                var m: usize = 0;
+                for (info.columns) |col| {
+                    if (col.is_pk) continue;
+                    if (m > 0) sets = sets ++ ", ";
+                    const c = quoteIdent(col.name, dialect);
+                    sets = sets ++ c ++ " = " ++ ref ++ c;
+                    m += 1;
+                }
+                var s: []const u8 = "INSERT INTO " ++ table ++ " (" ++ cols ++ ") VALUES (" ++ vals ++ ")" ++
+                    " ON CONFLICT (" ++ pk ++ ") DO UPDATE SET " ++ sets;
+                // No non-PK columns (a PK-only table): nothing to update on
+                // conflict — fall back to DO NOTHING so the statement is valid.
+                if (m == 0) s = "INSERT INTO " ++ table ++ " (" ++ cols ++ ") VALUES (" ++ vals ++ ")" ++
+                    " ON CONFLICT (" ++ pk ++ ") DO NOTHING";
+                return s;
+            },
+            // MySQL: INSERT … ON DUPLICATE KEY UPDATE col = VALUES(col).
+            .mysql => {
+                var sets: []const u8 = "";
+                var m: usize = 0;
+                for (info.columns) |col| {
+                    if (col.is_pk) continue;
+                    if (m > 0) sets = sets ++ ", ";
+                    const c = quoteIdent(col.name, dialect);
+                    sets = sets ++ c ++ " = VALUES(" ++ c ++ ")";
+                    m += 1;
+                }
+                if (m == 0) {
+                    // PK-only: a no-op assignment keeps the statement valid +
+                    // idempotent (re-assign the PK to itself).
+                    sets = pk ++ " = VALUES(" ++ pk ++ ")";
+                }
+                return "INSERT INTO " ++ table ++ " (" ++ cols ++ ") VALUES (" ++ vals ++ ")" ++
+                    " ON DUPLICATE KEY UPDATE " ++ sets;
+            },
+            // SQL Server has no INSERT…ON CONFLICT; the portable upsert is a
+            // MERGE keyed on the PK.
+            .mssql => {
+                // The placeholders are bound exactly ONCE — in the USING
+                // source row. Both the UPDATE SET and the NOT-MATCHED INSERT
+                // reference the source columns (`src.<col>`), so the bind
+                // order stays 1..N (same as buildInsert) with no re-binding.
+                var sets: []const u8 = "";
+                var ins_vals: []const u8 = ""; // src.col, … for the INSERT
+                var m: usize = 0;
+                var k: usize = 0;
+                for (info.columns) |col| {
+                    if (col.pk_auto) continue;
+                    const c = quoteIdent(col.name, dialect);
+                    if (k > 0) ins_vals = ins_vals ++ ", ";
+                    ins_vals = ins_vals ++ "src." ++ c;
+                    k += 1;
+                    if (col.is_pk) continue;
+                    if (m > 0) sets = sets ++ ", ";
+                    sets = sets ++ c ++ " = src." ++ c;
+                    m += 1;
+                }
+                var s: []const u8 = "MERGE " ++ table ++ " AS tgt USING (VALUES (" ++ vals ++ ")) AS src (" ++ src_cols ++ ")" ++
+                    " ON tgt." ++ pk ++ " = src." ++ pk;
+                if (m > 0) s = s ++ " WHEN MATCHED THEN UPDATE SET " ++ sets;
+                s = s ++ " WHEN NOT MATCHED THEN INSERT (" ++ cols ++ ") VALUES (" ++ ins_vals ++ ");";
+                return s;
+            },
+        }
+    }
+}
+
 fn buildSelectByPk(comptime T: type, comptime dialect: Dialect) []const u8 {
     const info = reflect.TableInfo(T);
     comptime {
@@ -153,6 +266,22 @@ pub fn update(comptime T: type, dialect: Dialect) []const u8 {
         .postgres => comptime buildUpdate(T, .postgres),
         .mysql => comptime buildUpdate(T, .mysql),
         .mssql => comptime buildUpdate(T, .mssql),
+    };
+}
+
+/// `INSERT … <conflict resolution>` — upsert keyed on the PK. On a PK
+/// collision the non-PK columns are overwritten with the incoming row; the
+/// bind order matches `insert` (every non-auto-PK column, 1..k). Dialects:
+///   sqlite   → `… ON CONFLICT (<pk>) DO UPDATE SET col = excluded.col …`
+///   postgres → `… ON CONFLICT (<pk>) DO UPDATE SET col = EXCLUDED.col …`
+///   mysql    → `… ON DUPLICATE KEY UPDATE col = VALUES(col) …`
+///   mssql    → `MERGE … WHEN MATCHED THEN UPDATE … WHEN NOT MATCHED THEN INSERT …`
+pub fn upsert(comptime T: type, dialect: Dialect) []const u8 {
+    return switch (dialect) {
+        .sqlite => comptime buildUpsert(T, .sqlite),
+        .postgres => comptime buildUpsert(T, .postgres),
+        .mysql => comptime buildUpsert(T, .mysql),
+        .mssql => comptime buildUpsert(T, .mssql),
     };
 }
 
@@ -256,6 +385,73 @@ test "MS SQL: @pN placeholders, OUTPUT INSERTED for auto PK" {
     try testing.expectEqualStrings(
         "DELETE FROM [things] WHERE [id] = @p1",
         deleteByPk(AutoEntity, .mssql),
+    );
+}
+
+test "UPSERT: SQLite ON CONFLICT DO UPDATE SET col = excluded.col" {
+    try testing.expectEqualStrings(
+        "INSERT INTO \"atp_accounts\" (\"id\", \"handle\", \"email\", \"role\") VALUES (?, ?, ?, ?)" ++
+            " ON CONFLICT (\"id\") DO UPDATE SET \"handle\" = excluded.\"handle\", \"email\" = excluded.\"email\", \"role\" = excluded.\"role\"",
+        upsert(Account, .sqlite),
+    );
+}
+
+test "UPSERT: Postgres ON CONFLICT DO UPDATE SET col = EXCLUDED.col, $N placeholders" {
+    try testing.expectEqualStrings(
+        "INSERT INTO \"atp_accounts\" (\"id\", \"handle\", \"email\", \"role\") VALUES ($1, $2, $3, $4)" ++
+            " ON CONFLICT (\"id\") DO UPDATE SET \"handle\" = EXCLUDED.\"handle\", \"email\" = EXCLUDED.\"email\", \"role\" = EXCLUDED.\"role\"",
+        upsert(Account, .postgres),
+    );
+}
+
+test "UPSERT: MySQL ON DUPLICATE KEY UPDATE col = VALUES(col)" {
+    try testing.expectEqualStrings(
+        "INSERT INTO `atp_accounts` (`id`, `handle`, `email`, `role`) VALUES (?, ?, ?, ?)" ++
+            " ON DUPLICATE KEY UPDATE `handle` = VALUES(`handle`), `email` = VALUES(`email`), `role` = VALUES(`role`)",
+        upsert(Account, .mysql),
+    );
+}
+
+test "UPSERT: MS SQL MERGE keyed on PK, source bound once" {
+    try testing.expectEqualStrings(
+        "MERGE [atp_accounts] AS tgt USING (VALUES (@p1, @p2, @p3, @p4)) AS src ([id], [handle], [email], [role])" ++
+            " ON tgt.[id] = src.[id]" ++
+            " WHEN MATCHED THEN UPDATE SET [handle] = src.[handle], [email] = src.[email], [role] = src.[role]" ++
+            " WHEN NOT MATCHED THEN INSERT ([id], [handle], [email], [role]) VALUES (src.[id], src.[handle], src.[email], src.[role]);",
+        upsert(Account, .mssql),
+    );
+}
+
+test "UPSERT: auto-PK entity omits the id column, conflict targets the auto id" {
+    // The auto PK is DB-assigned, so it is absent from the column list; the
+    // conflict key is still the auto id and the lone non-PK column is updated.
+    try testing.expectEqualStrings(
+        "INSERT INTO \"things\" (\"name\") VALUES (?)" ++
+            " ON CONFLICT (\"id\") DO UPDATE SET \"name\" = excluded.\"name\"",
+        upsert(AutoEntity, .sqlite),
+    );
+    try testing.expectEqualStrings(
+        "INSERT INTO `things` (`name`) VALUES (?)" ++
+            " ON DUPLICATE KEY UPDATE `name` = VALUES(`name`)",
+        upsert(AutoEntity, .mysql),
+    );
+    try testing.expectEqualStrings(
+        "MERGE [things] AS tgt USING (VALUES (@p1)) AS src ([name])" ++
+            " ON tgt.[id] = src.[id]" ++
+            " WHEN MATCHED THEN UPDATE SET [name] = src.[name]" ++
+            " WHEN NOT MATCHED THEN INSERT ([name]) VALUES (src.[name]);",
+        upsert(AutoEntity, .mssql),
+    );
+}
+
+test "UPSERT: PK-only table degrades to DO NOTHING (sqlite/postgres)" {
+    const PkOnly = struct {
+        pub const zorm_table = "tags";
+        id: fields.Pk(32) = .{},
+    };
+    try testing.expectEqualStrings(
+        "INSERT INTO \"tags\" (\"id\") VALUES (?) ON CONFLICT (\"id\") DO NOTHING",
+        upsert(PkOnly, .sqlite),
     );
 }
 

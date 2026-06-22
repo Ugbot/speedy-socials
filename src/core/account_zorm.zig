@@ -113,6 +113,49 @@ test "zorm/SQLite: CRUD round-trip of the account row (randomized)" {
     try std.testing.expect(!try repo.findByPk("did:plc:absent", &none));
 }
 
+test "zorm/SQLite: upsert inserts then updates the same PK without duplicating (real engine)" {
+    const db = try sqlite.openWriter(":memory:");
+    defer sqlite.closeDb(db);
+    var be: storage.SqliteBackend = undefined;
+    var adapter: storage.zorm_adapter.Adapter = undefined;
+    const zb = try sqliteZorm(ZAccount, db, &be, &adapter);
+
+    var prng = std.Random.DefaultPrng.init(0x0095E4701);
+    const rand = prng.random();
+
+    var i: usize = 0;
+    while (i < 20) : (i += 1) {
+        // First upsert of a brand-new key behaves like an INSERT.
+        var a = randAccount(rand, i);
+        try zorm.upsert(ZAccount, zb, &a); // INSERT … ON CONFLICT("id") DO UPDATE …
+
+        var got: ZAccount = .{};
+        try std.testing.expect(try zorm.findByPk(ZAccount, zb, a.id.slice(), &got));
+        try expectSameAccount(&a, &got);
+
+        // Second upsert of the SAME key with changed columns must UPDATE the
+        // existing row — not raise a UNIQUE violation, not add a second row.
+        var b2 = a; // same id
+        b2.handle.set("changed.test");
+        b2.email.set("changed@mail.test");
+        b2.state = .suspended;
+        b2.email_confirmed = !a.email_confirmed;
+        b2.created_at = .{ .unix = rand.int(i32) };
+        try zorm.upsert(ZAccount, zb, &b2);
+
+        var got2: ZAccount = .{};
+        try std.testing.expect(try zorm.findByPk(ZAccount, zb, a.id.slice(), &got2));
+        try expectSameAccount(&b2, &got2);
+    }
+
+    // Exactly `20` rows exist (one per distinct key) — upsert updated, never
+    // duplicated. Count via the query builder over the whole table.
+    var out: [64]ZAccount = undefined;
+    var q = zorm.Query(ZAccount).init(.sqlite);
+    const n = try q.all(zb, &out);
+    try std.testing.expectEqual(@as(usize, 20), n);
+}
+
 test "zorm/SQLite: Session unit-of-work batches insert+update+delete in one txn" {
     const db = try sqlite.openWriter(":memory:");
     defer sqlite.closeDb(db);

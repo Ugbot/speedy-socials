@@ -58,6 +58,23 @@ pub fn findByPk(comptime T: type, backend: Backend, pk: bind.PkValue(T), out: *T
     return true;
 }
 
+/// Insert `value`, or — on a primary-key collision — update its non-PK
+/// columns to the supplied values (an upsert). Binds the full row exactly
+/// like `insert` (every non-auto-PK column, in `TableInfo` order) and execs
+/// the dialect's conflict-resolution statement.
+///
+/// No RETURNING / id write-back: an upsert may either insert (a new id) or
+/// update (an existing id), and the dialects disagree on what they can return
+/// (MySQL ON DUPLICATE KEY / SQL Server MERGE do not yield the row uniformly),
+/// so the auto-PK field is NOT populated here. Callers that need the assigned
+/// id for a fresh row should `insert` instead; `upsert` targets text/explicit
+/// PKs where the key is caller-supplied and already known.
+pub fn upsert(comptime T: type, backend: Backend, value: *T) Error!void {
+    var args: [max_columns]BindValue = undefined;
+    const n = bind.bindInsert(T, value, &args);
+    try backend.exec(sql.upsert(T, backend.dialect), args[0..n]);
+}
+
 /// Persist all non-PK columns of `value`, matched by its PK.
 pub fn update(comptime T: type, backend: Backend, value: *const T) Error!void {
     var args: [max_columns]BindValue = undefined;
@@ -187,6 +204,56 @@ test "insert assigns an auto PK via lastInsertId (SQLite path)" {
     var got: Thing = .{};
     try testing.expect(try findByPk(Thing, backend, t1.id.value, &got));
     try testing.expectEqualStrings("first", got.name.slice());
+}
+
+test "upsert: same PK twice updates the row instead of duplicating it" {
+    var db = mock.MockBackend.init();
+    const backend = db.backend(.sqlite);
+
+    // First upsert behaves as an insert.
+    var a = Account{
+        .id = fields.Pk(64).from("did:plc:up"),
+        .handle = fields.Text(64).from("first"),
+        .role = .member,
+        .score = 1.0,
+    };
+    try upsert(Account, backend, &a);
+
+    // Second upsert with the SAME PK but changed columns must UPDATE, not
+    // append a second row.
+    var a2 = Account{
+        .id = fields.Pk(64).from("did:plc:up"),
+        .handle = fields.Text(64).from("second"),
+        .email = fields.Text(64).from("up@x.test"),
+        .role = .admin,
+        .score = 9.0,
+    };
+    try upsert(Account, backend, &a2);
+
+    // The row reflects the latest values …
+    var got: Account = .{};
+    try testing.expect(try findByPk(Account, backend, "did:plc:up", &got));
+    try testing.expectEqualStrings("second", got.handle.slice());
+    try testing.expect(got.email != null);
+    try testing.expectEqualStrings("up@x.test", got.email.?.slice());
+    try testing.expectEqual(Role.admin, got.role);
+    try testing.expectEqual(@as(f64, 9.0), got.score);
+
+    // … and there is exactly ONE row for that PK (no duplicate).
+    try testing.expectEqual(@as(usize, 1), db.rowCount("atp_accounts"));
+}
+
+test "upsert: a brand-new PK simply inserts" {
+    var db = mock.MockBackend.init();
+    const backend = db.backend(.sqlite);
+
+    var a = Account{ .id = fields.Pk(64).from("fresh"), .handle = fields.Text(64).from("h") };
+    try upsert(Account, backend, &a);
+
+    var got: Account = .{};
+    try testing.expect(try findByPk(Account, backend, "fresh", &got));
+    try testing.expectEqualStrings("h", got.handle.slice());
+    try testing.expectEqual(@as(usize, 1), db.rowCount("atp_accounts"));
 }
 
 test "values with SQL metacharacters survive as data (parameterized binds)" {

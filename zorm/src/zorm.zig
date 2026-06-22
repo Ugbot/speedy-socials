@@ -77,6 +77,7 @@ pub const initialMigration = migrate.initialMigration;
 // ── Marshaling + CRUD (S2) ─────────────────────────────────────────────
 pub const PkValue = bind.PkValue;
 pub const insert = crud.insert;
+pub const upsert = crud.upsert;
 pub const findByPk = crud.findByPk;
 pub const update = crud.update;
 pub const delete = crud.delete;
