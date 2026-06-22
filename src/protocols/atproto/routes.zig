@@ -51,6 +51,10 @@ const list_records_default: u32 = 50;
 const list_records_max: u32 = 100;
 const list_repos_default: u32 = 50;
 const list_repos_max: u32 = 200;
+// AT2: listBlobs / listMissingBlobs pagination. Mirrors the AT spec
+// default (500) and a hard cap so a single fetch stays bounded.
+const list_blobs_default: u32 = 500;
+const list_blobs_max: u32 = 1000;
 const max_blocks_per_request: u32 = 1024;
 const car_scratch_bytes: usize = 12 * 1024;
 
@@ -890,6 +894,190 @@ fn syncListRepos(hc: *HandlerContext) anyerror!void {
         body_buf[pos] = '}';
         pos += 1;
     }
+    try xrpc.writeJsonBody(hc, .ok, body_buf[0..pos]);
+}
+
+// AT2 ── com.atproto.sync.getLatestCommit ─────────────────────────
+// Relays poll this to learn the repo's current head commit. Returns
+// the `{cid, rev}` of the most recently committed commit for the DID.
+fn syncGetLatestCommit(hc: *HandlerContext) anyerror!void {
+    const st = State.get();
+    const db = st.dbHandle() orelse {
+        return xrpc.writeError(hc, .service_unavailable, "ServiceUnavailable", "db not ready");
+    };
+    const q = hc.request.pathAndQuery().query;
+    const repo_did = xrpc.queryParam(q, "did") orelse {
+        return xrpc.writeError(hc, .bad_request, "InvalidRequest", "missing did");
+    };
+
+    const sql = "SELECT cid, rev FROM atp_commits WHERE did = ? ORDER BY committed_at DESC LIMIT 1";
+    var stmt: ?*c.sqlite3_stmt = null;
+    if (c.sqlite3_prepare_v2(db, sql, -1, &stmt, null) != c.SQLITE_OK) {
+        return xrpc.writeError(hc, .internal, "InternalError", "prepare");
+    }
+    defer _ = c.sqlite3_finalize(stmt);
+    _ = c.sqlite3_bind_text(stmt, 1, repo_did.ptr, @intCast(repo_did.len), c.sqliteTransientAsDestructor());
+
+    const rc = c.sqlite3_step(stmt.?);
+    if (rc == c.SQLITE_DONE) {
+        return xrpc.writeError(hc, .not_found, "RepoNotFound", "no commit for repo");
+    }
+    if (rc != c.SQLITE_ROW) return xrpc.writeError(hc, .internal, "InternalError", "step");
+
+    const cid_ptr = c.sqlite3_column_text(stmt, 0);
+    const cid_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 0));
+    const rev_ptr = c.sqlite3_column_text(stmt, 1);
+    const rev_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 1));
+
+    var body_buf: [256]u8 = undefined;
+    const body = std.fmt.bufPrint(&body_buf,
+        "{{\"cid\":\"{s}\",\"rev\":\"{s}\"}}",
+        .{ cid_ptr[0..cid_len], rev_ptr[0..rev_len] },
+    ) catch return xrpc.writeError(hc, .internal, "InternalError", "fmt");
+    try xrpc.writeJsonBody(hc, .ok, body);
+}
+
+// AT2 ── com.atproto.sync.listBlobs ────────────────────────────────
+// Lists the blob CIDs held for a repo, oldest-first. Supports `limit`
+// and a `cursor` (the last created_at returned) for pagination; the
+// optional `since` (a rev) is accepted for spec compatibility but the
+// blob table carries no rev column, so it is treated as a no-op here.
+fn syncListBlobs(hc: *HandlerContext) anyerror!void {
+    const st = State.get();
+    const db = st.dbHandle() orelse {
+        return xrpc.writeError(hc, .service_unavailable, "ServiceUnavailable", "db not ready");
+    };
+    const q = hc.request.pathAndQuery().query;
+    const repo_did = xrpc.queryParam(q, "did") orelse {
+        return xrpc.writeError(hc, .bad_request, "InvalidRequest", "missing did");
+    };
+    var limit: u32 = list_blobs_default;
+    if (xrpc.queryParam(q, "limit")) |lim_str| {
+        if (std.fmt.parseInt(u32, lim_str, 10)) |n| {
+            limit = @min(n, list_blobs_max);
+            if (limit == 0) limit = 1;
+        } else |_| {}
+    }
+    // `cursor` is the created_at of the last row from the prior page.
+    var cursor_at: i64 = 0;
+    if (xrpc.queryParam(q, "cursor")) |cur_str| {
+        cursor_at = std.fmt.parseInt(i64, cur_str, 10) catch 0;
+    }
+    _ = xrpc.queryParam(q, "since"); // accepted, no rev column to filter on.
+
+    const sql = "SELECT cid, created_at FROM atp_blobs WHERE did = ? AND created_at > ? ORDER BY created_at ASC LIMIT ?";
+    var stmt: ?*c.sqlite3_stmt = null;
+    if (c.sqlite3_prepare_v2(db, sql, -1, &stmt, null) != c.SQLITE_OK) {
+        return xrpc.writeError(hc, .internal, "InternalError", "prepare");
+    }
+    defer _ = c.sqlite3_finalize(stmt);
+    _ = c.sqlite3_bind_text(stmt, 1, repo_did.ptr, @intCast(repo_did.len), c.sqliteTransientAsDestructor());
+    _ = c.sqlite3_bind_int64(stmt, 2, cursor_at);
+    _ = c.sqlite3_bind_int64(stmt, 3, @intCast(limit));
+
+    var body_buf: [64 * 1024]u8 = undefined;
+    var pos: usize = 0;
+    const head = "{\"cids\":[";
+    @memcpy(body_buf[pos..][0..head.len], head);
+    pos += head.len;
+
+    var n: u32 = 0;
+    var last_at: i64 = 0;
+    while (n < limit) : (n += 1) {
+        const rc = c.sqlite3_step(stmt.?);
+        if (rc == c.SQLITE_DONE) break;
+        if (rc != c.SQLITE_ROW) return xrpc.writeError(hc, .internal, "InternalError", "step");
+        const cid_ptr = c.sqlite3_column_text(stmt, 0);
+        const cid_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 0));
+        last_at = c.sqlite3_column_int64(stmt, 1);
+        const written = std.fmt.bufPrint(body_buf[pos..],
+            "{s}\"{s}\"",
+            .{ if (n == 0) "" else ",", cid_ptr[0..cid_len] },
+        ) catch return xrpc.writeError(hc, .internal, "InternalError", "fmt");
+        pos += written.len;
+    }
+
+    @memcpy(body_buf[pos..][0..1], "]");
+    pos += 1;
+    if (n >= limit and last_at > 0) {
+        const ct = std.fmt.bufPrint(body_buf[pos..], ",\"cursor\":\"{d}\"}}", .{last_at}) catch
+            return xrpc.writeError(hc, .internal, "InternalError", "fmt");
+        pos += ct.len;
+    } else {
+        body_buf[pos] = '}';
+        pos += 1;
+    }
+    try xrpc.writeJsonBody(hc, .ok, body_buf[0..pos]);
+}
+
+// AT2 ── com.atproto.sync.listMissingBlobs ─────────────────────────
+// Admin/repair: given a comma-separated `cids` list of blobs a caller
+// believes this repo should hold, return the bounded set-diff — the
+// CIDs that are NOT present (or present without data) in `atp_blobs`.
+// The result shape matches the AT lexicon: `{blobs:[{cid}], cursor?}`.
+// `did` scopes the lookup; `limit` bounds the response.
+fn syncListMissingBlobs(hc: *HandlerContext) anyerror!void {
+    const st = State.get();
+    const db = st.dbHandle() orelse {
+        return xrpc.writeError(hc, .service_unavailable, "ServiceUnavailable", "db not ready");
+    };
+    const q = hc.request.pathAndQuery().query;
+    const repo_did = xrpc.queryParam(q, "did") orelse {
+        return xrpc.writeError(hc, .bad_request, "InvalidRequest", "missing did");
+    };
+    const cids_param = xrpc.queryParam(q, "cids") orelse {
+        return xrpc.writeError(hc, .bad_request, "InvalidRequest", "missing cids");
+    };
+    var limit: u32 = list_blobs_default;
+    if (xrpc.queryParam(q, "limit")) |lim_str| {
+        if (std.fmt.parseInt(u32, lim_str, 10)) |n| {
+            limit = @min(n, list_blobs_max);
+            if (limit == 0) limit = 1;
+        } else |_| {}
+    }
+
+    // A blob is "present" only if it exists for this DID with non-empty
+    // data. `data` is NOT NULL in the schema, so length(data) > 0 is the
+    // truthful presence test even for repair scenarios.
+    const sql = "SELECT 1 FROM atp_blobs WHERE did = ? AND cid = ? AND length(data) > 0 LIMIT 1";
+    var stmt: ?*c.sqlite3_stmt = null;
+    if (c.sqlite3_prepare_v2(db, sql, -1, &stmt, null) != c.SQLITE_OK) {
+        return xrpc.writeError(hc, .internal, "InternalError", "prepare");
+    }
+    defer _ = c.sqlite3_finalize(stmt);
+
+    var body_buf: [64 * 1024]u8 = undefined;
+    var pos: usize = 0;
+    const head = "{\"blobs\":[";
+    @memcpy(body_buf[pos..][0..head.len], head);
+    pos += head.len;
+
+    var it = std.mem.splitScalar(u8, cids_param, ',');
+    var emitted: u32 = 0;
+    while (it.next()) |cid_s| {
+        if (emitted >= limit) break;
+        if (cid_s.len == 0) continue;
+
+        _ = c.sqlite3_reset(stmt.?);
+        _ = c.sqlite3_clear_bindings(stmt.?);
+        _ = c.sqlite3_bind_text(stmt, 1, repo_did.ptr, @intCast(repo_did.len), c.sqliteTransientAsDestructor());
+        _ = c.sqlite3_bind_text(stmt, 2, cid_s.ptr, @intCast(cid_s.len), c.sqliteTransientAsDestructor());
+        const rc = c.sqlite3_step(stmt.?);
+        if (rc == c.SQLITE_ROW) continue; // present — not missing.
+        if (rc != c.SQLITE_DONE) return xrpc.writeError(hc, .internal, "InternalError", "step");
+
+        const written = std.fmt.bufPrint(body_buf[pos..],
+            "{s}{{\"cid\":\"{s}\"}}",
+            .{ if (emitted == 0) "" else ",", cid_s },
+        ) catch return xrpc.writeError(hc, .internal, "InternalError", "fmt");
+        pos += written.len;
+        emitted += 1;
+    }
+
+    @memcpy(body_buf[pos..][0..1], "]");
+    pos += 1;
+    body_buf[pos] = '}';
+    pos += 1;
     try xrpc.writeJsonBody(hc, .ok, body_buf[0..pos]);
 }
 
@@ -1788,6 +1976,9 @@ pub fn register(router: *Router, plugin_index: u16) !void {
     try router.register(.post, "/xrpc/com.atproto.identity.updateHandle", identityUpdateHandle, plugin_index); // AT-18a
     try router.register(.get, "/xrpc/com.atproto.sync.getRepoStatus", syncGetRepoStatus, plugin_index); // AT-15
     try router.register(.get, "/xrpc/com.atproto.sync.getBlob", syncGetBlob, plugin_index); // AT-6
+    try router.register(.get, "/xrpc/com.atproto.sync.getLatestCommit", syncGetLatestCommit, plugin_index); // AT2
+    try router.register(.get, "/xrpc/com.atproto.sync.listBlobs", syncListBlobs, plugin_index); // AT2
+    try router.register(.get, "/xrpc/com.atproto.sync.listMissingBlobs", syncListMissingBlobs, plugin_index); // AT2
     try router.register(.get, "/blob/:cid", serveBlobByCid, plugin_index); // DUAL-3
 
     try router.register(.post, "/xrpc/com.atproto.moderation.createReport", moderationCreateReport, plugin_index); // AT-21
@@ -1945,6 +2136,152 @@ test "AT-15: getRepoStatus body shape" {
     try testing.expect(found);
     try testing.expectEqualStrings(head, meta.headCid());
     try testing.expectEqualStrings(rev, meta.headRev());
+}
+
+// AT2 test helpers: seed atp_commits / atp_blobs rows directly.
+fn seedCommit(db: *c.sqlite3, did: []const u8, cid: []const u8, rev: []const u8, committed_at: i64) !void {
+    const sql = "INSERT INTO atp_commits (cid, did, rev, prev_cid, data_cid, signature, committed_at) VALUES (?,?,?,NULL,?,?,?)";
+    var stmt: ?*c.sqlite3_stmt = null;
+    try testing.expect(c.sqlite3_prepare_v2(db, sql, -1, &stmt, null) == c.SQLITE_OK);
+    defer _ = c.sqlite3_finalize(stmt);
+    _ = c.sqlite3_bind_text(stmt, 1, cid.ptr, @intCast(cid.len), c.sqliteTransientAsDestructor());
+    _ = c.sqlite3_bind_text(stmt, 2, did.ptr, @intCast(did.len), c.sqliteTransientAsDestructor());
+    _ = c.sqlite3_bind_text(stmt, 3, rev.ptr, @intCast(rev.len), c.sqliteTransientAsDestructor());
+    _ = c.sqlite3_bind_text(stmt, 4, cid.ptr, @intCast(cid.len), c.sqliteTransientAsDestructor());
+    _ = c.sqlite3_bind_blob(stmt, 5, "sig", 3, c.sqliteTransientAsDestructor());
+    _ = c.sqlite3_bind_int64(stmt, 6, committed_at);
+    try testing.expect(c.sqlite3_step(stmt.?) == c.SQLITE_DONE);
+}
+
+fn seedBlob(db: *c.sqlite3, did: []const u8, cid: []const u8, data: []const u8, created_at: i64) !void {
+    const sql = "INSERT INTO atp_blobs (cid, did, mime, size, ref_count, data, created_at) VALUES (?,?,?,?,?,?,?)";
+    var stmt: ?*c.sqlite3_stmt = null;
+    try testing.expect(c.sqlite3_prepare_v2(db, sql, -1, &stmt, null) == c.SQLITE_OK);
+    defer _ = c.sqlite3_finalize(stmt);
+    _ = c.sqlite3_bind_text(stmt, 1, cid.ptr, @intCast(cid.len), c.sqliteTransientAsDestructor());
+    _ = c.sqlite3_bind_text(stmt, 2, did.ptr, @intCast(did.len), c.sqliteTransientAsDestructor());
+    _ = c.sqlite3_bind_text(stmt, 3, "image/jpeg", 10, c.sqliteTransientAsDestructor());
+    _ = c.sqlite3_bind_int64(stmt, 4, @intCast(data.len));
+    _ = c.sqlite3_bind_int64(stmt, 5, 1);
+    _ = c.sqlite3_bind_blob(stmt, 6, data.ptr, @intCast(data.len), c.sqliteTransientAsDestructor());
+    _ = c.sqlite3_bind_int64(stmt, 7, created_at);
+    try testing.expect(c.sqlite3_step(stmt.?) == c.SQLITE_DONE);
+}
+
+test "AT2: getLatestCommit returns the newest commit by committed_at" {
+    const db = try setupRouteDb();
+    defer core.storage.sqlite.closeDb(db);
+
+    const did = "did:plc:alice";
+    try seedCommit(db, did, "bafyc1", "3aaa", 100);
+    try seedCommit(db, did, "bafyc2", "3bbb", 300); // newest
+    try seedCommit(db, did, "bafyc3", "3ccc", 200);
+    // A commit for a different repo must not leak in.
+    try seedCommit(db, "did:plc:bob", "bafyc9", "3zzz", 999);
+
+    const sql = "SELECT cid, rev FROM atp_commits WHERE did = ? ORDER BY committed_at DESC LIMIT 1";
+    var stmt: ?*c.sqlite3_stmt = null;
+    try testing.expect(c.sqlite3_prepare_v2(db, sql, -1, &stmt, null) == c.SQLITE_OK);
+    defer _ = c.sqlite3_finalize(stmt);
+    _ = c.sqlite3_bind_text(stmt, 1, did.ptr, @intCast(did.len), c.sqliteTransientAsDestructor());
+    try testing.expect(c.sqlite3_step(stmt.?) == c.SQLITE_ROW);
+    const cid_ptr = c.sqlite3_column_text(stmt, 0);
+    const cid_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 0));
+    const rev_ptr = c.sqlite3_column_text(stmt, 1);
+    const rev_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 1));
+    try testing.expectEqualStrings("bafyc2", cid_ptr[0..cid_len]);
+    try testing.expectEqualStrings("3bbb", rev_ptr[0..rev_len]);
+}
+
+test "AT2: getLatestCommit finds no row for an unknown repo" {
+    const db = try setupRouteDb();
+    defer core.storage.sqlite.closeDb(db);
+    const sql = "SELECT cid, rev FROM atp_commits WHERE did = ? ORDER BY committed_at DESC LIMIT 1";
+    var stmt: ?*c.sqlite3_stmt = null;
+    try testing.expect(c.sqlite3_prepare_v2(db, sql, -1, &stmt, null) == c.SQLITE_OK);
+    defer _ = c.sqlite3_finalize(stmt);
+    const did = "did:plc:nobody";
+    _ = c.sqlite3_bind_text(stmt, 1, did.ptr, @intCast(did.len), c.sqliteTransientAsDestructor());
+    try testing.expect(c.sqlite3_step(stmt.?) == c.SQLITE_DONE); // 404 path
+}
+
+test "AT2: listBlobs returns this repo's blobs oldest-first with cursor paging" {
+    const db = try setupRouteDb();
+    defer core.storage.sqlite.closeDb(db);
+
+    const did = "did:plc:alice";
+    try seedBlob(db, did, "bafb1", "one", 10);
+    try seedBlob(db, did, "bafb2", "two", 20);
+    try seedBlob(db, did, "bafb3", "three", 30);
+    try seedBlob(db, "did:plc:bob", "bafbx", "other", 15); // must not leak.
+
+    // Page 1: limit 2, cursor 0 -> bafb1, bafb2 (oldest-first).
+    const sql = "SELECT cid, created_at FROM atp_blobs WHERE did = ? AND created_at > ? ORDER BY created_at ASC LIMIT ?";
+    var stmt: ?*c.sqlite3_stmt = null;
+    try testing.expect(c.sqlite3_prepare_v2(db, sql, -1, &stmt, null) == c.SQLITE_OK);
+    defer _ = c.sqlite3_finalize(stmt);
+    _ = c.sqlite3_bind_text(stmt, 1, did.ptr, @intCast(did.len), c.sqliteTransientAsDestructor());
+    _ = c.sqlite3_bind_int64(stmt, 2, 0);
+    _ = c.sqlite3_bind_int64(stmt, 3, 2);
+
+    try testing.expect(c.sqlite3_step(stmt.?) == c.SQLITE_ROW);
+    var p = c.sqlite3_column_text(stmt, 0);
+    try testing.expectEqualStrings("bafb1", p[0..@intCast(c.sqlite3_column_bytes(stmt, 0))]);
+    try testing.expect(c.sqlite3_step(stmt.?) == c.SQLITE_ROW);
+    p = c.sqlite3_column_text(stmt, 0);
+    try testing.expectEqualStrings("bafb2", p[0..@intCast(c.sqlite3_column_bytes(stmt, 0))]);
+    const cursor = c.sqlite3_column_int64(stmt, 1);
+    try testing.expectEqual(@as(i64, 20), cursor);
+    try testing.expect(c.sqlite3_step(stmt.?) == c.SQLITE_DONE);
+
+    // Page 2: cursor = 20 -> bafb3 only.
+    _ = c.sqlite3_reset(stmt.?);
+    _ = c.sqlite3_bind_text(stmt, 1, did.ptr, @intCast(did.len), c.sqliteTransientAsDestructor());
+    _ = c.sqlite3_bind_int64(stmt, 2, cursor);
+    _ = c.sqlite3_bind_int64(stmt, 3, 2);
+    try testing.expect(c.sqlite3_step(stmt.?) == c.SQLITE_ROW);
+    p = c.sqlite3_column_text(stmt, 0);
+    try testing.expectEqualStrings("bafb3", p[0..@intCast(c.sqlite3_column_bytes(stmt, 0))]);
+    try testing.expect(c.sqlite3_step(stmt.?) == c.SQLITE_DONE);
+}
+
+test "AT2: listMissingBlobs set-diff returns only absent cids" {
+    const db = try setupRouteDb();
+    defer core.storage.sqlite.closeDb(db);
+
+    const did = "did:plc:alice";
+    // Present (with data) for this repo.
+    try seedBlob(db, did, "bafhave1", "x", 10);
+    try seedBlob(db, did, "bafhave2", "y", 20);
+    // Same cid but belongs to a different repo -> still missing for alice.
+    try seedBlob(db, "did:plc:bob", "bafonlybob", "z", 30);
+
+    // Requested set: two held, one foreign-only, one never-seen.
+    const requested = [_][]const u8{ "bafhave1", "bafmiss1", "bafonlybob", "bafhave2" };
+    const expect_missing = [_][]const u8{ "bafmiss1", "bafonlybob" };
+
+    const sql = "SELECT 1 FROM atp_blobs WHERE did = ? AND cid = ? AND length(data) > 0 LIMIT 1";
+    var stmt: ?*c.sqlite3_stmt = null;
+    try testing.expect(c.sqlite3_prepare_v2(db, sql, -1, &stmt, null) == c.SQLITE_OK);
+    defer _ = c.sqlite3_finalize(stmt);
+
+    var missing_buf: [4][]const u8 = undefined;
+    var missing_n: usize = 0;
+    for (requested) |cid_s| {
+        _ = c.sqlite3_reset(stmt.?);
+        _ = c.sqlite3_clear_bindings(stmt.?);
+        _ = c.sqlite3_bind_text(stmt, 1, did.ptr, @intCast(did.len), c.sqliteTransientAsDestructor());
+        _ = c.sqlite3_bind_text(stmt, 2, cid_s.ptr, @intCast(cid_s.len), c.sqliteTransientAsDestructor());
+        const rc = c.sqlite3_step(stmt.?);
+        if (rc == c.SQLITE_ROW) continue; // present.
+        try testing.expect(rc == c.SQLITE_DONE);
+        missing_buf[missing_n] = cid_s;
+        missing_n += 1;
+    }
+
+    try testing.expectEqual(expect_missing.len, missing_n);
+    try testing.expectEqualStrings(expect_missing[0], missing_buf[0]);
+    try testing.expectEqualStrings(expect_missing[1], missing_buf[1]);
 }
 
 test "AT-14: identityResolveDid returns own doc for did:web:<host>" {
