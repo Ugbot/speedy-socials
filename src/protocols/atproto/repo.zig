@@ -270,7 +270,44 @@ pub fn setCacheEnabledForTest(v: ?bool) void {
     mst_cache_loaded = false;
 }
 
-/// Append-only commit. Mutates the tree, persists record + MST block +
+/// MST node sink: persists each hierarchical MST node block into
+/// `atp_mst_blocks` keyed by its own CID. `buildAndEmit` calls `onNode`
+/// once per node (children before parents). The first SQLite error is
+/// captured in `err` and surfaced to the caller after the walk so the
+/// commit aborts cleanly. `INSERT OR REPLACE` makes re-emitting an
+/// unchanged node (shared across commits) idempotent.
+const MstBlockSink = struct {
+    db: *c.sqlite3,
+    did: []const u8,
+    err: ?Error = null,
+    count: u32 = 0,
+
+    pub fn onNode(self: *MstBlockSink, node_cid: cid_mod.Cid, bytes: []const u8) AtpError!void {
+        if (self.err != null) return; // already failed; drain quietly
+        var cid_str_buf: [cid_mod.string_cid_len]u8 = undefined;
+        const cid_s = cid_mod.encodeString(node_cid, &cid_str_buf) catch |e| {
+            self.err = e;
+            return;
+        };
+        const sql = "INSERT OR REPLACE INTO atp_mst_blocks (cid, did, data) VALUES (?,?,?)";
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null) != c.SQLITE_OK) {
+            self.err = error.PrepareFailed;
+            return;
+        }
+        defer _ = c.sqlite3_finalize(stmt);
+        _ = c.sqlite3_bind_text(stmt, 1, cid_s.ptr, @intCast(cid_s.len), c.sqliteTransientAsDestructor());
+        _ = c.sqlite3_bind_text(stmt, 2, self.did.ptr, @intCast(self.did.len), c.sqliteTransientAsDestructor());
+        _ = c.sqlite3_bind_blob(stmt, 3, bytes.ptr, @intCast(bytes.len), c.sqliteTransientAsDestructor());
+        if (c.sqlite3_step(stmt.?) != c.SQLITE_DONE) {
+            self.err = error.StepFailed;
+            return;
+        }
+        self.count += 1;
+    }
+};
+
+/// Append-only commit. Mutates the tree, persists record + MST node blocks +
 /// commit row, emits a firehose event. Operations are applied in order;
 /// no support for delete/swap here — those are added by the route layer.
 pub fn commit(
@@ -340,22 +377,24 @@ pub fn commit(
         fireChange(if (pre_existing) ChangeKind.update else ChangeKind.create, did, op.collection, rkey, record_cid_s);
     }
 
-    // Compute new MST root.
-    var mst_scratch: [64 * 1024]u8 = undefined;
-    const root = try tree.getRoot(&mst_scratch);
+    // Compute new MST root and persist *every* node block. The hierarchical
+    // MST is a DAG of `{l, e:[{p,k,v,t}]}` nodes (see `mst.zig`); each node is
+    // a DAG-CBOR block keyed by its own CID. `buildAndEmit` streams each node
+    // (children before parents) to the sink, which inserts it into
+    // `atp_mst_blocks`. The repo `data` root is the *root node's* CID.
+    //
+    // Incremental load: `loadTree`/`acquireTree` keep the in-memory tree warm
+    // across commits (AT-16), so we never reload records per commit. The node
+    // blocks are re-derived from that warm tree here; the CAR/sync layer reads
+    // them back from `atp_mst_blocks` by CID without ever needing a full
+    // "tree reload" — incremental block lookup by CID replaces the old
+    // single-root-block reload.
+    var sink = MstBlockSink{ .db = db, .did = did };
+    const root_cid = try tree.buildAndEmit(@TypeOf(sink), &sink);
+    if (sink.err) |e| return e;
 
     var data_cid_str: [cid_mod.string_cid_len]u8 = undefined;
-    const data_cid_s = try cid_mod.encodeString(root.cid, &data_cid_str);
-
-    // Persist MST block.
-    const mst_sql = "INSERT OR REPLACE INTO atp_mst_blocks (cid, did, data) VALUES (?,?,?)";
-    var mst_stmt: ?*c.sqlite3_stmt = null;
-    if (c.sqlite3_prepare_v2(db, mst_sql, -1, &mst_stmt, null) != c.SQLITE_OK) return error.PrepareFailed;
-    defer _ = c.sqlite3_finalize(mst_stmt);
-    _ = c.sqlite3_bind_text(mst_stmt, 1, data_cid_s.ptr, @intCast(data_cid_s.len), c.sqliteTransientAsDestructor());
-    _ = c.sqlite3_bind_text(mst_stmt, 2, did.ptr, @intCast(did.len), c.sqliteTransientAsDestructor());
-    _ = c.sqlite3_bind_blob(mst_stmt, 3, mst_scratch[0..root.bytes_written].ptr, @intCast(root.bytes_written), c.sqliteTransientAsDestructor());
-    if (c.sqlite3_step(mst_stmt.?) != c.SQLITE_DONE) return error.StepFailed;
+    const data_cid_s = try cid_mod.encodeString(root_cid, &data_cid_str);
 
     // AT-5: Build the **unsigned** commit CBOR. Per spec, the commit
     // CID is computed over the unsigned form `{did, version, data,
@@ -379,7 +418,7 @@ pub fn commit(
     try u.writeText("rev");
     try u.writeText(rev.str());
     try u.writeText("data");
-    try u.writeCidLink(root.cid.raw());
+    try u.writeCidLink(root_cid.raw());
     try u.writeText("prev");
     try u.writeNull();
     try u.writeText("version");
@@ -405,7 +444,7 @@ pub fn commit(
     try s.writeText("sig");
     try s.writeBytesValue(&sig);
     try s.writeText("data");
-    try s.writeCidLink(root.cid.raw());
+    try s.writeCidLink(root_cid.raw());
     try s.writeText("prev");
     try s.writeNull();
     try s.writeText("version");
