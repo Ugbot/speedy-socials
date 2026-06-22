@@ -505,12 +505,24 @@ pub fn build(b: *std.Build) void {
     });
     const run_sim_replay = b.addRunArtifact(sim_replay_exe);
 
+    const sim_tr_replay_exe = b.addExecutable(.{
+        .name = "sim-firehose-translate-replay",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/sim/firehose_translate_replay.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &sim_imports,
+        }),
+    });
+    const run_sim_tr_replay = b.addRunArtifact(sim_tr_replay_exe);
+
     const sim_step = b.step("sim", "Run simulation tests");
     sim_step.dependOn(&run_sim_fed.step);
     sim_step.dependOn(&run_sim_fh.step);
     sim_step.dependOn(&run_sim_relay.step);
     sim_step.dependOn(&run_sim_chaos.step);
     sim_step.dependOn(&run_sim_replay.step);
+    sim_step.dependOn(&run_sim_tr_replay.step);
 
     // The simulation scenarios also run as regular `zig build test` tests.
     const sim_fed_tests = b.addTest(.{
@@ -541,6 +553,16 @@ pub fn build(b: *std.Build) void {
         }),
     });
     test_step.dependOn(&b.addRunArtifact(sim_relay_tests).step);
+
+    const sim_tr_replay_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/sim/firehose_translate_replay.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &sim_imports,
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(sim_tr_replay_tests).step);
 
     // ── benchmarks (continued) ─────────────────────────────────────
     const echo_bench = b.addExecutable(.{
