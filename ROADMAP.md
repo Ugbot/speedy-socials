@@ -97,10 +97,12 @@ integration, and net-new capability (zorm MS SQL + features)** — not core gaps
 Shipped: `mssql` Dialect — `@pN` params · `BIGINT IDENTITY(1,1)` + `OUTPUT INSERTED.id`
 (no `RETURNING`) · `NVARCHAR(N)`/`VARBINARY(N)`/`FLOAT`/`BIGINT` · `IF OBJECT_ID/sys.indexes`
 guards (T-SQL has no `IF NOT EXISTS`) · `LIMIT`→`OFFSET…FETCH` (with synthesized
-`ORDER BY (SELECT NULL)`). 1003 tests lock the generated SQL. **Remaining for mssql:**
-`[bracket]` identifier quoting (folded into the P1 quoting item) and a **live round-trip
-against `mcr.microsoft.com/mssql/server`** — deferred (the podman VM disk was full of
-other containers in the dev env; the T-SQL is standard and unit-locked).
+`ORDER BY (SELECT NULL)`). 1003 tests lock the generated SQL, and the T-SQL was
+**live-validated** against Azure SQL Edge (ARM64): DDL guards + NVARCHAR/IDENTITY/FK
+apply, `OUTPUT INSERTED` returns ids, an orphan insert is rejected (Msg 547), ON DELETE
+CASCADE fires, and `OFFSET…FETCH` paginates. (Full `mcr.microsoft.com/mssql/server`
+segfaults under qemu on arm64; SQL Edge runs the same T-SQL natively.) **Remaining for
+mssql:** `[bracket]` identifier quoting (folded into the P1 quoting item).
 
 ## P1 — correctness foundations + query depth
 - **Identifier quoting** per dialect (`"x"`/`` `x` ``/`[x]`) — today names are unquoted
@@ -142,7 +144,6 @@ other containers in the dev env; the T-SQL is standard and unit-locked).
 3. **zorm P1** (identifier quoting incl. mssql brackets, typed errors, query ops + OFFSET,
    upserts, composite PK) — and use it to harden **H1/H3 multi-tenancy**.
 4. **Track 1 P1** spec/client polish, then **P2/testing**.
-5. (when a disk-headroom env is available) live SQL Server round-trip to close out M5.
 
 # Doc map (post-reconciliation)
 - **ROADMAP.md** (this file) — the single forward plan. Update here first.
