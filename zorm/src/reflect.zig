@@ -12,7 +12,7 @@
 const std = @import("std");
 const fields = @import("fields.zig");
 
-pub const ColType = enum { text, integer, real, blob };
+pub const ColType = enum { text, integer, real, blob, decimal, uuid, json, date, datetime };
 pub const BindKind = enum { int, real, text, blob };
 
 pub const ColumnSpec = struct {
@@ -22,9 +22,12 @@ pub const ColumnSpec = struct {
     nullable: bool,
     is_pk: bool,
     pk_auto: bool, // i64 autoincrement PK (DB-assigned id)
-    byte_cap: usize, // text/blob capacity (0 for scalars)
+    byte_cap: usize, // text/blob/json capacity (0 for scalars)
     is_enum: bool, // stored as text by @tagName; read via stringToEnum
     field_index: usize, // index in std.meta.fields(T)
+    // Decimal numeric type only: total precision + fractional scale.
+    decimal_precision: usize = 0,
+    decimal_scale: usize = 0,
 };
 
 /// Strip a leading `?` and report nullability.
@@ -91,6 +94,36 @@ pub fn columnSpec(comptime field_name: []const u8, comptime F: type, comptime id
             .timestamp => {
                 spec.col_type = .integer;
                 spec.bind_kind = .int;
+            },
+            // The following all marshal as text (lossless string forms) but
+            // carry distinct ColTypes so the DDL layer emits the right SQL
+            // type keyword per dialect.
+            .decimal => {
+                spec.col_type = .decimal;
+                spec.bind_kind = .text;
+                spec.byte_cap = T.capacity;
+                spec.decimal_precision = T.sql_precision;
+                spec.decimal_scale = T.sql_scale;
+            },
+            .uuid => {
+                spec.col_type = .uuid;
+                spec.bind_kind = .text;
+                spec.byte_cap = T.capacity; // 36 (canonical string)
+            },
+            .json => {
+                spec.col_type = .json;
+                spec.bind_kind = .text;
+                spec.byte_cap = T.capacity;
+            },
+            .date => {
+                spec.col_type = .date;
+                spec.bind_kind = .text;
+                spec.byte_cap = T.capacity;
+            },
+            .datetime => {
+                spec.col_type = .datetime;
+                spec.bind_kind = .text;
+                spec.byte_cap = T.capacity;
             },
         }
         return spec;

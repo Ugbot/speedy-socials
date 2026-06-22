@@ -27,8 +27,12 @@ fn bindScalar(comptime col: reflect.ColumnSpec, ptr: anytype) BindValue {
     return switch (col.bind_kind) {
         .text => if (col.is_enum)
             .{ .text = @tagName(ptr.*) }
+        else if (col.col_type == .uuid)
+            // Uuid stores raw 16 bytes; bind its canonical 36-char string,
+            // formatted into a buffer the caller's entity owns (see Uuid.buf).
+            .{ .text = ptr.canonical() }
         else
-            .{ .text = ptr.slice() }, // Text/Bytes/Pk (slice() takes *const Self)
+            .{ .text = ptr.slice() }, // Text/Bytes/Pk/Decimal/Json/Date/DateTime (slice() takes *const Self)
         .blob => .{ .blob = ptr.slice() },
         .int => blk: {
             // Timestamp / AutoPk wrappers, bool, or native int.
@@ -240,6 +244,65 @@ test "nullable column binds null + reads back null" {
     var b: Account = .{ .email = fields.Text(64).from("stale") };
     readColumn(Account, reflect.TableInfo(Account).columns[2], &row.columns[2], &b);
     try testing.expect(b.email == null);
+}
+
+const TypedEntity = struct {
+    pub const zorm_table = "typed";
+    id: fields.Pk(36) = .{},
+    price: fields.Decimal(12, 2) = .{},
+    ext_id: fields.Uuid = .{},
+    payload: fields.Json(64) = .{},
+    born_on: fields.Date = .{},
+    seen_at: fields.DateTime = .{},
+};
+
+test "Z5 column types bind as text + read back via MockBackend round-trip" {
+    const testing_mod = @import("testing.zig");
+    var db = testing_mod.MockBackend.init();
+    const b = db.backend(.postgres);
+
+    const canon = "550e8400-e29b-41d4-a716-446655440000";
+    var e = TypedEntity{
+        .id = fields.Pk(36).from("row-1"),
+        .price = fields.Decimal(12, 2).from("-1234567890.99"),
+        .ext_id = fields.Uuid.from(canon),
+        .payload = fields.Json(64).from("{\"k\":42}"),
+        .born_on = fields.Date.from("2026-06-23"),
+        .seen_at = fields.DateTime.from("2026-06-23T14:05:09.250"),
+    };
+
+    // Bind: every new type marshals as text.
+    var args: [16]BindValue = undefined;
+    const n = bindAll(TypedEntity, &e, &args);
+    try testing.expectEqual(@as(usize, 6), n);
+    try testing.expectEqualStrings("row-1", args[0].text);
+    try testing.expectEqualStrings("-1234567890.99", args[1].text);
+    try testing.expectEqualStrings(canon, args[2].text); // uuid canonical string
+    try testing.expectEqualStrings("{\"k\":42}", args[3].text);
+    try testing.expectEqualStrings("2026-06-23", args[4].text);
+    try testing.expectEqualStrings("2026-06-23T14:05:09.250", args[5].text);
+
+    // Round-trip through the mock: INSERT then SELECT-by-pk.
+    try b.exec(
+        "INSERT INTO typed (id, price, ext_id, payload, born_on, seen_at) VALUES ($1, $2, $3, $4, $5, $6)",
+        args[0..n],
+    );
+    var row: contract.Row = .{};
+    try testing.expect(try b.queryOne(
+        "SELECT id, price, ext_id, payload, born_on, seen_at FROM typed WHERE id = $1",
+        &.{.{ .text = "row-1" }},
+        &row,
+    ));
+
+    var got: TypedEntity = .{};
+    rowToEntity(TypedEntity, &row, &got);
+    try testing.expectEqualStrings("row-1", got.id.slice());
+    try testing.expectEqualStrings("-1234567890.99", got.price.slice());
+    try testing.expectEqualStrings(canon, got.ext_id.canonical());
+    try testing.expect(got.ext_id.eql(&e.ext_id));
+    try testing.expectEqualStrings("{\"k\":42}", got.payload.slice());
+    try testing.expectEqualStrings("2026-06-23", got.born_on.slice());
+    try testing.expectEqualStrings("2026-06-23T14:05:09.250", got.seen_at.slice());
 }
 
 test "bindInsert skips the auto PK column" {

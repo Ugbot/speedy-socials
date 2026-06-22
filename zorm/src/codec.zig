@@ -88,6 +88,9 @@ fn encodeValue(w: *Cursor, comptime wt: WireType, vp: anytype) Error!void {
         .text => try w.putBytes(vp.*.slice()), // Text(N)/Pk(N)
         .bytes => try w.putBytes(vp.*.slice()), // Bytes(N)
         .enum_text => try w.putBytes(@tagName(vp.*)),
+        // Z5 typed strings: lossless string forms over the wire.
+        .decimal, .json, .date, .datetime => try w.putBytes(vp.*.slice()),
+        .uuid => try w.putBytes(vp.*.canonical()),
     }
 }
 
@@ -152,9 +155,9 @@ fn decodeValue(r: *Reader, comptime wt: WireType, comptime VT: type, dst: *VT) E
         .f64 => {
             dst.* = @bitCast(try r.getU64());
         },
-        .text, .bytes => {
+        .text, .bytes, .decimal, .uuid, .json, .date, .datetime => {
             const s = try r.getBytes();
-            dst.*.set(s); // Text(N)/Pk(N)/Bytes(N) — truncates at capacity
+            dst.*.set(s); // Text/Pk/Bytes/Decimal/Uuid/Json/Date/DateTime — set() truncates/normalizes
         },
         .enum_text => {
             const s = try r.getBytes();

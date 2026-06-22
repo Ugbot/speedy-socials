@@ -51,6 +51,40 @@ fn sqlType(comptime col: reflect.ColumnSpec, comptime dialect: Dialect) []const 
             .mysql => std.fmt.comptimePrint("VARBINARY({d})", .{col.byte_cap}),
             .mssql => std.fmt.comptimePrint("VARBINARY({d})", .{col.byte_cap}),
         },
+        // Fixed-point numeric. SQLite has no parametrized NUMERIC (its type
+        // affinity ignores the (p,s)), so it gets a bare NUMERIC; the others
+        // carry the precision/scale.
+        .decimal => switch (dialect) {
+            .sqlite => "NUMERIC",
+            .postgres => std.fmt.comptimePrint("NUMERIC({d},{d})", .{ col.decimal_precision, col.decimal_scale }),
+            .mysql, .mssql => std.fmt.comptimePrint("DECIMAL({d},{d})", .{ col.decimal_precision, col.decimal_scale }),
+        },
+        // 16-byte UUID. Native type on PG/MSSQL; CHAR(36) on MySQL (canonical
+        // string form); TEXT on SQLite.
+        .uuid => switch (dialect) {
+            .sqlite => "TEXT",
+            .postgres => "UUID",
+            .mysql => "CHAR(36)",
+            .mssql => "UNIQUEIDENTIFIER",
+        },
+        // Bounded JSON document. Native JSON on PG (JSONB) / MySQL (JSON);
+        // NVARCHAR(N) on MSSQL; TEXT on SQLite.
+        .json => switch (dialect) {
+            .sqlite => "TEXT",
+            .postgres => "JSONB",
+            .mysql => "JSON",
+            .mssql => std.fmt.comptimePrint("NVARCHAR({d})", .{col.byte_cap}),
+        },
+        // Calendar date — DATE on every dialect.
+        .date => "DATE",
+        // Date + time. PG TIMESTAMP / MySQL DATETIME / MSSQL DATETIME2 /
+        // SQLite TEXT (ISO-8601 string).
+        .datetime => switch (dialect) {
+            .sqlite => "TEXT",
+            .postgres => "TIMESTAMP",
+            .mysql => "DATETIME",
+            .mssql => "DATETIME2",
+        },
     };
 }
 
@@ -304,6 +338,51 @@ test "createTable: blob type per dialect" {
     try testing.expect(std.mem.indexOf(u8, createTable(BlobEntity, .postgres), "\"data\" BYTEA NOT NULL") != null);
     try testing.expect(std.mem.indexOf(u8, createTable(BlobEntity, .mysql), "`data` VARBINARY(512) NOT NULL") != null);
     try testing.expect(std.mem.indexOf(u8, createTable(BlobEntity, .mssql), "[data] VARBINARY(512) NOT NULL") != null);
+}
+
+// Entity exercising every Z5 column type for per-dialect DDL assertions.
+const TypedEntity = struct {
+    pub const zorm_table = "typed";
+    id: fields.Pk(36) = .{},
+    price: fields.Decimal(12, 2) = .{},
+    ext_id: fields.Uuid = .{},
+    payload: fields.Json(256) = .{},
+    born_on: fields.Date = .{},
+    seen_at: fields.DateTime = .{},
+};
+
+test "createTable: Decimal NUMERIC/DECIMAL(p,s) per dialect" {
+    try testing.expect(std.mem.indexOf(u8, createTable(TypedEntity, .sqlite), "\"price\" NUMERIC NOT NULL") != null);
+    try testing.expect(std.mem.indexOf(u8, createTable(TypedEntity, .postgres), "\"price\" NUMERIC(12,2) NOT NULL") != null);
+    try testing.expect(std.mem.indexOf(u8, createTable(TypedEntity, .mysql), "`price` DECIMAL(12,2) NOT NULL") != null);
+    try testing.expect(std.mem.indexOf(u8, createTable(TypedEntity, .mssql), "[price] DECIMAL(12,2) NOT NULL") != null);
+}
+
+test "createTable: Uuid native type per dialect" {
+    try testing.expect(std.mem.indexOf(u8, createTable(TypedEntity, .sqlite), "\"ext_id\" TEXT NOT NULL") != null);
+    try testing.expect(std.mem.indexOf(u8, createTable(TypedEntity, .postgres), "\"ext_id\" UUID NOT NULL") != null);
+    try testing.expect(std.mem.indexOf(u8, createTable(TypedEntity, .mysql), "`ext_id` CHAR(36) NOT NULL") != null);
+    try testing.expect(std.mem.indexOf(u8, createTable(TypedEntity, .mssql), "[ext_id] UNIQUEIDENTIFIER NOT NULL") != null);
+}
+
+test "createTable: Json native type per dialect" {
+    try testing.expect(std.mem.indexOf(u8, createTable(TypedEntity, .sqlite), "\"payload\" TEXT NOT NULL") != null);
+    try testing.expect(std.mem.indexOf(u8, createTable(TypedEntity, .postgres), "\"payload\" JSONB NOT NULL") != null);
+    try testing.expect(std.mem.indexOf(u8, createTable(TypedEntity, .mysql), "`payload` JSON NOT NULL") != null);
+    try testing.expect(std.mem.indexOf(u8, createTable(TypedEntity, .mssql), "[payload] NVARCHAR(256) NOT NULL") != null);
+}
+
+test "createTable: Date + DateTime per dialect" {
+    // DATE on every dialect.
+    try testing.expect(std.mem.indexOf(u8, createTable(TypedEntity, .sqlite), "\"born_on\" DATE NOT NULL") != null);
+    try testing.expect(std.mem.indexOf(u8, createTable(TypedEntity, .postgres), "\"born_on\" DATE NOT NULL") != null);
+    try testing.expect(std.mem.indexOf(u8, createTable(TypedEntity, .mysql), "`born_on` DATE NOT NULL") != null);
+    try testing.expect(std.mem.indexOf(u8, createTable(TypedEntity, .mssql), "[born_on] DATE NOT NULL") != null);
+    // DateTime: distinct per dialect.
+    try testing.expect(std.mem.indexOf(u8, createTable(TypedEntity, .sqlite), "\"seen_at\" TEXT NOT NULL") != null);
+    try testing.expect(std.mem.indexOf(u8, createTable(TypedEntity, .postgres), "\"seen_at\" TIMESTAMP NOT NULL") != null);
+    try testing.expect(std.mem.indexOf(u8, createTable(TypedEntity, .mysql), "`seen_at` DATETIME NOT NULL") != null);
+    try testing.expect(std.mem.indexOf(u8, createTable(TypedEntity, .mssql), "[seen_at] DATETIME2 NOT NULL") != null);
 }
 
 test "dropTable" {

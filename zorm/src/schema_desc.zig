@@ -31,6 +31,11 @@ pub const WireType = enum {
     bytes,
     enum_text,
     timestamp,
+    decimal,
+    uuid,
+    json,
+    date,
+    datetime,
 
     /// Canonical, stable spelling used in the fingerprint + JSON. Never
     /// reorder/rename these strings without intending a fingerprint break.
@@ -43,6 +48,11 @@ pub const WireType = enum {
             .bytes => "bytes",
             .enum_text => "enum_text",
             .timestamp => "timestamp",
+            .decimal => "decimal",
+            .uuid => "uuid",
+            .json => "json",
+            .date => "date",
+            .datetime => "datetime",
         };
     }
 };
@@ -71,7 +81,16 @@ pub fn wireTypeFor(comptime spec: reflect.ColumnSpec) WireType {
             else => .i64,
         },
         .real => .f64,
-        .text => .text,
+        // Text-bound columns: distinguish the typed string forms (decimal,
+        // uuid, json, date, datetime) from arbitrary text via col_type.
+        .text => switch (spec.col_type) {
+            .decimal => .decimal,
+            .uuid => .uuid,
+            .json => .json,
+            .date => .date,
+            .datetime => .datetime,
+            else => .text,
+        },
         .blob => .bytes,
     };
 }
@@ -107,6 +126,11 @@ fn fieldWireType(comptime F: type, comptime spec: reflect.ColumnSpec) WireType {
             .bytes => .bytes,
             .pk_auto => .i64,
             .timestamp => .timestamp,
+            .decimal => .decimal,
+            .uuid => .uuid,
+            .json => .json,
+            .date => .date,
+            .datetime => .datetime,
         };
     }
     return switch (@typeInfo(T)) {
