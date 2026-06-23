@@ -42,6 +42,9 @@ fn run(gpa: std.mem.Allocator) !void {
     defer core.storage.sqlite.closeDb(db);
     const consumer_db = try core.storage.sqlite.openWriter(tmp_path_z);
     defer core.storage.sqlite.closeDb(consumer_db);
+    // D3: clear any stale L0 firehose store on these recycled handles.
+    atproto.firehose.forgetStore(db);
+    atproto.firehose.forgetStore(consumer_db);
     try applySchema(db);
 
     var sc = core.clock.SimClock.init(1_900_000_000);
@@ -77,7 +80,10 @@ fn run(gpa: std.mem.Allocator) !void {
 
     relay.firehose_consumer.stop(gpa);
 
-    // Persistent count = producer count (the durable layer never drops).
+    // D3: flush the L0 ring so the batched tail is durable before we
+    // assert on the table. Persistent count = producer count (the
+    // durable layer never drops).
+    try atproto.firehose.flush(db);
     const persistent_count = try countAll(db, "SELECT count(*) FROM atp_firehose_events");
     if (persistent_count != @as(i64, @intCast(burst_count))) {
         std.debug.print("FAIL: persistent count {d} != {d}\n", .{ persistent_count, burst_count });

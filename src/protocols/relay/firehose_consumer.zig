@@ -513,6 +513,7 @@ const at_schema = atproto.schema;
 fn setupDb() !*c.sqlite3 {
     const sqlite_mod = core.storage.sqlite;
     const db = try sqlite_mod.openWriter(":memory:");
+    firehose.forgetStore(db); // clear stale L0 firehose store on recycled handle
     // Apply AT schema (we need atp_repos, atp_records, atp_firehose_*).
     for (at_schema.all_migrations) |m| {
         const sql_z = try testing.allocator.dupeZ(u8, m.up);

@@ -623,6 +623,8 @@ const schema_mod = @import("schema.zig");
 fn setupDb() !*c.sqlite3 {
     const sqlite_mod = core.storage.sqlite;
     const db = try sqlite_mod.openWriter(":memory:");
+    // Drop any stale L0 firehose store left on a recycled handle address.
+    firehose.forgetStore(db);
     for (schema_mod.all_migrations) |m| {
         const sql_z = try testing.allocator.dupeZ(u8, m.up);
         defer testing.allocator.free(sql_z);
@@ -879,7 +881,11 @@ test "AT-5: firehose commit body carries all 6 spec fields" {
     const ops = [_]Operation{.{ .collection = "n.s.r", .rkey = "k1", .value_cbor = enc.written() }};
     _ = try commit(db, "did:plc:shape", kp, rev, &tree, &ops, 2, null);
 
-    // Pull the raw body out of atp_firehose_events.
+    // D3: the firehose hot path now buffers in an L0 ring and batches
+    // the durable insert, so a single just-committed event may not yet
+    // be in atp_firehose_events. Flush the multi-level store first, then
+    // read the durable row as before.
+    try firehose.flush(db);
     var stmt: ?*c.sqlite3_stmt = null;
     _ = c.sqlite3_prepare_v2(db, "SELECT body FROM atp_firehose_events ORDER BY seq DESC LIMIT 1", -1, &stmt, null);
     defer _ = c.sqlite3_finalize(stmt);

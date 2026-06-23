@@ -155,6 +155,7 @@ fn run(seed: u64, allocator: std.mem.Allocator) ![32]u8 {
     const sqlite_mod = core.storage.sqlite;
     const db = try sqlite_mod.openWriter(":memory:");
     defer sqlite_mod.closeDb(db);
+    atproto.firehose.forgetStore(db); // clear stale L0 store on recycled handle
 
     try applySchema(db, allocator);
 

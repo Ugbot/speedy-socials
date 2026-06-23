@@ -258,23 +258,12 @@ fn sendCommitForSeq(ctx: *WsUpgradeContext, db: *c.sqlite3, seq: i64) !void {
 }
 
 fn loadEventBody(db: *c.sqlite3, seq: i64, out: []u8) !usize {
-    const sql = "SELECT body FROM atp_firehose_events WHERE seq = ?";
-    var stmt: ?*c.sqlite3_stmt = null;
-    if (c.sqlite3_prepare_v2(db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.ReadFailed;
-    defer _ = c.sqlite3_finalize(stmt);
-    _ = c.sqlite3_bind_int64(stmt, 1, seq);
-    const step_rc = c.sqlite3_step(stmt.?);
-    if (step_rc == c.SQLITE_DONE) return 0;
-    if (step_rc != c.SQLITE_ROW) return error.ReadFailed;
-
-    const ptr = c.sqlite3_column_blob(stmt, 0);
-    const len: usize = @intCast(c.sqlite3_column_bytes(stmt, 0));
-    const cap = @min(len, out.len);
-    if (cap > 0 and ptr != null) {
-        const p: [*]const u8 = @ptrCast(ptr);
-        @memcpy(out[0..cap], p[0..cap]);
-    }
-    return cap;
+    // D3: route through the multi-level store so L0-only (unflushed)
+    // bodies resolve from the ring, with SQLite as the cold-tier
+    // fallback. Keeps the durable table the source of truth for evicted
+    // events.
+    const body = firehose.bodyForSeq(db, seq, out) catch return error.ReadFailed;
+    return body.len;
 }
 
 /// Best-effort drain of any inbound client frames. Returns true if the
@@ -405,6 +394,8 @@ const schema_mod = @import("schema.zig");
 fn setupDb() !*c.sqlite3 {
     const sqlite_mod = core.storage.sqlite;
     const db = try sqlite_mod.openWriter(":memory:");
+    // Drop any stale L0 firehose store left on a recycled handle address.
+    firehose.forgetStore(db);
     for (schema_mod.all_migrations) |m| {
         const sql_z = try testing.allocator.dupeZ(u8, m.up);
         defer testing.allocator.free(sql_z);

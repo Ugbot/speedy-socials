@@ -18,6 +18,11 @@ const c = @import("sqlite").c;
 const core = @import("core");
 const StorageError = core.errors.StorageError;
 
+/// D3: multi-level (L0 ring + L1 SQLite) backing store for the firehose
+/// hot path. `appendKind` writes to the in-memory ring and batches the
+/// durable insert; reads check L0 before falling back to SQLite.
+const store = @import("firehose_store.zig");
+
 /// W5.1: an in-process notification fired synchronously from
 /// `append()` after a row has been committed. The relay's firehose
 /// consumer registers here at boot to pick up AT→AP translation work
@@ -41,38 +46,9 @@ pub fn currentLocalSink() ?LocalSink {
 
 /// AT-3: kinds of events the firehose can carry. Subscribers need
 /// each kind so AppViews / relays can keep their identity caches in
-/// sync as accounts mutate.
-pub const EventKind = enum {
-    commit,
-    identity,
-    account,
-    tombstone,
-    handle,
-    migrate,
-    info,
-
-    pub fn columnString(self: EventKind) []const u8 {
-        return switch (self) {
-            .commit => "commit",
-            .identity => "identity",
-            .account => "account",
-            .tombstone => "tombstone",
-            .handle => "handle",
-            .migrate => "migrate",
-            .info => "info",
-        };
-    }
-
-    pub fn fromColumn(s: []const u8) EventKind {
-        if (std.mem.eql(u8, s, "identity")) return .identity;
-        if (std.mem.eql(u8, s, "account")) return .account;
-        if (std.mem.eql(u8, s, "tombstone")) return .tombstone;
-        if (std.mem.eql(u8, s, "handle")) return .handle;
-        if (std.mem.eql(u8, s, "migrate")) return .migrate;
-        if (std.mem.eql(u8, s, "info")) return .info;
-        return .commit;
-    }
-};
+/// sync as accounts mutate. Defined in the store so both the hot-path
+/// ring and the read API share one canonical enum.
+pub const EventKind = store.EventKind;
 
 /// Append a firehose event row of the given kind. Returns the assigned
 /// sequence number. `commit_cid` is the empty string for non-commit
@@ -85,30 +61,11 @@ pub fn appendKind(
     body: []const u8,
     ts: i64,
 ) StorageError!i64 {
-    const sql = "INSERT INTO atp_firehose_events (did, commit_cid, body, ts, event_kind) VALUES (?,?,?,?,?)";
-    var stmt: ?*c.sqlite3_stmt = null;
-    const rc = c.sqlite3_prepare_v2(db, sql, -1, &stmt, null);
-    if (rc != c.SQLITE_OK or stmt == null) return error.PrepareFailed;
-    defer _ = c.sqlite3_finalize(stmt);
-
-    _ = c.sqlite3_bind_text(stmt, 1, did.ptr, @intCast(did.len), c.sqliteTransientAsDestructor());
-    _ = c.sqlite3_bind_text(stmt, 2, commit_cid.ptr, @intCast(commit_cid.len), c.sqliteTransientAsDestructor());
-    _ = c.sqlite3_bind_blob(stmt, 3, body.ptr, @intCast(body.len), c.sqliteTransientAsDestructor());
-    _ = c.sqlite3_bind_int64(stmt, 4, ts);
-    const kind_str = kind.columnString();
-    _ = c.sqlite3_bind_text(stmt, 5, kind_str.ptr, @intCast(kind_str.len), c.sqliteTransientAsDestructor());
-
-    const step_rc = c.sqlite3_step(stmt.?);
-    if (step_rc != c.SQLITE_DONE) return error.StepFailed;
-    const seq = c.sqlite3_last_insert_rowid(db);
-
-    const upd_sql = "UPDATE atp_firehose_cursor SET seq = ? WHERE id = 1";
-    var ustmt: ?*c.sqlite3_stmt = null;
-    if (c.sqlite3_prepare_v2(db, upd_sql, -1, &ustmt, null) == c.SQLITE_OK) {
-        defer _ = c.sqlite3_finalize(ustmt);
-        _ = c.sqlite3_bind_int64(ustmt, 1, seq);
-        _ = c.sqlite3_step(ustmt.?);
-    }
+    // D3 hot path: land the event in the L0 ring (assigning its seq) and
+    // let the store batch the durable L1 insert. The synchronous
+    // per-event INSERT + cursor UPDATE that used to live here is now
+    // amortised across a batch inside the store.
+    const seq = try store.append(db, kind, did, commit_cid, body, ts);
 
     if (local_sink) |sink| sink(seq, did, commit_cid, body, ts);
 
@@ -315,82 +272,47 @@ fn encodeInfoBody(name: []const u8, message: []const u8, out: []u8) !([]const u8
     return enc.written();
 }
 
-pub const Event = struct {
-    seq: i64,
-    did_buf: [256]u8 = undefined,
-    did_len: u16 = 0,
-    commit_cid_buf: [128]u8 = undefined,
-    commit_cid_len: u16 = 0,
-    ts: i64 = 0,
-    kind: EventKind = .commit,
+/// Read-facing event. Aliased to the store's type so the L0 ring and
+/// the SQLite fallback hand back one shape.
+pub const Event = store.Event;
 
-    pub fn did(self: *const Event) []const u8 {
-        return self.did_buf[0..self.did_len];
-    }
-    pub fn commitCid(self: *const Event) []const u8 {
-        return self.commit_cid_buf[0..self.commit_cid_len];
-    }
-};
-
-/// Read events with seq > `cursor`, up to `out.len`. Returns the count
-/// written.
+/// Read events with seq > `cursor`, up to `out.len`. L0 (in-memory ring)
+/// serves recent events without touching SQLite; older seqs fall back to
+/// the durable `atp_firehose_events` table. Returns the count written.
 pub fn readSince(
     db: *c.sqlite3,
     cursor: i64,
     out: []Event,
 ) StorageError!u32 {
-    const sql = "SELECT seq, did, commit_cid, ts, event_kind FROM atp_firehose_events WHERE seq > ? ORDER BY seq ASC LIMIT ?";
-    var stmt: ?*c.sqlite3_stmt = null;
-    const rc = c.sqlite3_prepare_v2(db, sql, -1, &stmt, null);
-    if (rc != c.SQLITE_OK or stmt == null) return error.PrepareFailed;
-    defer _ = c.sqlite3_finalize(stmt);
-
-    _ = c.sqlite3_bind_int64(stmt, 1, cursor);
-    _ = c.sqlite3_bind_int64(stmt, 2, @intCast(out.len));
-
-    var n: u32 = 0;
-    while (n < out.len) {
-        const step_rc = c.sqlite3_step(stmt.?);
-        if (step_rc == c.SQLITE_DONE) break;
-        if (step_rc != c.SQLITE_ROW) return error.StepFailed;
-
-        var ev: Event = .{ .seq = c.sqlite3_column_int64(stmt, 0) };
-        const did_ptr = c.sqlite3_column_text(stmt, 1);
-        const did_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 1));
-        if (did_len > 0 and did_ptr != null) {
-            const cap = @min(did_len, ev.did_buf.len);
-            @memcpy(ev.did_buf[0..cap], did_ptr[0..cap]);
-            ev.did_len = @intCast(cap);
-        }
-        const cid_ptr = c.sqlite3_column_text(stmt, 2);
-        const cid_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 2));
-        if (cid_len > 0 and cid_ptr != null) {
-            const cap = @min(cid_len, ev.commit_cid_buf.len);
-            @memcpy(ev.commit_cid_buf[0..cap], cid_ptr[0..cap]);
-            ev.commit_cid_len = @intCast(cap);
-        }
-        ev.ts = c.sqlite3_column_int64(stmt, 3);
-
-        const kind_ptr = c.sqlite3_column_text(stmt, 4);
-        const kind_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 4));
-        if (kind_len > 0 and kind_ptr != null) {
-            ev.kind = EventKind.fromColumn(kind_ptr[0..kind_len]);
-        }
-
-        out[n] = ev;
-        n += 1;
-    }
-    return n;
+    return store.readSince(db, cursor, out);
 }
 
+/// Force any L0-buffered events to the durable L1 table. A durability
+/// barrier for callers (and tests) that need every appended event in
+/// SQLite immediately.
+pub fn flush(db: *c.sqlite3) StorageError!void {
+    return store.flush(db);
+}
+
+/// Latest assigned seq, reflecting events still buffered in L0 as well
+/// as durable ones — the true high-water mark.
 pub fn latestSeq(db: *c.sqlite3) StorageError!i64 {
-    const sql = "SELECT seq FROM atp_firehose_cursor WHERE id = 1";
-    var stmt: ?*c.sqlite3_stmt = null;
-    if (c.sqlite3_prepare_v2(db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.PrepareFailed;
-    defer _ = c.sqlite3_finalize(stmt);
-    const step_rc = c.sqlite3_step(stmt.?);
-    if (step_rc == c.SQLITE_ROW) return c.sqlite3_column_int64(stmt, 0);
-    return 0;
+    return store.latestSeq(db);
+}
+
+/// Fetch the raw CBOR body for `seq` into `out`. Serves from the L0 ring
+/// when still retained, else from the durable table. Used by the
+/// subscribeRepos handler to frame each event's body block.
+pub fn bodyForSeq(db: *c.sqlite3, seq: i64, out: []u8) StorageError![]const u8 {
+    return store.bodyForSeq(db, seq, out);
+}
+
+/// Drop the L0 store bound to `db` (after the caller is done with the
+/// handle). Call this when closing a DB so a future handle reusing the
+/// same address does not inherit this database's ring or seq counter.
+/// Safe to call on an unknown handle.
+pub fn forgetStore(db: *c.sqlite3) void {
+    store.forget(db);
 }
 
 // ── Tests ──────────────────────────────────────────────────────────
@@ -401,6 +323,9 @@ const schema_mod = @import("schema.zig");
 fn setupDb() !*c.sqlite3 {
     const sqlite_mod = core.storage.sqlite;
     const db = try sqlite_mod.openWriter(":memory:");
+    // A previous test may have closed a DB at this same address; drop any
+    // stale L0 store so this fresh DB starts with seq 1.
+    store.forget(db);
     for (schema_mod.all_migrations) |m| {
         const sql_z = try testing.allocator.dupeZ(u8, m.up);
         defer testing.allocator.free(sql_z);
@@ -541,19 +466,10 @@ test "AT-3: encodeIdentityBody omits handle when empty" {
 // `readSince` deliberately omits the body to keep the live-tail Event
 // struct fixed-size, so we go straight to the persistent table here.
 fn readBodyForSeq(db: *c.sqlite3, seq: i64, out: []u8) StorageError![]const u8 {
-    const sql = "SELECT body FROM atp_firehose_events WHERE seq = ?";
-    var stmt: ?*c.sqlite3_stmt = null;
-    if (c.sqlite3_prepare_v2(db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.PrepareFailed;
-    defer _ = c.sqlite3_finalize(stmt);
-    _ = c.sqlite3_bind_int64(stmt, 1, seq);
-    if (c.sqlite3_step(stmt.?) != c.SQLITE_ROW) return error.StepFailed;
-    const ptr = c.sqlite3_column_blob(stmt, 0);
-    const len: usize = @intCast(c.sqlite3_column_bytes(stmt, 0));
-    if (len == 0 or ptr == null) return out[0..0];
-    const cap = @min(len, out.len);
-    const src: [*]const u8 = @ptrCast(ptr);
-    @memcpy(out[0..cap], src[0..cap]);
-    return out[0..cap];
+    // Route through the store so unflushed (L0-only) bodies are also
+    // resolvable; the store serves inline bodies from the ring and falls
+    // back to SQLite for evicted/oversized ones.
+    return store.bodyForSeq(db, seq, out);
 }
 
 /// AT1: result of scanning a flat CBOR map body for one key's value.

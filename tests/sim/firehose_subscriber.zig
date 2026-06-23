@@ -168,7 +168,11 @@ pub fn run(allocator: std.mem.Allocator) !void {
         return error.AppendCountMismatch;
     }
 
-    // Persistent table holds them all (NEVER drops).
+    // D3: drain the L0 ring to the durable tier before asserting on the
+    // table — the hot path batches inserts, so the tail of events may
+    // still be buffered. After flush the persistent table holds them all
+    // (and NEVER drops).
+    try atp.firehose.flush(db);
     var stmt: ?*c.sqlite3_stmt = null;
     _ = c.sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM atp_firehose_events", -1, &stmt, null);
     defer _ = c.sqlite3_finalize(stmt);
@@ -205,6 +209,10 @@ pub fn run(allocator: std.mem.Allocator) !void {
 }
 
 fn applyAtpMigrationsHere(allocator: std.mem.Allocator, db: *c.sqlite3) !void {
+    // D3: the firehose now keeps an L0 ring keyed by the DB handle; a
+    // prior test may have left a store on this recycled address. Drop it
+    // so this DB starts clean.
+    atp.firehose.forgetStore(db);
     var errmsg: [*c]u8 = null;
     _ = c.sqlite3_exec(
         db,

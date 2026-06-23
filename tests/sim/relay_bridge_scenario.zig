@@ -222,6 +222,7 @@ fn countRows(db: *c.sqlite3, sql: []const u8, param: []const u8) !i64 {
 
 fn openSchemaDb() !*c.sqlite3 {
     const db = try core.storage.sqlite.openWriter(":memory:");
+    atproto.firehose.forgetStore(db); // clear stale L0 store on recycled handle
     inline for ([_]type{
         atproto.schema,
         activitypub.schema,

@@ -41,6 +41,8 @@ fn run(seed: u64, allocator: std.mem.Allocator) ![32]u8 {
     const sqlite_mod = core.storage.sqlite;
     const db = try sqlite_mod.openWriter(":memory:");
     defer sqlite_mod.closeDb(db);
+    // D3: drop any stale L0 firehose store on this recycled handle.
+    atproto.firehose.forgetStore(db);
 
     try applyAtprotoSchema(db, allocator);
     try applyRelaySchema(db, allocator);
@@ -58,7 +60,9 @@ fn run(seed: u64, allocator: std.mem.Allocator) ![32]u8 {
         _ = try atproto.firehose.append(db, did, cid, body, sc.clock().wallUnix());
     }
 
-    // Hash the firehose_events table as a deterministic fingerprint.
+    // D3: flush the L0 ring so the whole run is durable, then hash the
+    // firehose_events table as a deterministic fingerprint.
+    try atproto.firehose.flush(db);
     var stmt: ?*c.sqlite3_stmt = null;
     const sql = "SELECT seq, did, commit_cid, body FROM atp_firehose_events ORDER BY seq";
     _ = c.sqlite3_prepare_v2(db, sql, -1, &stmt, null);
