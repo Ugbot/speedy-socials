@@ -122,6 +122,14 @@ pub const Stats = struct {
     dropped: std.atomic.Value(u64) = .init(0),
     translated_ok: std.atomic.Value(u64) = .init(0),
     translated_err: std.atomic.Value(u64) = .init(0),
+    /// Count of ring items the worker has fully finished (popped +
+    /// `processItem` returned, whatever the per-record outcome). This
+    /// is the "this item is fully drained" signal — distinct from
+    /// `enqueued` (pushed to the ring) and `translated_ok` (a record
+    /// produced an AP activity). A waiter that needs the worker to be
+    /// quiescent for an item — including the unsupported-collection
+    /// path, which produces no `translated_ok` — spins on this.
+    processed: std.atomic.Value(u64) = .init(0),
 };
 
 const Ring = core.stdx.RingBufferType(QueueItem, .{ .array = ring_capacity });
@@ -265,6 +273,11 @@ fn workerLoop(self: *Consumer) void {
             std.log.warn("relay consumer: processItem failed: {s}", .{@errorName(err)});
             _ = self.stats.translated_err.fetchAdd(1, .monotonic);
         };
+        // Item fully drained (regardless of per-record outcome). Bump
+        // last so a waiter that observes `processed` knows every db
+        // touch this item triggered has completed. Release so the
+        // observing thread sees those writes before it reads the db.
+        _ = self.stats.processed.fetchAdd(1, .release);
     }
 }
 
@@ -569,6 +582,11 @@ test "consumer: end-to-end firehose append → translation log entry" {
 
     var sc = core.clock.SimClock.init(ts);
     const consumer = try start(testing.allocator, db, sc.clock(), "relay.test");
+    // Safety net: if an assertion below fails before the explicit
+    // `stop`, this tears the worker down so the next test doesn't
+    // inherit a live consumer pointing at a freed db. `stop` is
+    // idempotent (no-op once `instance` is null), so the explicit
+    // call + this defer don't double-free.
     defer stop(testing.allocator);
 
     // Trigger the sink via a real firehose append.
@@ -581,6 +599,17 @@ test "consumer: end-to-end firehose append → translation log entry" {
         sleepNs(2 * std.time.ns_per_ms);
     }
     try testing.expect(consumer.stats.translated_ok.load(.monotonic) >= 1);
+
+    // Quiesce the worker thread BEFORE the main thread touches `db`
+    // again. `translated_ok` is bumped mid-`processItem`, but the
+    // worker keeps issuing sqlite calls (followers.list, the outbox
+    // enqueue) on this same NOMUTEX connection afterwards. Reading
+    // `db` from the test thread while the worker is still inside a
+    // prepare/step races on shared connection state and aborts.
+    // `stop` joins the worker, giving us exclusive access to `db`.
+    // (Production gives the consumer its own connection; a shared
+    // :memory: handle can't be split, so the test serializes instead.)
+    stop(testing.allocator);
 
     // Verify the translation log got an at_to_ap row keyed on our uri.
     var log_rows: [4]subscription.LogEntry = undefined;
@@ -605,6 +634,7 @@ test "consumer: bridge target inbox enqueues into ap_federation_outbox" {
 
     var sc = core.clock.SimClock.init(ts);
     const consumer = try start(testing.allocator, db, sc.clock(), "relay.test");
+    // Safety net for an early-failure path; `stop` is idempotent.
     defer stop(testing.allocator);
 
     _ = try firehose.append(db, did, "bafycid", value, ts);
@@ -616,8 +646,13 @@ test "consumer: bridge target inbox enqueues into ap_federation_outbox" {
     }
     try testing.expect(consumer.stats.translated_ok.load(.monotonic) >= 1);
 
-    // Wait a beat for the post-translation enqueue to land.
-    sleepNs(50 * std.time.ns_per_ms);
+    // Join the worker before the main thread reads `db`. The enqueue
+    // into ap_federation_outbox happens AFTER translated_ok bumps, so
+    // we can't just spin on the counter — we must wait for the worker
+    // to finish the whole `processItem` (which `stop` guarantees via
+    // join). This also removes the concurrent-connection-use race that
+    // otherwise corrupts the shared NOMUTEX sqlite handle.
+    stop(testing.allocator);
 
     // Assert the row landed in ap_federation_outbox addressed at the
     // configured bridge target.
@@ -664,21 +699,35 @@ test "A6: unsupported collection is logged with reason (not silently dropped)" {
 
     var sc = core.clock.SimClock.init(ts);
     const consumer = try start(testing.allocator, db, sc.clock(), "relay.test");
+    // Safety net for an early-failure path; `stop` is idempotent.
     defer stop(testing.allocator);
 
     _ = try firehose.append(db, did, "bafycid", "{}", ts);
 
+    // Wait for the worker to FULLY process the item — not just enqueue
+    // it. The unsupported-collection path produces no `translated_ok`,
+    // so we spin on `processed` (bumped once processItem returns). This
+    // is deterministic: once processed >= 1 the appendLog row exists.
     var spin: u32 = 0;
-    while (spin < 100) : (spin += 1) {
-        if (consumer.stats.enqueued.load(.monotonic) > 0) break;
+    while (spin < 500) : (spin += 1) {
+        if (consumer.stats.processed.load(.acquire) > 0) break;
         sleepNs(2 * std.time.ns_per_ms);
     }
-    // Give the worker a beat to actually pop the item.
-    sleepNs(50 * std.time.ns_per_ms);
 
-    try testing.expect(consumer.stats.enqueued.load(.monotonic) >= 1);
-    try testing.expectEqual(@as(u64, 0), consumer.stats.translated_ok.load(.monotonic));
-    try testing.expectEqual(@as(u64, 0), consumer.stats.translated_err.load(.monotonic));
+    // Join the worker before reading `db`. The unsupported-collection
+    // path writes its log row via appendLog on the worker thread; the
+    // main thread must not prepare/step on the same NOMUTEX connection
+    // concurrently. Snapshot the stats first (the explicit `stop` frees
+    // the consumer), then `stop` joins so appendLog has fully landed and
+    // the connection is ours alone for the assertions below.
+    const enqueued = consumer.stats.enqueued.load(.monotonic);
+    const translated_ok = consumer.stats.translated_ok.load(.monotonic);
+    const translated_err = consumer.stats.translated_err.load(.monotonic);
+    stop(testing.allocator);
+
+    try testing.expect(enqueued >= 1);
+    try testing.expectEqual(@as(u64, 0), translated_ok);
+    try testing.expectEqual(@as(u64, 0), translated_err);
 
     // A6: the unsupported-collection event is now logged with a
     // reason so /admin/relay/log shows we saw it.
