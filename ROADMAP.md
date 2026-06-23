@@ -55,10 +55,27 @@ H1 per-vhost plugin-registry isolation — dispatch mechanism (C2; boot-wiring d
 hierarchical Merkle Search Tree with per-node block persistence (MST) · deterministic-replay
 sim test for the AT→AP relay path (J3) · gated Mastodon e2e CI job + round-trip test (J5).
 
-**All three ROADMAP waves are now complete and merged to `main`.** Remaining lower-priority
-follow-ups (not in these waves): multi-level firehose storage (D3) for ≥10× hot-path
-throughput; per-tenant registry boot-wiring (H1 composition root); MST incremental
-structural-diff persist; upstream-blocked C2/C5 TLS items.
+**All three ROADMAP waves are now complete and merged to `main`.**
+
+## ✅ Shipped 2026-06-23 — Wave 4 (on `main`, 1195 tests + 18 sims green)
+**MySQL host driver** (pure-Zig wire protocol — handshake/native-password auth/COM_QUERY/
+prepared statements; `STORAGE_BACKEND=mysql`) — **live-validated against MariaDB 11** ·
+**MS SQL host driver** (TDS 7.4: Pre-Login/LOGIN7/sp_executesql/token-stream; codec
+unit-tested 20/20; ⚠️ live validation pending a runnable SQL Server — segfaults under arm64
+qemu) · **multi-level firehose storage** D3 (L0 ring / L1 batch; ~450× hot-path append
+latency) · **H1 per-tenant registry boot-wiring** (RegistrySet constructed + bound at boot;
+storage isolated, plugin-state shared, default path unchanged) · **incremental MST persist**
+(~200× fewer block writes, rebuild-parity asserted) · **AP FEP-844e capability negotiation +
+poll-tally serving** · **fixed the `firehose_consumer` SIGABRT** (shared-`:memory:` SQLite
+race — stop/join before the test reads) · **phase-8 retirement re-verified** (legacy already
+gone).
+
+### Genuinely remaining (host/env-blocked or separate)
+- **MS SQL live round-trip** — needs a runnable SQL Server (not possible on this arm64 host
+  via qemu; codec is unit-tested + ready).
+- **Multi-SNI cert dispatch / outbound cert pinning** — blocked on upstream Zig `std.crypto.tls`.
+- **`third_party/zig-kafka`** vendored roadmap (C-API, examples, broker tests) — separate project.
+Everything actionable in-repo on this host is done.
 
 ---
 
