@@ -377,20 +377,29 @@ pub fn commit(
         fireChange(if (pre_existing) ChangeKind.update else ChangeKind.create, did, op.collection, rkey, record_cid_s);
     }
 
-    // Compute new MST root and persist *every* node block. The hierarchical
-    // MST is a DAG of `{l, e:[{p,k,v,t}]}` nodes (see `mst.zig`); each node is
-    // a DAG-CBOR block keyed by its own CID. `buildAndEmit` streams each node
-    // (children before parents) to the sink, which inserts it into
-    // `atp_mst_blocks`. The repo `data` root is the *root node's* CID.
+    // Compute new MST root and persist the changed node blocks. The
+    // hierarchical MST is a DAG of `{l, e:[{p,k,v,t}]}` nodes (see `mst.zig`);
+    // each node is a DAG-CBOR block keyed by its own CID. The repo `data` root
+    // is the *root node's* CID.
+    //
+    // Incremental persistence (MSTi): `buildAndEmitIncremental` re-encodes and
+    // streams ONLY the O(K·depth) nodes on the paths to the K records changed
+    // since the last persisted root. Unchanged sibling subtrees keep their
+    // existing CIDs (looked up in the tree's node cache) and are neither
+    // re-encoded nor re-emitted — they are already present in `atp_mst_blocks`
+    // from a previous commit. `INSERT OR REPLACE` keeps re-emission of the
+    // few changed nodes idempotent. The very first commit (cold tree / empty
+    // cache) and any commit after a cache overflow do a full rebuild that
+    // repopulates the cache for subsequent incremental commits.
     //
     // Incremental load: `loadTree`/`acquireTree` keep the in-memory tree warm
-    // across commits (AT-16), so we never reload records per commit. The node
-    // blocks are re-derived from that warm tree here; the CAR/sync layer reads
-    // them back from `atp_mst_blocks` by CID without ever needing a full
-    // "tree reload" — incremental block lookup by CID replaces the old
-    // single-root-block reload.
+    // across commits (AT-16), so we never reload records per commit; the warm
+    // tree is also what carries the dirty-path marks + node cache that make
+    // this persist incremental. The CAR/sync layer reads node blocks back from
+    // `atp_mst_blocks` by CID. `emitted_blocks` is the count actually written.
     var sink = MstBlockSink{ .db = db, .did = did };
-    const root_cid = try tree.buildAndEmit(@TypeOf(sink), &sink);
+    var emitted_blocks: u32 = 0;
+    const root_cid = try tree.buildAndEmitIncremental(@TypeOf(sink), &sink, &emitted_blocks);
     if (sink.err) |e| return e;
 
     var data_cid_str: [cid_mod.string_cid_len]u8 = undefined;

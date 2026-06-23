@@ -92,6 +92,21 @@ pub const max_key_bytes: usize = 256;
 /// Layer derivation hash width (bits) — SHA-256.
 const hash_bits: u32 = 256;
 
+/// Maximum distinct keys that may be marked dirty between two persisted
+/// roots before the incremental encoder falls back to a full rebuild.
+/// A commit normally touches 1 record; bursts (batch writes, replays)
+/// stay well under this. Sized so the dirty-key store is a fixed BSS
+/// array, not an allocation. On overflow we rebuild from scratch —
+/// always correct, just not incremental that one commit.
+pub const max_dirty_keys: u32 = 4096;
+
+/// Maximum cached node identities (one per live MST node). Each node
+/// owns at least one entry at its layer and entries are disjoint across
+/// nodes, so the live node count is bounded by the entry count. We cache
+/// node CIDs keyed by a 32-byte digest of (lo_key, hi_key, layer) so a
+/// subtree whose content is unchanged is reused without re-encoding.
+pub const max_node_cache: u32 = max_keys;
+
 pub const Entry = struct {
     key_len: u8,
     key_bytes: [max_key_bytes]u8,
@@ -138,6 +153,94 @@ fn commonPrefixLen(a: []const u8, b: []const u8) u32 {
     return i;
 }
 
+/// Identity digest of a subtree node: SHA-256 over its key span and
+/// layer. Two builds produce the same digest for the same subtree
+/// position, so a cached CID keyed by this digest is reusable whenever
+/// the subtree's *content* is also unchanged (guaranteed by the
+/// dirty-key range test in the incremental encoder).
+fn nodeIdentity(lo_key: []const u8, hi_key: []const u8, layer: u32) [32]u8 {
+    var h = std.crypto.hash.sha2.Sha256.init(.{});
+    var len_buf: [4]u8 = undefined;
+    std.mem.writeInt(u32, &len_buf, @intCast(lo_key.len), .little);
+    h.update(&len_buf);
+    h.update(lo_key);
+    std.mem.writeInt(u32, &len_buf, @intCast(hi_key.len), .little);
+    h.update(&len_buf);
+    h.update(hi_key);
+    std.mem.writeInt(u32, &len_buf, layer, .little);
+    h.update(&len_buf);
+    var out: [32]u8 = undefined;
+    h.final(&out);
+    return out;
+}
+
+/// Fixed-capacity map from a node-identity digest to its computed CID.
+/// Linear-probed open addressing over a fixed array — allocator-free,
+/// every loop bounded by capacity. Used by the incremental encoder to
+/// reuse unchanged subtree CIDs across commits.
+const NodeCache = struct {
+    const Slot = struct {
+        id: [32]u8 = undefined,
+        cid: cid_mod.Cid = undefined,
+        used: bool = false,
+    };
+    slots: [max_node_cache]Slot = [_]Slot{.{}} ** max_node_cache,
+    count: u32 = 0,
+
+    fn clear(self: *NodeCache) void {
+        var i: u32 = 0;
+        while (i < max_node_cache) : (i += 1) self.slots[i].used = false;
+        self.count = 0;
+    }
+
+    fn slotIndex(id: [32]u8) u32 {
+        // Use the first 8 bytes of the (already-uniform) digest as the
+        // hash; mask to capacity (a power of two).
+        const h = std.mem.readInt(u64, id[0..8], .little);
+        return @intCast(h & (max_node_cache - 1));
+    }
+
+    fn get(self: *const NodeCache, id: [32]u8) ?cid_mod.Cid {
+        var idx = slotIndex(id);
+        var probe: u32 = 0;
+        while (probe < max_node_cache) : (probe += 1) {
+            const s = &self.slots[idx];
+            if (!s.used) return null;
+            if (std.mem.eql(u8, &s.id, &id)) return s.cid;
+            idx = (idx + 1) & (max_node_cache - 1);
+        }
+        return null;
+    }
+
+    /// Insert or overwrite. Returns false only if the table is full and
+    /// the key is absent (caller falls back to a full rebuild next time).
+    fn put(self: *NodeCache, id: [32]u8, cid: cid_mod.Cid) bool {
+        var idx = slotIndex(id);
+        var probe: u32 = 0;
+        while (probe < max_node_cache) : (probe += 1) {
+            const s = &self.slots[idx];
+            if (!s.used) {
+                s.id = id;
+                s.cid = cid;
+                s.used = true;
+                self.count += 1;
+                return true;
+            }
+            if (std.mem.eql(u8, &s.id, &id)) {
+                s.cid = cid;
+                return true;
+            }
+            idx = (idx + 1) & (max_node_cache - 1);
+        }
+        return false;
+    }
+};
+
+comptime {
+    if (max_node_cache & (max_node_cache - 1) != 0)
+        @compileError("max_node_cache must be a power of two for masked probing");
+}
+
 /// A fixed-capacity sorted map. The host owns the storage so the MST
 /// itself is allocator-free.
 pub fn Tree(comptime N: u32) type {
@@ -149,8 +252,61 @@ pub fn Tree(comptime N: u32) type {
         entries: [N]Entry = undefined,
         count: u32 = 0,
 
+        // ── Incremental-persistence bookkeeping ──────────────────────
+        // Keys whose content changed (insert / value-overwrite / delete)
+        // since the last persisted root. The incremental encoder reuses
+        // any subtree whose key span contains no dirty key. `dirty_full`
+        // forces a full rebuild (set on overflow, or before the first
+        // incremental persist when no cache exists yet).
+        dirty_keys: [max_dirty_keys][max_key_bytes]u8 = undefined,
+        dirty_lens: [max_dirty_keys]u16 = undefined,
+        dirty_count: u32 = 0,
+        dirty_full: bool = true,
+        node_cache: NodeCache = .{},
+
         pub fn init() Self {
             return .{};
+        }
+
+        /// Record `key` as changed since the last persisted root. Bounds
+        /// the dirty set; on overflow we mark `dirty_full` so the next
+        /// persist does a full rebuild (still correct).
+        fn markDirty(self: *Self, key: []const u8) void {
+            if (self.dirty_full) return; // already forcing a full rebuild
+            // Dedup against an existing dirty entry (cheap, bounded).
+            var i: u32 = 0;
+            while (i < self.dirty_count) : (i += 1) {
+                if (self.dirty_lens[i] == key.len and
+                    std.mem.eql(u8, self.dirty_keys[i][0..self.dirty_lens[i]], key))
+                    return;
+            }
+            if (self.dirty_count >= max_dirty_keys) {
+                self.dirty_full = true;
+                return;
+            }
+            @memcpy(self.dirty_keys[self.dirty_count][0..key.len], key);
+            self.dirty_lens[self.dirty_count] = @intCast(key.len);
+            self.dirty_count += 1;
+        }
+
+        /// True if any dirty key lies in the closed lex interval
+        /// [lo_key, hi_key]. A subtree spanning that interval can be
+        /// reused from cache iff this is false.
+        fn dirtyInRange(self: *const Self, lo_key: []const u8, hi_key: []const u8) bool {
+            var i: u32 = 0;
+            while (i < self.dirty_count) : (i += 1) {
+                const dk = self.dirty_keys[i][0..self.dirty_lens[i]];
+                // lo_key <= dk <= hi_key (lexicographic)
+                if (!std.mem.lessThan(u8, dk, lo_key) and
+                    !std.mem.lessThan(u8, hi_key, dk)) return true;
+            }
+            return false;
+        }
+
+        /// Discard all dirty marks (called after a successful persist).
+        fn clearDirty(self: *Self) void {
+            self.dirty_count = 0;
+            self.dirty_full = false;
         }
 
         pub fn len(self: *const Self) u32 {
@@ -166,10 +322,16 @@ pub fn Tree(comptime N: u32) type {
 
             const idx = self.lowerBound(key);
             if (idx < self.count and entryKeyEql(&self.entries[idx], key)) {
+                // Overwrite: only mark dirty if the value actually changed,
+                // so a no-op re-put doesn't force re-encoding a subtree.
+                if (!std.mem.eql(u8, self.entries[idx].value.raw(), value.raw())) {
+                    self.markDirty(key);
+                }
                 self.entries[idx].value = value;
                 return true;
             }
             if (self.count >= N) return error.Full;
+            self.markDirty(key);
 
             // Shift right [idx, count) by one. Bounded by N.
             var i: u32 = self.count;
@@ -198,6 +360,7 @@ pub fn Tree(comptime N: u32) type {
             if (idx >= self.count) return false;
             if (!entryKeyEql(&self.entries[idx], key)) return false;
 
+            self.markDirty(key);
             var i: u32 = idx;
             while (i + 1 < self.count) : (i += 1) {
                 assertLe(i, N);
@@ -281,12 +444,66 @@ pub fn Tree(comptime N: u32) type {
         /// node `{l: null, e: []}` is emitted and its CID returned, matching
         /// the atproto convention that even an empty repo has a data root.
         pub fn buildAndEmit(self: *const Self, comptime Sink: type, sink: *Sink) AtpError!cid_mod.Cid {
+            // A full (non-incremental) build never touches the cache or the
+            // dirty set and emits every node. It takes `self` by const, so
+            // it cannot refresh the cache — that is the incremental path's
+            // job. Used for verification / reload / `getRoot`.
+            return self.buildAndEmitMode(Sink, sink, false, false, null);
+        }
+
+        /// Incremental build: emit ONLY the node blocks on changed paths.
+        /// Unchanged sibling subtrees keep their existing CIDs (looked up
+        /// in `self.node_cache`) and are NOT re-encoded or re-emitted.
+        /// Recomputed nodes refresh the cache; the dirty set is cleared on
+        /// success. The returned root CID is byte-identical to a full
+        /// rebuild of the same key set (proven in tests).
+        ///
+        /// `out_emitted` (optional) receives the number of node blocks the
+        /// sink was actually given — << total node count when few records
+        /// changed in a large tree.
+        pub fn buildAndEmitIncremental(
+            self: *Self,
+            comptime Sink: type,
+            sink: *Sink,
+            out_emitted: ?*u32,
+        ) AtpError!cid_mod.Cid {
+            var emitted: u32 = 0;
+            // First persist (no cache yet) or after an overflow → full
+            // rebuild, populating the cache for subsequent incremental
+            // commits.
+            // force_full: rebuild every node without consulting the cache,
+            // but still REFRESH the cache so subsequent commits go
+            // incremental. The two cases differ only in `reuse`.
+            const force_full = self.dirty_full or self.node_cache.count == 0;
+            if (force_full) self.node_cache.clear();
+            const root = if (force_full)
+                try self.buildAndEmitMode(Sink, sink, false, true, &emitted)
+            else
+                try self.buildAndEmitMode(Sink, sink, true, true, &emitted);
+            self.clearDirty();
+            if (out_emitted) |p| p.* = emitted;
+            return root;
+        }
+
+        /// `reuse`: consult the node cache to skip unchanged subtrees.
+        /// `refresh`: write every recomputed node's CID back to the cache.
+        /// `refresh` requires a mutable `self`; the public const full-build
+        /// path passes both false.
+        fn buildAndEmitMode(
+            self: anytype,
+            comptime Sink: type,
+            sink: *Sink,
+            comptime reuse: bool,
+            comptime refresh: bool,
+            out_emitted: ?*u32,
+        ) AtpError!cid_mod.Cid {
             // Empty tree → the canonical empty node.
             if (self.count == 0) {
                 var node_buf: [64]u8 = undefined;
                 const bytes = try encodeEmptyNode(&node_buf);
                 const cid = cid_mod.computeDagCbor(bytes);
                 try sink.onNode(cid, bytes);
+                if (out_emitted) |p| p.* += 1;
                 return cid;
             }
 
@@ -303,7 +520,7 @@ pub fn Tree(comptime N: u32) type {
             var root_cid: cid_mod.Cid = undefined;
             var root_present: bool = false;
             const top_layer = self.maxLayer(0, self.count);
-            try self.buildRange(Sink, sink, 0, self.count, top_layer, &root_cid, &root_present);
+            try self.buildRange(Sink, sink, 0, self.count, top_layer, &root_cid, &root_present, reuse, refresh, out_emitted);
             assert(root_present);
             return root_cid;
         }
@@ -330,8 +547,24 @@ pub fn Tree(comptime N: u32) type {
         /// entries-at-layer (this node's `e[]`) and the gap sub-ranges
         /// (children at a strictly lower layer). Children jobs carry a slot
         /// pointer; when fully built, the parent is assembled.
+        /// Attempt to reuse the cached CID for the subtree covering
+        /// entries [lo, hi) at `layer`. Returns the cached CID iff (a) we
+        /// are in incremental mode, (b) no dirty key lies in the subtree's
+        /// closed key span, and (c) the cache holds a CID for that span.
+        /// When all hold, the subtree is byte-identical to the previous
+        /// build, so neither it nor any descendant needs re-encoding.
+        fn tryReuse(self: *const Self, lo: u32, hi: u32, layer: u32, comptime reuse: bool) ?cid_mod.Cid {
+            if (!reuse) return null;
+            assert(hi > lo);
+            const lo_key = self.entries[lo].key();
+            const hi_key = self.entries[hi - 1].key();
+            if (self.dirtyInRange(lo_key, hi_key)) return null;
+            const id = nodeIdentity(lo_key, hi_key, layer);
+            return self.node_cache.get(id);
+        }
+
         fn buildRange(
-            self: *const Self,
+            self: anytype,
             comptime Sink: type,
             sink: *Sink,
             root_lo: u32,
@@ -339,7 +572,17 @@ pub fn Tree(comptime N: u32) type {
             root_layer: u32,
             out_cid: *cid_mod.Cid,
             out_present: *bool,
+            comptime reuse: bool,
+            comptime refresh: bool,
+            out_emitted: ?*u32,
         ) AtpError!void {
+            // Whole-tree reuse: if nothing on the path changed, the root
+            // node (and everything beneath it) is unchanged.
+            if (self.tryReuse(root_lo, root_hi, root_layer, reuse)) |cid| {
+                out_cid.* = cid;
+                out_present.* = true;
+                return;
+            }
             // A job to build one node. We process jobs with an explicit
             // stack. Because a node needs its children's CIDs *before* it can
             // be assembled, each job has two visits:
@@ -472,20 +715,27 @@ pub fn Tree(comptime N: u32) type {
                         const g_lo = jobs[ji].lo;
                         const g_hi = ent_ptr[0];
                         if (g_hi > g_lo) {
-                            if (top >= max_walk_depth) return error.MstInvariant;
                             const child_layer = self.maxLayer(g_lo, g_hi);
-                            jobs[top] = .{
-                                .lo = g_lo,
-                                .hi = g_hi,
-                                .layer = child_layer,
-                                .phase = 0,
-                                .out_cid = &jobs[ji].left_cid,
-                                .out_present = &jobs[ji].left_present,
-                                .ent = ent_arena[0..].ptr,
-                                .rt_cid = rt_cid_arena[0..].ptr,
-                                .rt_present = rt_present_arena[0..].ptr,
-                            };
-                            top += 1;
+                            if (self.tryReuse(g_lo, g_hi, child_layer, reuse)) |cid| {
+                                // Unchanged subtree → reuse cached CID, skip
+                                // the whole sub-traversal and its emission.
+                                jobs[ji].left_cid = cid;
+                                jobs[ji].left_present = true;
+                            } else {
+                                if (top >= max_walk_depth) return error.MstInvariant;
+                                jobs[top] = .{
+                                    .lo = g_lo,
+                                    .hi = g_hi,
+                                    .layer = child_layer,
+                                    .phase = 0,
+                                    .out_cid = &jobs[ji].left_cid,
+                                    .out_present = &jobs[ji].left_present,
+                                    .ent = ent_arena[0..].ptr,
+                                    .rt_cid = rt_cid_arena[0..].ptr,
+                                    .rt_present = rt_present_arena[0..].ptr,
+                                };
+                                top += 1;
+                            }
                         }
                     }
                     // Right gaps (between entries and after last).
@@ -494,20 +744,25 @@ pub fn Tree(comptime N: u32) type {
                         const g_lo = ent_ptr[e] + 1;
                         const g_hi = if (e + 1 < ent_count) ent_ptr[e + 1] else jobs[ji].hi;
                         if (g_hi > g_lo) {
-                            if (top >= max_walk_depth) return error.MstInvariant;
                             const child_layer = self.maxLayer(g_lo, g_hi);
-                            jobs[top] = .{
-                                .lo = g_lo,
-                                .hi = g_hi,
-                                .layer = child_layer,
-                                .phase = 0,
-                                .out_cid = &jobs[ji].rt_cid[e],
-                                .out_present = &jobs[ji].rt_present[e],
-                                .ent = ent_arena[0..].ptr,
-                                .rt_cid = rt_cid_arena[0..].ptr,
-                                .rt_present = rt_present_arena[0..].ptr,
-                            };
-                            top += 1;
+                            if (self.tryReuse(g_lo, g_hi, child_layer, reuse)) |cid| {
+                                jobs[ji].rt_cid[e] = cid;
+                                jobs[ji].rt_present[e] = true;
+                            } else {
+                                if (top >= max_walk_depth) return error.MstInvariant;
+                                jobs[top] = .{
+                                    .lo = g_lo,
+                                    .hi = g_hi,
+                                    .layer = child_layer,
+                                    .phase = 0,
+                                    .out_cid = &jobs[ji].rt_cid[e],
+                                    .out_present = &jobs[ji].rt_present[e],
+                                    .ent = ent_arena[0..].ptr,
+                                    .rt_cid = rt_cid_arena[0..].ptr,
+                                    .rt_present = rt_present_arena[0..].ptr,
+                                };
+                                top += 1;
+                            }
                         }
                     }
                     continue;
@@ -518,6 +773,19 @@ pub fn Tree(comptime N: u32) type {
                 const bytes = try self.encodeNode(&jobs[ji], &node_buf);
                 const cid = cid_mod.computeDagCbor(bytes);
                 try sink.onNode(cid, bytes);
+                if (out_emitted) |p| p.* += 1;
+                // Refresh the node cache so the next incremental build can
+                // reuse this (now-current) subtree if it stays clean. Only
+                // the incremental path mutates the cache; `self` is a
+                // mutable pointer there and const on the full path.
+                if (refresh) {
+                    const node_lo_key = self.entries[jobs[ji].lo].key();
+                    const node_hi_key = self.entries[jobs[ji].hi - 1].key();
+                    const id = nodeIdentity(node_lo_key, node_hi_key, jobs[ji].layer);
+                    // A full table can't accept a new id → force a full
+                    // rebuild next commit so the cache is rebuilt clean.
+                    if (!self.node_cache.put(id, cid)) self.dirty_full = true;
+                }
                 jobs[ji].out_cid.* = cid;
                 jobs[ji].out_present.* = true;
                 top -= 1;
@@ -1017,4 +1285,352 @@ test "mst: delete changes the root CID and removes the key from the DAG" {
     while (j < rec.n) : (j += 1) {
         try std.testing.expect(!std.mem.eql(u8, rec.keys[j][0..rec.key_lens[j]], "c.n/c"));
     }
+}
+
+// ── MSTi: incremental node persistence ──────────────────────────────
+//
+// These tests prove the incremental encoder is a *pure optimization*:
+// it writes only the node blocks on changed paths, yet the root CID and
+// the reloaded record set are byte-identical to what a from-scratch full
+// rebuild produces. The persistent store below mirrors the repo's
+// `atp_mst_blocks` table (`INSERT OR REPLACE` keyed by CID) by
+// accumulating every emitted block across commits and deduping by CID,
+// so reconstruction after an incremental commit walks the full DAG
+// (changed nodes from this commit + unchanged nodes carried over).
+
+/// Accumulating block store: large capacity, dedups by CID, mirrors
+/// `atp_mst_blocks`. Records the number of blocks written *per emit* via
+/// `last_writes` so tests can assert "only changed-path nodes written".
+const BlockStore = struct {
+    const Cap = 8192;
+    const BlobCap = 4096;
+    cids: [Cap]cid_mod.Cid = undefined,
+    lens: [Cap]u16 = undefined,
+    blobs: [Cap][BlobCap]u8 = undefined,
+    n: u32 = 0,
+    // Number of onNode calls in the most recent buildAndEmit* invocation.
+    last_writes: u32 = 0,
+
+    fn beginEmit(self: *BlockStore) void {
+        self.last_writes = 0;
+    }
+
+    pub fn onNode(self: *BlockStore, cid: cid_mod.Cid, bytes: []const u8) AtpError!void {
+        self.last_writes += 1;
+        if (bytes.len > BlobCap) return error.BufferTooSmall;
+        // INSERT OR REPLACE semantics: if the CID is already present,
+        // overwrite in place (same CID ⇒ same bytes, so this is a no-op
+        // store-wise but keeps the table from growing).
+        var i: u32 = 0;
+        while (i < self.n) : (i += 1) {
+            if (std.mem.eql(u8, self.cids[i].raw(), cid.raw())) {
+                @memcpy(self.blobs[i][0..bytes.len], bytes);
+                self.lens[i] = @intCast(bytes.len);
+                return;
+            }
+        }
+        if (self.n >= Cap) return error.MstInvariant;
+        self.cids[self.n] = cid;
+        self.lens[self.n] = @intCast(bytes.len);
+        @memcpy(self.blobs[self.n][0..bytes.len], bytes);
+        self.n += 1;
+    }
+
+    fn find(self: *const BlockStore, cid: cid_mod.Cid) ?[]const u8 {
+        var i: u32 = 0;
+        while (i < self.n) : (i += 1) {
+            if (std.mem.eql(u8, self.cids[i].raw(), cid.raw())) {
+                return self.blobs[i][0..self.lens[i]];
+            }
+        }
+        return null;
+    }
+};
+
+/// Walk the node DAG rooted at `root` over a `BlockStore`, collecting
+/// every (key, value-CID) leaf. Mirrors `Reconstructor` but reads from
+/// the accumulating store. Bounded, explicit stack.
+const StoreReconstructor = struct {
+    store: *const BlockStore,
+    keys: [8192][256]u8 = undefined,
+    key_lens: [8192]u16 = undefined,
+    vals: [8192]cid_mod.Cid = undefined,
+    n: u32 = 0,
+
+    fn run(self: *StoreReconstructor, root: cid_mod.Cid) !void {
+        var stack: [1024]cid_mod.Cid = undefined;
+        var top: usize = 0;
+        stack[top] = root;
+        top += 1;
+        var guard: u32 = 0;
+        while (top > 0) {
+            guard += 1;
+            if (guard > 1_000_000) return error.MstInvariant;
+            top -= 1;
+            const cid = stack[top];
+            const bytes = self.store.find(cid) orelse return error.MstInvariant;
+            try self.visitNode(bytes, &stack, &top);
+        }
+    }
+
+    fn visitNode(self: *StoreReconstructor, bytes: []const u8, stack: *[1024]cid_mod.Cid, top: *usize) !void {
+        var dec = dag.Decoder.init(bytes);
+        const m = try dec.nextEvent();
+        if (m != .map_start) return error.MstInvariant;
+        const ke = try dec.nextEvent();
+        if (ke != .text or !std.mem.eql(u8, ke.text, "e")) return error.MstInvariant;
+        const arr = try dec.nextEvent();
+        if (arr != .array_start) return error.MstInvariant;
+        const ecount: u64 = arr.array_start;
+        var prev: [256]u8 = undefined;
+        var i: u64 = 0;
+        while (i < ecount) : (i += 1) {
+            const em = try dec.nextEvent();
+            if (em != .map_start or em.map_start != 4) return error.MstInvariant;
+            const kk = try dec.nextEvent();
+            if (kk != .text or !std.mem.eql(u8, kk.text, "k")) return error.MstInvariant;
+            const suffix_ev = try dec.nextEvent();
+            const suffix = suffix_ev.bytes;
+            const kp = try dec.nextEvent();
+            if (kp != .text or !std.mem.eql(u8, kp.text, "p")) return error.MstInvariant;
+            const p_ev = try dec.nextEvent();
+            const p: usize = @intCast(p_ev.uint);
+            const kt = try dec.nextEvent();
+            if (kt != .text or !std.mem.eql(u8, kt.text, "t")) return error.MstInvariant;
+            const t_ev = try dec.nextEvent();
+            const kv = try dec.nextEvent();
+            if (kv != .text or !std.mem.eql(u8, kv.text, "v")) return error.MstInvariant;
+            const v_ev = try dec.nextEvent();
+
+            var full: [256]u8 = undefined;
+            @memcpy(full[0..p], prev[0..p]);
+            @memcpy(full[p..][0..suffix.len], suffix);
+            const full_len = p + suffix.len;
+            @memcpy(prev[0..full_len], full[0..full_len]);
+
+            @memcpy(self.keys[self.n][0..full_len], full[0..full_len]);
+            self.key_lens[self.n] = @intCast(full_len);
+            self.vals[self.n] = cidFromBytes(v_ev.cid);
+            self.n += 1;
+
+            if (t_ev == .cid) {
+                stack[top.*] = cidFromBytes(t_ev.cid);
+                top.* += 1;
+            }
+        }
+        const kl = try dec.nextEvent();
+        if (kl != .text or !std.mem.eql(u8, kl.text, "l")) return error.MstInvariant;
+        const l_ev = try dec.nextEvent();
+        if (l_ev == .cid) {
+            stack[top.*] = cidFromBytes(l_ev.cid);
+            top.* += 1;
+        }
+    }
+};
+
+/// Count the total nodes a from-scratch full rebuild of `t` emits.
+fn fullNodeCount(t: *Tree(max_keys)) !u32 {
+    const store = try std.testing.allocator.create(BlockStore);
+    defer std.testing.allocator.destroy(store);
+    store.* = .{};
+    store.beginEmit();
+    _ = try t.buildAndEmit(BlockStore, store);
+    return store.last_writes;
+}
+
+/// Build a fresh tree holding exactly `t`'s current key/value set (full
+/// rebuild) and return its root CID. Used to assert incremental parity.
+fn rebuildRoot(t: *const Tree(max_keys)) !cid_mod.Cid {
+    const fresh = try std.testing.allocator.create(Tree(max_keys));
+    defer std.testing.allocator.destroy(fresh);
+    fresh.* = .{};
+    var i: u32 = 0;
+    while (i < t.count) : (i += 1) {
+        _ = try fresh.put(t.entries[i].key(), t.entries[i].value);
+    }
+    var scratch: [64 * 1024]u8 = undefined;
+    const r = try fresh.getRoot(&scratch);
+    return r.cid;
+}
+
+fn loadKey(buf: []u8, i: u32) []const u8 {
+    return std.fmt.bufPrint(buf, "app.bsky.feed.post/rec{x:0>8}", .{i}) catch unreachable;
+}
+
+test "MSTi: incremental insert writes only changed-path nodes; root matches full rebuild" {
+    const t = try std.testing.allocator.create(Tree(max_keys));
+    defer std.testing.allocator.destroy(t);
+    t.* = .{};
+
+    const N: u32 = 1500;
+    var kb: [64]u8 = undefined;
+    var i: u32 = 0;
+    while (i < N) : (i += 1) {
+        _ = try t.put(loadKey(&kb, i), fakeCid(@intCast(i % 251)));
+    }
+
+    // First (cold) commit: full build, populates the node cache and the
+    // persistent store. This is the baseline node count.
+    const store = try std.testing.allocator.create(BlockStore);
+    defer std.testing.allocator.destroy(store);
+    store.* = .{};
+    store.beginEmit();
+    const root0 = try t.buildAndEmitIncremental(BlockStore, store, null);
+    const total_nodes = store.last_writes;
+    try std.testing.expect(total_nodes >= 2); // multi-layer
+
+    // The cold incremental build must equal a from-scratch rebuild.
+    try std.testing.expectEqualSlices(u8, (try rebuildRoot(t)).raw(), root0.raw());
+
+    // Now insert ONE more record and commit incrementally.
+    _ = try t.put(loadKey(&kb, N), fakeCid(7));
+    store.beginEmit();
+    const root1 = try t.buildAndEmitIncremental(BlockStore, store, null);
+    const incr_writes = store.last_writes;
+
+    // Only the nodes on the single changed path were re-encoded/written.
+    // For N=1500 with fanout 4 the tree is several layers deep, so the
+    // changed-path node count is a small fraction of the total.
+    try std.testing.expect(incr_writes >= 1);
+    try std.testing.expect(incr_writes < total_nodes);
+    // Strong ratio assertion: << total. Allow generous headroom but
+    // require at least a 4x reduction (depth ≪ node count at this N).
+    try std.testing.expect(incr_writes * 4 < total_nodes);
+
+    // CORRECTNESS: incremental root == full rebuild root over the new set.
+    try std.testing.expectEqualSlices(u8, (try rebuildRoot(t)).raw(), root1.raw());
+
+    // CORRECTNESS: reload the full record set from the accumulated block
+    // DAG (changed + carried-over unchanged nodes) → exactly N+1 records,
+    // each with the value held in the tree.
+    const rec = try std.testing.allocator.create(StoreReconstructor);
+    defer std.testing.allocator.destroy(rec);
+    rec.* = .{ .store = store, .n = 0 };
+    try rec.run(root1);
+    try std.testing.expectEqual(N + 1, rec.n);
+    var j: u32 = 0;
+    while (j < rec.n) : (j += 1) {
+        const got = t.get(rec.keys[j][0..rec.key_lens[j]]) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualSlices(u8, got.raw(), rec.vals[j].raw());
+    }
+}
+
+test "MSTi: incremental delete writes only changed-path nodes; root matches full rebuild" {
+    const t = try std.testing.allocator.create(Tree(max_keys));
+    defer std.testing.allocator.destroy(t);
+    t.* = .{};
+
+    const N: u32 = 1500;
+    var kb: [64]u8 = undefined;
+    var i: u32 = 0;
+    while (i < N) : (i += 1) {
+        _ = try t.put(loadKey(&kb, i), fakeCid(@intCast(i % 251)));
+    }
+
+    const store = try std.testing.allocator.create(BlockStore);
+    defer std.testing.allocator.destroy(store);
+    store.* = .{};
+    store.beginEmit();
+    const root0 = try t.buildAndEmitIncremental(BlockStore, store, null);
+    const total_nodes = store.last_writes;
+    try std.testing.expectEqualSlices(u8, (try rebuildRoot(t)).raw(), root0.raw());
+
+    // Delete one record near the middle and commit incrementally.
+    try std.testing.expect(t.delete(loadKey(&kb, N / 2)));
+    store.beginEmit();
+    const root1 = try t.buildAndEmitIncremental(BlockStore, store, null);
+    const incr_writes = store.last_writes;
+
+    try std.testing.expect(incr_writes >= 1);
+    try std.testing.expect(incr_writes * 4 < total_nodes);
+
+    // Parity with a from-scratch rebuild of the post-delete set.
+    try std.testing.expectEqualSlices(u8, (try rebuildRoot(t)).raw(), root1.raw());
+
+    // Reload: exactly N-1 records, deleted key absent.
+    const rec = try std.testing.allocator.create(StoreReconstructor);
+    defer std.testing.allocator.destroy(rec);
+    rec.* = .{ .store = store, .n = 0 };
+    try rec.run(root1);
+    try std.testing.expectEqual(N - 1, rec.n);
+    const deleted = loadKey(&kb, N / 2);
+    var j: u32 = 0;
+    while (j < rec.n) : (j += 1) {
+        try std.testing.expect(!std.mem.eql(u8, rec.keys[j][0..rec.key_lens[j]], deleted));
+        const got = t.get(rec.keys[j][0..rec.key_lens[j]]) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualSlices(u8, got.raw(), rec.vals[j].raw());
+    }
+}
+
+test "MSTi: value-overwrite is incremental; no-op re-put writes nothing" {
+    const t = try std.testing.allocator.create(Tree(max_keys));
+    defer std.testing.allocator.destroy(t);
+    t.* = .{};
+
+    const N: u32 = 800;
+    var kb: [64]u8 = undefined;
+    var i: u32 = 0;
+    while (i < N) : (i += 1) {
+        _ = try t.put(loadKey(&kb, i), fakeCid(@intCast(i % 251)));
+    }
+    const store = try std.testing.allocator.create(BlockStore);
+    defer std.testing.allocator.destroy(store);
+    store.* = .{};
+    store.beginEmit();
+    _ = try t.buildAndEmitIncremental(BlockStore, store, null);
+    const total_nodes = store.last_writes;
+
+    // Overwrite one key's value with a *different* CID → incremental.
+    _ = try t.put(loadKey(&kb, 100), fakeCid(200));
+    store.beginEmit();
+    const root1 = try t.buildAndEmitIncremental(BlockStore, store, null);
+    try std.testing.expect(store.last_writes >= 1);
+    try std.testing.expect(store.last_writes * 4 < total_nodes);
+    try std.testing.expectEqualSlices(u8, (try rebuildRoot(t)).raw(), root1.raw());
+
+    // Re-put the SAME (key,value) → nothing dirtied → the whole tree is
+    // reused; the only "write" is the root reuse, i.e. zero re-encodes.
+    _ = try t.put(loadKey(&kb, 100), fakeCid(200));
+    store.beginEmit();
+    const root2 = try t.buildAndEmitIncremental(BlockStore, store, null);
+    try std.testing.expectEqual(@as(u32, 0), store.last_writes);
+    try std.testing.expectEqualSlices(u8, root1.raw(), root2.raw());
+}
+
+test "MSTi: a burst of K inserts touches O(K·depth) nodes, not all" {
+    const t = try std.testing.allocator.create(Tree(max_keys));
+    defer std.testing.allocator.destroy(t);
+    t.* = .{};
+
+    const N: u32 = 2000;
+    var kb: [64]u8 = undefined;
+    var i: u32 = 0;
+    while (i < N) : (i += 1) {
+        _ = try t.put(loadKey(&kb, i), fakeCid(@intCast(i % 251)));
+    }
+    const store = try std.testing.allocator.create(BlockStore);
+    defer std.testing.allocator.destroy(store);
+    store.* = .{};
+    store.beginEmit();
+    _ = try t.buildAndEmitIncremental(BlockStore, store, null);
+    const total_nodes = store.last_writes;
+
+    // Insert K=8 new records spread across the key space, then one commit.
+    const K: u32 = 8;
+    var s: u32 = 0;
+    while (s < K) : (s += 1) {
+        _ = try t.put(loadKey(&kb, N + s * 97), fakeCid(@intCast(s)));
+    }
+    store.beginEmit();
+    const root1 = try t.buildAndEmitIncremental(BlockStore, store, null);
+    // Still far fewer than a full rebuild for N=2000.
+    try std.testing.expect(store.last_writes < total_nodes);
+    try std.testing.expect(store.last_writes * 2 < total_nodes);
+    try std.testing.expectEqualSlices(u8, (try rebuildRoot(t)).raw(), root1.raw());
+
+    const rec = try std.testing.allocator.create(StoreReconstructor);
+    defer std.testing.allocator.destroy(rec);
+    rec.* = .{ .store = store, .n = 0 };
+    try rec.run(root1);
+    try std.testing.expectEqual(N + K, rec.n);
 }
