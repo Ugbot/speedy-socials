@@ -488,6 +488,27 @@ pub fn main() !void {
     // sibling lookup during `initAll`.
     relay.attachRegistry(&registry);
 
+    // H1b: per-tenant plugin-registry set. The existing global `registry`
+    // is the DEFAULT — the empty/default tenant always resolves to it, so a
+    // single-tenant deployment is byte-for-byte unchanged (the default
+    // tenant has `current()` == "" → `RegistrySet.resolve` returns the very
+    // same global registry the routes were built from). We point
+    // `server.registry_set` at this below, then populate it from the
+    // tenancy table once TENANTS is parsed.
+    //
+    // v1 SEMANTICS (documented deliberately): every known tenant is bound
+    // to the SAME shared `registry` instance. The route table and the
+    // plugin `state` singletons (e.g. `activitypub.state.get()`) are
+    // process-global, so re-running plugin init per tenant would not, by
+    // itself, isolate that state. What IS isolated per tenant today is
+    // STORAGE — `server.dispatch` calls `storage.setCurrentTenant`, routing
+    // each tenant's reads/writes to its own per-tenant database (opened +
+    // migrated eagerly in the TENANTS block via `ensureTenant`). The
+    // registry binding makes the `currentRegistry()` dispatch seam live
+    // (non-null, concrete) for every known tenant, so future per-tenant
+    // registries are a drop-in replacement for the shared one here.
+    var registry_set = core.plugin.RegistrySet.init(&registry);
+
     // INFRA-1/2/3/5: wire pluggable backends with safe defaults.
     // Operators swap these out via env at boot.
     //   * Account store: SQLite-backed by DEFAULT (AT-8..AT-11 are
@@ -990,6 +1011,15 @@ pub fn main() !void {
                     });
                 };
             }
+            // H1b: bind every configured tenant to the shared registry so
+            // dispatch stamps a concrete active registry for each known
+            // tenant (the default tenant still resolves to the same global
+            // registry). Shares one instance per the v1 semantics above.
+            registry_set.bindAllTenants(core.tenancy.globalTable(), &registry) catch |err| {
+                log_ptr.record(.warn, "boot", "failed to bind tenant registries", &.{
+                    .{ .k = "err", .v = @errorName(err) },
+                });
+            };
             log_ptr.info("boot", "multi-tenant Host routing + per-tenant storage configured (TENANTS)");
         } else |_| {
             log_ptr.warn("boot", "TENANTS failed to parse — multi-tenancy disabled");
@@ -1104,6 +1134,14 @@ pub fn main() !void {
         pool,
     );
     defer server.deinit();
+
+    // H1b: wire the per-tenant registry set into the server so dispatch
+    // resolves + stamps the active registry per request. For the default
+    // (single-tenant) deployment the set's only entry is the default
+    // pointing at the global `registry`, and the default tenant (empty id)
+    // resolves straight back to it — the stamp is the same registry the
+    // handlers already used, so behavior is unchanged.
+    server.registry_set = &registry_set;
 
     if (inbound_tls_backend == null) {
         log_ptr.info("boot", "listening on 127.0.0.1:8080 (plain HTTP — set TLS_CERT_PATH+TLS_KEY_PATH for HTTPS)");

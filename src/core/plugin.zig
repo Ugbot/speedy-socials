@@ -229,6 +229,35 @@ pub const RegistrySet = struct {
         assertLe(@as(u32, self.count), limits.max_tenant_registries);
     }
 
+    /// H1b: bind every tenant in a `tenancy.Table` to the same shared
+    /// registry. This is the v1 boot wiring: the route table and the
+    /// plugin `state` pointers are process-global singletons, so all
+    /// tenants legitimately share ONE registry instance. What is actually
+    /// isolated per-tenant lives elsewhere (storage routing via
+    /// `storage.setCurrentTenant`); this binding makes the dispatch path
+    /// stamp a concrete, non-null active registry for every known tenant
+    /// instead of falling through to the implicit default, so the
+    /// `currentRegistry()` seam is live in multi-tenant deployments.
+    ///
+    /// Duplicate ids are skipped (already bound). The empty/default tenant
+    /// is never an override slot — `resolve("")` already returns `default`.
+    /// Overflow beyond `max_tenant_registries` is reported.
+    pub fn bindAllTenants(
+        self: *RegistrySet,
+        table: *const @import("tenancy.zig").Table,
+        shared: *Registry,
+    ) PluginError!void {
+        var i: u8 = 0;
+        while (i < table.count) : (i += 1) {
+            const tid = table.items[i].id();
+            if (tid.len == 0) continue; // default tenant: never an override
+            self.bind(tid, shared) catch |err| switch (err) {
+                error.DuplicateName => {}, // already bound; idempotent
+                else => return err,
+            };
+        }
+    }
+
     /// Resolve the registry for a tenant id. The default tenant (empty
     /// id) and any id without an explicit binding map to `default`.
     pub fn resolve(self: *const RegistrySet, tenant_id: []const u8) *Registry {
@@ -383,6 +412,31 @@ test "C2: RegistrySet rejects empty id, duplicates, and overflow" {
         try set.bind(id, &other);
     }
     try std.testing.expectError(error.TooManyPlugins, set.bind("overflow", &other));
+}
+
+test "H1b: bindAllTenants binds every table tenant to the shared registry" {
+    const tenancy = @import("tenancy.zig");
+    var table = tenancy.Table.init();
+    try table.add("a.example", "tenant-a");
+    try table.add("b.example", "tenant-b");
+
+    var def = Registry.init();
+    var shared = Registry.init();
+    var set = RegistrySet.init(&def);
+
+    try set.bindAllTenants(&table, &shared);
+
+    // Both known tenants resolve to the shared registry (NOT the default
+    // fall-through), proving the dispatch stamp is concrete for them.
+    try std.testing.expect(set.resolve("tenant-a") == &shared);
+    try std.testing.expect(set.resolve("tenant-b") == &shared);
+    // Default tenant and an unknown id still fall through to default.
+    try std.testing.expect(set.resolve("") == &def);
+    try std.testing.expect(set.resolve("tenant-c") == &def);
+
+    // Idempotent: re-binding the same table must not error or double-count.
+    try set.bindAllTenants(&table, &shared);
+    try std.testing.expectEqual(@as(u8, 2), set.count);
 }
 
 test "C2: per-tenant plugin state is isolated through the active registry" {
