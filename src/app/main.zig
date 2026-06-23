@@ -628,6 +628,10 @@ pub fn main() !void {
     defer core.storage.backend.setGlobal(null);
     var pg_provider_holder: ?core.storage.PostgresProvider = null;
     defer if (pg_provider_holder) |*p| p.deinit();
+    var my_provider_holder: ?core.storage.MysqlProvider = null;
+    defer if (my_provider_holder) |*p| p.deinit();
+    var ms_provider_holder: ?core.storage.MssqlProvider = null;
+    defer if (ms_provider_holder) |*p| p.deinit();
     {
         const sb = if (std.c.getenv("STORAGE_BACKEND")) |v| std.mem.sliceTo(v, 0) else "sqlite";
         if (std.mem.eql(u8, sb, "postgres")) {
@@ -641,6 +645,34 @@ pub fn main() !void {
                 log_ptr.info("boot", "storage provider: postgres (pure-Zig pg.zig)");
             } else |err| {
                 log_ptr.record(.warn, "boot", "postgres connect failed — using sqlite", &.{
+                    .{ .k = "err", .v = @errorName(err) },
+                });
+            }
+        } else if (std.mem.eql(u8, sb, "mysql")) {
+            const url = if (std.c.getenv("DATABASE_URL")) |u| std.mem.sliceTo(u, 0) else "";
+            if (url.len == 0) {
+                log_ptr.warn("boot", "STORAGE_BACKEND=mysql but DATABASE_URL unset — using sqlite");
+            } else if (core.storage.MysqlProvider.init(gpa_allocator, url)) |mp| {
+                my_provider_holder = mp;
+                core.storage.setProvider(my_provider_holder.?.dbProvider());
+                core.storage.backend.setGlobal(my_provider_holder.?.my_backend.backend());
+                log_ptr.info("boot", "storage provider: mysql (pure-Zig wire driver)");
+            } else |err| {
+                log_ptr.record(.warn, "boot", "mysql connect failed — using sqlite", &.{
+                    .{ .k = "err", .v = @errorName(err) },
+                });
+            }
+        } else if (std.mem.eql(u8, sb, "mssql")) {
+            const url = if (std.c.getenv("DATABASE_URL")) |u| std.mem.sliceTo(u, 0) else "";
+            if (url.len == 0) {
+                log_ptr.warn("boot", "STORAGE_BACKEND=mssql but DATABASE_URL unset — using sqlite");
+            } else if (core.storage.MssqlProvider.init(url)) |mp| {
+                ms_provider_holder = mp;
+                core.storage.setProvider(ms_provider_holder.?.dbProvider());
+                core.storage.backend.setGlobal(ms_provider_holder.?.mssql_backend.backend());
+                log_ptr.info("boot", "storage provider: mssql (pure-Zig TDS; live-pending)");
+            } else |err| {
+                log_ptr.record(.warn, "boot", "mssql connect failed — using sqlite", &.{
                     .{ .k = "err", .v = @errorName(err) },
                 });
             }

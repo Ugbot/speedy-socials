@@ -16,6 +16,13 @@ pub const DbProvider = provider.DbProvider;
 pub const SqliteProvider = provider.SqliteProvider;
 /// Pure-Zig Postgres DbProvider (over pg.zig). See `storage/postgres_provider.zig`.
 pub const PostgresProvider = @import("storage/postgres_provider.zig").PostgresProvider;
+/// Pure-Zig MySQL/MariaDB DbProvider (in-tree wire driver). See `storage/mysql_provider.zig`.
+pub const MysqlProvider = @import("storage/mysql_provider.zig").MysqlProvider;
+pub const MysqlBackend = @import("storage/mysql_backend.zig").MysqlBackend;
+/// Pure-Zig MS SQL Server (TDS) DbProvider. Codec unit-tested; live validation
+/// pending a runnable SQL Server. See `storage/mssql/`.
+pub const MssqlProvider = @import("storage/mssql/mssql_provider.zig").MssqlProvider;
+pub const MssqlBackend = @import("storage/mssql/mssql_backend.zig").MssqlBackend;
 
 /// Zero-cost bridge from `Backend` to the standalone `zorm` library's
 /// storage contract. See `storage/zorm_adapter.zig`.
@@ -52,5 +59,11 @@ test {
     _ = backend;
     _ = provider;
     _ = PostgresProvider;
+    _ = MysqlProvider;
+    _ = MysqlBackend;
+    _ = @import("storage/mysql/mysql.zig");
+    _ = MssqlProvider;
+    _ = MssqlBackend;
+    _ = @import("storage/mssql/tds_test.zig");
     _ = zorm_adapter;
 }
