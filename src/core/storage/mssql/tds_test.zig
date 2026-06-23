@@ -557,3 +557,206 @@ test "reader: bounds checks prevent over-read" {
     try testing.expectError(error.Truncated, r.u8_());
     try testing.expectError(error.Truncated, r.u16le());
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// MSSQLTLS: Pre-Login ENCRYPTION negotiation + TDS-wrapped TLS framing
+// ─────────────────────────────────────────────────────────────────────────
+
+test "prelogin: ENCRYPT option byte round-trips through build (ON/REQ/OFF/NOT_SUP)" {
+    const modes = [_]u8{
+        tds.ENCRYPT_OFF, tds.ENCRYPT_ON, tds.ENCRYPT_NOT_SUP, tds.ENCRYPT_REQ,
+    };
+    for (modes) |m| {
+        var buf: [128]u8 = undefined;
+        const total = try tds.buildPreLogin(&buf, m);
+        // The server-response parser walks the same token-table layout, so a
+        // request we built must parse back to the encryption byte we asked for.
+        const payload = buf[tds.header_len..total];
+        const got = try tds.parsePreLoginEncryption(payload);
+        try testing.expectEqual(m, got);
+    }
+}
+
+test "parsePreLoginEncryption: handcrafted server response fixture" {
+    // A minimal server Pre-Login response: VERSION(6) + ENCRYPTION(1), table
+    // of 2 entries + terminator. Offsets are relative to the data region.
+    // table = 2*5 + 1 = 11 bytes.
+    const table_len: u16 = 2 * 5 + 1;
+    var p: [64]u8 = undefined;
+    // VERSION entry
+    p[0] = tds.PRELOGIN_VERSION;
+    p[1] = @intCast((table_len >> 8) & 0xFF);
+    p[2] = @intCast(table_len & 0xFF);
+    p[3] = 0;
+    p[4] = 6;
+    // ENCRYPTION entry (offset = table_len + 6)
+    const enc_off: u16 = table_len + 6;
+    p[5] = tds.PRELOGIN_ENCRYPTION;
+    p[6] = @intCast((enc_off >> 8) & 0xFF);
+    p[7] = @intCast(enc_off & 0xFF);
+    p[8] = 0;
+    p[9] = 1;
+    p[10] = tds.PRELOGIN_TERMINATOR;
+    // data region: 6 version bytes then the encryption byte (ENCRYPT_REQ).
+    var d: usize = table_len;
+    var k: usize = 0;
+    while (k < 6) : (k += 1) {
+        p[d] = 0;
+        d += 1;
+    }
+    p[d] = tds.ENCRYPT_REQ;
+    d += 1;
+    const got = try tds.parsePreLoginEncryption(p[0..d]);
+    try testing.expectEqual(tds.ENCRYPT_REQ, got);
+}
+
+test "parsePreLoginEncryption: missing ENCRYPTION option is Malformed" {
+    // Table with only VERSION + terminator, no ENCRYPTION → Malformed.
+    const table_len: u16 = 1 * 5 + 1;
+    var p: [32]u8 = undefined;
+    p[0] = tds.PRELOGIN_VERSION;
+    p[1] = @intCast((table_len >> 8) & 0xFF);
+    p[2] = @intCast(table_len & 0xFF);
+    p[3] = 0;
+    p[4] = 6;
+    p[5] = tds.PRELOGIN_TERMINATOR;
+    var d: usize = table_len;
+    var k: usize = 0;
+    while (k < 6) : (k += 1) {
+        p[d] = 0;
+        d += 1;
+    }
+    try testing.expectError(error.Malformed, tds.parsePreLoginEncryption(p[0..d]));
+}
+
+test "parsePreLoginEncryption: truncated table is rejected" {
+    // A 3-byte buffer cannot hold even one 5-byte entry nor a terminator.
+    var p = [_]u8{ tds.PRELOGIN_VERSION, 0x00, 0x0B };
+    try testing.expectError(error.Truncated, tds.parsePreLoginEncryption(&p));
+}
+
+test "frameTlsHandshake: single packet for a small flight (EOM set)" {
+    var prng = std.Random.DefaultPrng.init(0x515_71_5);
+    const rand = prng.random();
+    var flight: [500]u8 = undefined;
+    rand.bytes(&flight);
+
+    var out: [1024]u8 = undefined;
+    const n = try tds.frameTlsHandshake(&out, &flight, tds.default_packet_size, 0);
+    try testing.expectEqual(tds.header_len + flight.len, n);
+
+    const h = try tds.parseHeader(out[0..n]);
+    try testing.expectEqual(@as(u8, @intFromEnum(tds.PacketType.pre_login)), h.ptype);
+    try testing.expect(h.isEom());
+    try testing.expectEqualSlices(u8, &flight, out[tds.header_len..n]);
+}
+
+test "frameTlsHandshake: multi-packet chunking, only the last carries EOM" {
+    var prng = std.Random.DefaultPrng.init(0xBEEF_F00D);
+    const rand = prng.random();
+    var flight: [300]u8 = undefined;
+    rand.bytes(&flight);
+
+    // packet payload cap = 32, so 300 bytes → ceil(300/32) = 10 packets.
+    const pkt: u32 = tds.header_len + 32;
+    var out: [2048]u8 = undefined;
+    const n = try tds.frameTlsHandshake(&out, &flight, pkt, 0);
+
+    // Walk the packets: verify status bits + that payloads concatenate back.
+    var off: usize = 0;
+    var assembled: [300]u8 = undefined;
+    var asm_len: usize = 0;
+    var count: usize = 0;
+    var last_eom = false;
+    while (off < n) {
+        const h = try tds.parseHeader(out[off .. off + tds.header_len]);
+        const body = h.payloadLen();
+        // Every non-final packet must be full (cap=32) and non-EOM.
+        last_eom = h.isEom();
+        @memcpy(assembled[asm_len .. asm_len + body], out[off + tds.header_len .. off + h.length]);
+        asm_len += body;
+        off += h.length;
+        count += 1;
+        if (!last_eom) try testing.expectEqual(@as(usize, 32), body);
+    }
+    try testing.expect(last_eom); // final packet carries EOM
+    try testing.expectEqual(@as(usize, 10), count);
+    try testing.expectEqual(flight.len, asm_len);
+    try testing.expectEqualSlices(u8, &flight, assembled[0..asm_len]);
+}
+
+test "frameTlsHandshake: empty flight still emits one empty EOM packet" {
+    var out: [32]u8 = undefined;
+    const n = try tds.frameTlsHandshake(&out, &.{}, tds.default_packet_size, 0);
+    try testing.expectEqual(tds.header_len, n);
+    const h = try tds.parseHeader(out[0..n]);
+    try testing.expect(h.isEom());
+    try testing.expectEqual(@as(usize, 0), h.payloadLen());
+}
+
+test "frame/dechunk: round-trips for randomized sizes and packet sizes" {
+    var prng = std.Random.DefaultPrng.init(0xD3C0CEA5);
+    const rand = prng.random();
+    var iter: usize = 0;
+    while (iter < 64) : (iter += 1) {
+        const len = rand.intRangeAtMost(usize, 0, 1500);
+        var flight: [1500]u8 = undefined;
+        rand.bytes(flight[0..len]);
+        // Random packet payload cap in [8, 256].
+        const cap = rand.intRangeAtMost(u32, 8, 256);
+        const pkt: u32 = @as(u32, @intCast(tds.header_len)) + cap;
+        const start_pid = rand.int(u8);
+
+        var framed: [4096]u8 = undefined;
+        const fn_len = try tds.frameTlsHandshake(&framed, flight[0..len], pkt, start_pid);
+
+        var out: [1500]u8 = undefined;
+        const dc = try tds.dechunkTlsHandshake(&out, framed[0..fn_len]);
+        try testing.expect(dc.complete);
+        try testing.expectEqual(fn_len, dc.consumed);
+        try testing.expectEqual(len, dc.payload_len);
+        try testing.expectEqualSlices(u8, flight[0..len], out[0..dc.payload_len]);
+    }
+}
+
+test "dechunkTlsHandshake: partial header reports incomplete without consuming" {
+    // Fewer than header_len bytes → not even a full header.
+    var framed = [_]u8{ 0x12, 0x00, 0x00 };
+    var out: [64]u8 = undefined;
+    const dc = try tds.dechunkTlsHandshake(&out, &framed);
+    try testing.expect(!dc.complete);
+    try testing.expectEqual(@as(usize, 0), dc.consumed);
+    try testing.expectEqual(@as(usize, 0), dc.payload_len);
+}
+
+test "dechunkTlsHandshake: partial body stops at last whole-packet boundary" {
+    // Build two packets, then truncate inside the second's body. The first
+    // (non-EOM) packet must be consumed; the partial second must not.
+    var prng = std.Random.DefaultPrng.init(0x9A27_1A1);
+    const rand = prng.random();
+    var flight: [80]u8 = undefined;
+    rand.bytes(&flight);
+    const pkt: u32 = tds.header_len + 40; // 2 packets: 40 + 40
+    var framed: [256]u8 = undefined;
+    const fn_len = try tds.frameTlsHandshake(&framed, &flight, pkt, 0);
+    // First packet is header_len+40; truncate 5 bytes into the 2nd body.
+    const first_pkt = tds.header_len + 40;
+    const trunc = first_pkt + tds.header_len + 5;
+
+    var out: [128]u8 = undefined;
+    const dc = try tds.dechunkTlsHandshake(&out, framed[0..trunc]);
+    try testing.expect(!dc.complete);
+    try testing.expectEqual(first_pkt, dc.consumed);
+    try testing.expectEqual(@as(usize, 40), dc.payload_len);
+    _ = fn_len;
+}
+
+test "tlsChunkPayloadCap: equals packet_size minus header" {
+    var prng = std.Random.DefaultPrng.init(0xCA9_51_2E);
+    const rand = prng.random();
+    var i: usize = 0;
+    while (i < 64) : (i += 1) {
+        const sz = rand.intRangeAtMost(u32, tds.header_len + 1, 65535);
+        try testing.expectEqual(@as(usize, sz - tds.header_len), tds.tlsChunkPayloadCap(sz));
+    }
+}

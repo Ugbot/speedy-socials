@@ -80,7 +80,7 @@ pub const MssqlBackend = struct {
                 else => error.StepFailed,
             },
             error.BufferTooSmall => error.BufferTooSmall,
-            error.ConnectFailed, error.DnsFailed, error.SocketError, error.Closed, error.WriteFailed, error.ReadFailed => error.BackendFailed,
+            error.ConnectFailed, error.DnsFailed, error.SocketError, error.Closed, error.WriteFailed, error.ReadFailed, error.TlsHandshakeFailed, error.TlsRequiredButRefused => error.BackendFailed,
             error.Truncated, error.Malformed, error.UnsupportedToken, error.ProtocolError, error.ResponseTooLarge, error.TooManyColumns => error.StepFailed,
         };
     }

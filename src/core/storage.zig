@@ -65,5 +65,8 @@ test {
     _ = MssqlProvider;
     _ = MssqlBackend;
     _ = @import("storage/mssql/tds_test.zig");
+    _ = @import("storage/mssql/conn.zig");
+    _ = @import("storage/mssql/tls_transport.zig");
+    _ = @import("storage/mssql/mssql_provider.zig");
     _ = zorm_adapter;
 }

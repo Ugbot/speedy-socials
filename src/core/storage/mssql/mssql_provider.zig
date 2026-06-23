@@ -41,30 +41,58 @@ const MssqlBackend = mssql_backend.MssqlBackend;
 pub const MssqlProvider = struct {
     conn: Conn,
     mssql_backend: MssqlBackend,
+    /// Saved connection config; the actual Pre-Login/TLS/LOGIN7 handshake is
+    /// deferred to the first `dbProvider()` call so it runs at the provider's
+    /// final, stable address (see below).
+    cfg: conn_mod.Config,
+    connected: bool = false,
+    connect_err: ?Error = null,
 
-    /// Connect via a SQL-Server-style URI
-    /// (`mssql://user:pass@host:port/db`). The single connection performs
-    /// Pre-Login + LOGIN7 (SQL auth) during `init`.
-    /// `MssqlProvider` is returned by value, so the embedded `conn`'s address
-    /// is not stable until the caller stores the result. The backend's
-    /// `conn` pointer is therefore (re)bound to the final, stable address in
-    /// `dbProvider` — callers must reach the vtable through `dbProvider()`
-    /// (which is the only way to obtain the `DbProvider`), so the backend is
-    /// never dereferenced before its pointer is corrected.
+    /// Parse a SQL-Server-style URI (`mssql://user:pass@host:port/db`,
+    /// optional `?tls=require|off`) and stage the connection.
+    ///
+    /// ⚠️ The handshake is NOT performed here. `MssqlProvider` is returned by
+    /// value, so the embedded `conn`'s address is not stable until the caller
+    /// stores the result. When TLS is negotiated the std TLS client retains
+    /// pointers into `conn`'s embedded transport, which a post-return move
+    /// would dangle. We therefore defer the whole connect to `dbProvider()`,
+    /// which runs once at the stable address. `init` only fails on an
+    /// unparseable URI; connection failures surface from the first
+    /// `dbProvider()`/`backendFor` use (and are logged by the boot path).
     pub fn init(uri_str: []const u8) Error!MssqlProvider {
         const cfg = parseUri(uri_str) orelse return error.OpenFailed;
-        var self: MssqlProvider = .{ .conn = .{}, .mssql_backend = .{ .conn = undefined } };
-        self.conn.connect(cfg) catch return error.OpenFailed;
-        return self;
+        return .{ .conn = .{}, .mssql_backend = .{ .conn = undefined }, .cfg = cfg };
     }
 
     pub fn deinit(self: *MssqlProvider) void {
-        self.conn.close();
+        if (self.connected) self.conn.close();
+    }
+
+    /// True once the deferred handshake has succeeded. Callers (e.g. the boot
+    /// path) use this after `dbProvider()` to decide whether to fall back to
+    /// SQLite when the server is unreachable.
+    pub fn isConnected(self: *const MssqlProvider) bool {
+        return self.connected;
+    }
+
+    /// Perform the deferred connect exactly once, at the stable `self`
+    /// address. Idempotent; a prior failure is sticky (re-reported).
+    fn ensureConnected(self: *MssqlProvider) Error!void {
+        if (self.connected) return;
+        if (self.connect_err) |e| return e;
+        self.conn.connect(self.cfg) catch {
+            self.connect_err = error.OpenFailed;
+            return error.OpenFailed;
+        };
+        self.connected = true;
     }
 
     pub fn dbProvider(self: *MssqlProvider) DbProvider {
-        // Bind the backend to our (now stable) owned conn address.
+        // Bind the backend to our (now stable) owned conn address and run the
+        // deferred handshake. A connect failure is swallowed here (the vtable
+        // returns it on use); the provider object is still valid to hold.
         self.mssql_backend.conn = &self.conn;
+        self.ensureConnected() catch {};
         return .{ .ctx = self, .vtable = &vtable };
     }
 
@@ -131,13 +159,43 @@ fn parseUri(uri_str: []const u8) ?conn_mod.Config {
         .percent_encoded => |x| x,
     };
     if (path.len > 1) db = path[1..];
+
+    // Optional `?tls=require|off` flag. Default off (plaintext fallback).
+    var tls_mode: conn_mod.TlsMode = .off;
+    if (uri.query) |q| {
+        const qs = switch (q) {
+            .raw => |x| x,
+            .percent_encoded => |x| x,
+        };
+        tls_mode = parseTlsQuery(qs) orelse .off;
+    }
     return .{
         .host = host,
         .port = uri.port orelse 1433,
         .username = user,
         .password = pass,
         .database = db,
+        .tls = tls_mode,
     };
+}
+
+/// Scan a URI query string for a `tls=` key and map its value to a `TlsMode`.
+/// Recognized values: `require`/`on`/`1` → require; `off`/`disable`/`0` →
+/// off. An unrecognized or absent value yields null (caller defaults to off).
+fn parseTlsQuery(query: []const u8) ?conn_mod.TlsMode {
+    var it = std.mem.splitScalar(u8, query, '&');
+    while (it.next()) |pair| {
+        const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
+        const key = pair[0..eq];
+        const val = pair[eq + 1 ..];
+        if (!std.mem.eql(u8, key, "tls")) continue;
+        if (std.mem.eql(u8, val, "require") or std.mem.eql(u8, val, "on") or std.mem.eql(u8, val, "1"))
+            return .require;
+        if (std.mem.eql(u8, val, "off") or std.mem.eql(u8, val, "disable") or std.mem.eql(u8, val, "0"))
+            return .off;
+        return null;
+    }
+    return null;
 }
 
 const testing = std.testing;
@@ -163,6 +221,39 @@ test "MssqlProvider: parseUri defaults port 1433 + empty db" {
 
 test "MssqlProvider: parseUri rejects missing credentials" {
     try testing.expect(parseUri("mssql://host:1433/db") == null);
+}
+
+test "MssqlProvider: parseUri tls flag defaults off and honors require/on/1" {
+    const off_default = parseUri("mssql://u:p@h:1433/db") orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(conn_mod.TlsMode.off, off_default.tls);
+
+    const req = parseUri("mssql://u:p@h:1433/db?tls=require") orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(conn_mod.TlsMode.require, req.tls);
+
+    const on = parseUri("mssql://u:p@h:1433/db?tls=on") orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(conn_mod.TlsMode.require, on.tls);
+
+    const one = parseUri("mssql://u:p@h:1433/db?tls=1") orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(conn_mod.TlsMode.require, one.tls);
+
+    const explicit_off = parseUri("mssql://u:p@h:1433/db?tls=off") orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(conn_mod.TlsMode.off, explicit_off.tls);
+
+    // Unknown value falls back to off (the safe plaintext default).
+    const unknown = parseUri("mssql://u:p@h:1433/db?tls=banana") orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(conn_mod.TlsMode.off, unknown.tls);
+
+    // tls flag mixed with other query keys.
+    const mixed = parseUri("mssql://u:p@h:1433/db?foo=bar&tls=require&x=y") orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(conn_mod.TlsMode.require, mixed.tls);
+}
+
+test "parseTlsQuery: recognized + unrecognized values" {
+    try testing.expectEqual(conn_mod.TlsMode.require, parseTlsQuery("tls=require").?);
+    try testing.expectEqual(conn_mod.TlsMode.off, parseTlsQuery("tls=off").?);
+    try testing.expect(parseTlsQuery("tls=maybe") == null);
+    try testing.expect(parseTlsQuery("other=1") == null);
+    try testing.expect(parseTlsQuery("") == null);
 }
 
 test {

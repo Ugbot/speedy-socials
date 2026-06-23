@@ -280,6 +280,141 @@ pub fn buildPreLogin(buf: []u8, encryption: u8) Error!usize {
     return total;
 }
 
+/// Parse the server's Pre-Login RESPONSE payload (token table identical in
+/// shape to the request) and return the ENCRYPTION option byte the server
+/// chose. The response carries the same {token(1), offset(2 BE), length(2
+/// BE)} table terminated by 0xFF. Per MS-TDS §2.2.6.5 each option's offset
+/// is measured from the START of the PRELOGIN message data (i.e. the option
+/// table itself is at offset 0), so an option's payload lives at
+/// `payload[offset]` directly — matching how `buildPreLogin` emits them.
+/// Returns `error.Malformed` if the ENCRYPTION option is absent or its
+/// payload is empty / out of range.
+///
+/// The server replies with ENCRYPT_OFF (0x00), ENCRYPT_ON (0x01),
+/// ENCRYPT_NOT_SUP (0x02), or ENCRYPT_REQ (0x03). The caller (conn.zig)
+/// decides whether to start the TLS handshake based on this byte combined
+/// with the client's policy (`tls=require|off`).
+pub fn parsePreLoginEncryption(payload: []const u8) Error!u8 {
+    var j: usize = 0;
+    while (true) {
+        if (j >= payload.len) return error.Truncated;
+        if (payload[j] == PRELOGIN_TERMINATOR) break;
+        if (j + 5 > payload.len) return error.Truncated;
+        const token = payload[j];
+        const off = (@as(usize, payload[j + 1]) << 8) | @as(usize, payload[j + 2]);
+        const len = (@as(usize, payload[j + 3]) << 8) | @as(usize, payload[j + 4]);
+        if (token == PRELOGIN_ENCRYPTION) {
+            if (len == 0) return error.Malformed;
+            if (off >= payload.len) return error.Malformed;
+            return payload[off];
+        }
+        j += 5;
+    }
+    return error.Malformed;
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// TDS-wrapped TLS handshake framing (MS-TDS §2.2.6.5 / "TLS over TDS")
+// ─────────────────────────────────────────────────────────────────────────
+//
+// During the TDS Pre-Login phase the TLS handshake records are not sent
+// raw: each batch of TLS handshake bytes the client emits is wrapped in one
+// or more TDS packets of type PRELOGIN (0x12) with the standard 8-byte TDS
+// header, the final packet of a batch carrying the EOM status bit. The
+// server replies the same way. Once the TLS handshake completes the wrapping
+// is dropped and TLS records flow directly over the socket (LOGIN7 and every
+// subsequent TDS message then travels *inside* the TLS session).
+//
+// These are PURE functions over byte buffers — the chunking (TLS handshake
+// bytes → TDS 0x12 packets) and dechunking (TDS 0x12 payloads → contiguous
+// handshake bytes) are exhaustively unit-testable without a socket, which is
+// the whole point on a host that cannot run SQL Server.
+
+/// The max TLS-handshake payload that fits in one TDS packet given a target
+/// total packet size: `packet_size - header_len`. SQL Server's pre-login TLS
+/// packets conventionally use the default 4096-byte packet size.
+pub fn tlsChunkPayloadCap(packet_size: u32) usize {
+    std.debug.assert(packet_size > header_len);
+    return @as(usize, packet_size) - header_len;
+}
+
+/// Frame `handshake` (raw TLS handshake bytes the TLS client produced) into
+/// `out` as a sequence of TDS PRELOGIN (0x12) packets, each at most
+/// `packet_size` bytes total. Every packet but the last has `status_normal`;
+/// the last has `status_eom`. `packet_id` seeds the per-packet counter (it
+/// wraps at 256, matching the 1-byte PacketID field). A zero-length
+/// `handshake` still emits one empty EOM packet (a valid, if unusual, TDS
+/// message). Returns the number of bytes written to `out`.
+pub fn frameTlsHandshake(out: []u8, handshake: []const u8, packet_size: u32, packet_id: u8) Error!usize {
+    const cap = tlsChunkPayloadCap(packet_size);
+    var written: usize = 0;
+    var src: usize = 0;
+    var pid: u8 = packet_id;
+    // Emit at least one packet (handles the empty-handshake case).
+    while (true) {
+        const remaining = handshake.len - src;
+        const chunk = @min(remaining, cap);
+        const is_last = (src + chunk) >= handshake.len;
+        const total = header_len + chunk;
+        if (written + total > out.len) return error.BufferTooSmall;
+        const status: u8 = if (is_last) status_eom else status_normal;
+        _ = try writeHeader(out[written .. written + header_len], .pre_login, status, @intCast(total), pid);
+        if (chunk > 0) @memcpy(out[written + header_len .. written + total], handshake[src .. src + chunk]);
+        written += total;
+        src += chunk;
+        pid +%= 1;
+        if (is_last) break;
+    }
+    return written;
+}
+
+/// The result of dechunking a TDS-wrapped handshake stream: the contiguous
+/// handshake bytes recovered, plus how many bytes of `framed` were consumed
+/// (so a caller draining a socket buffer knows where the next message starts)
+/// and whether an EOM-terminated message was fully assembled.
+pub const Dechunked = struct {
+    /// Bytes written into the caller's destination buffer.
+    payload_len: usize,
+    /// Bytes consumed from the `framed` input.
+    consumed: usize,
+    /// True once a packet carrying the EOM bit was seen (message complete).
+    complete: bool,
+};
+
+/// Strip TDS packet headers from `framed` (a buffer holding one or more
+/// type-0x12 TDS packets) and copy the concatenated PAYLOAD bytes into `out`,
+/// stopping after the packet whose header sets the EOM bit. If `framed` ends
+/// mid-message (no EOM yet, or a partial header/body) the function returns
+/// what it could assemble with `complete=false` and `consumed` set to the
+/// last whole-packet boundary — the caller then reads more socket bytes and
+/// calls again with the unconsumed tail prepended.
+pub fn dechunkTlsHandshake(out: []u8, framed: []const u8) Error!Dechunked {
+    var payload_len: usize = 0;
+    var consumed: usize = 0;
+    while (true) {
+        if (consumed + header_len > framed.len) {
+            // Not even a full header buffered yet.
+            return .{ .payload_len = payload_len, .consumed = consumed, .complete = false };
+        }
+        const h = try parseHeader(framed[consumed .. consumed + header_len]);
+        const body_len = h.payloadLen();
+        if (consumed + h.length > framed.len) {
+            // Header present but body not fully buffered.
+            return .{ .payload_len = payload_len, .consumed = consumed, .complete = false };
+        }
+        if (payload_len + body_len > out.len) return error.BufferTooSmall;
+        const body_start = consumed + header_len;
+        if (body_len > 0) {
+            @memcpy(out[payload_len .. payload_len + body_len], framed[body_start .. body_start + body_len]);
+        }
+        payload_len += body_len;
+        consumed += h.length;
+        if (h.isEom()) {
+            return .{ .payload_len = payload_len, .consumed = consumed, .complete = true };
+        }
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // LOGIN7 request
 // ─────────────────────────────────────────────────────────────────────────

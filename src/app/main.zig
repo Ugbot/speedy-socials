@@ -668,9 +668,18 @@ pub fn main() !void {
                 log_ptr.warn("boot", "STORAGE_BACKEND=mssql but DATABASE_URL unset — using sqlite");
             } else if (core.storage.MssqlProvider.init(url)) |mp| {
                 ms_provider_holder = mp;
-                core.storage.setProvider(ms_provider_holder.?.dbProvider());
-                core.storage.backend.setGlobal(ms_provider_holder.?.mssql_backend.backend());
-                log_ptr.info("boot", "storage provider: mssql (pure-Zig TDS; live-pending)");
+                // dbProvider() runs the deferred Pre-Login/TLS/LOGIN7 at the
+                // holder's stable address. Fall back to sqlite if it can't
+                // reach the server.
+                const dbp = ms_provider_holder.?.dbProvider();
+                if (ms_provider_holder.?.isConnected()) {
+                    core.storage.setProvider(dbp);
+                    core.storage.backend.setGlobal(ms_provider_holder.?.mssql_backend.backend());
+                    log_ptr.info("boot", "storage provider: mssql (pure-Zig TDS; live-pending)");
+                } else {
+                    ms_provider_holder = null;
+                    log_ptr.warn("boot", "mssql connect failed — using sqlite");
+                }
             } else |err| {
                 log_ptr.record(.warn, "boot", "mssql connect failed — using sqlite", &.{
                     .{ .k = "err", .v = @errorName(err) },

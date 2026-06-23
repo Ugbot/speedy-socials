@@ -4,12 +4,22 @@
 //! token-stream parsing live in `tds.zig` (pure, unit-tested); this module
 //! is the thin I/O wrapper that those pure functions feed.
 //!
+//! TLS: when the connection config requests `tls=require`, Pre-Login
+//! advertises ENCRYPT_ON and the TDS-wrapped TLS handshake runs (see
+//! `tls_transport.zig`) before LOGIN7; thereafter LOGIN7 and every request/
+//! response travels inside the TLS session. `tls=off` keeps the plaintext
+//! path (advertise ENCRYPT_NOT_SUP). The wire layer (`writeAll`/`readExact`)
+//! is identical either way — it transparently routes through the TLS client
+//! when `tls_active`.
+//!
 //! ⚠️ LIVE VALIDATION PENDING A RUNNABLE SQL SERVER. SQL Server cannot run
 //! on this arm64 host (segfaults under qemu), so the network round-trip in
 //! this file is NOT exercised against a real server here. The packet codec
-//! it depends on IS exhaustively unit-tested in `tds_test.zig`. When a
-//! reachable SQL Server is available, set `MSSQL_TEST_URL` and the gated
-//! live test in `mssql_backend.zig` will exercise this path end-to-end.
+//! and the TDS-wrapped-TLS framing it depends on ARE unit-tested
+//! (`tds_test.zig`, `tls_transport.zig`'s socketpair tests). When a reachable
+//! SQL Server is available, set `MSSQL_TEST_URL` (optionally with
+//! `?tls=require`) and the gated live test in `mssql_backend.zig` will
+//! exercise this path end-to-end.
 //!
 //! Networking uses `std.c` sockets + getaddrinfo (this repo's Zig 0.16 std
 //! lacks `std.net`); mirrors `tls/boring_outbound.zig`'s dial idiom.
@@ -20,6 +30,7 @@
 
 const std = @import("std");
 const tds = @import("tds.zig");
+const tls_transport = @import("tls_transport.zig");
 
 pub const Error = error{
     DnsFailed,
@@ -33,7 +44,18 @@ pub const Error = error{
     ProtocolError,
     ResponseTooLarge,
     ServerError,
+    TlsHandshakeFailed,
+    TlsRequiredButRefused,
 } || tds.Error;
+
+/// TLS negotiation policy, selected via the `mssql://...?tls=...` URL flag.
+///   * `off`     — plaintext (advertise ENCRYPT_NOT_SUP); never start TLS.
+///   * `require` — advertise ENCRYPT_ON; perform the TDS-wrapped TLS
+///                 handshake and run LOGIN7 + all later traffic over TLS.
+///                 Encryption-in-transit without certificate authority
+///                 verification (SQL Server commonly uses self-signed certs);
+///                 a future `verify-full` mode can add CA/hostname checks.
+pub const TlsMode = enum { off, require };
 
 /// Per-connection send buffer. One request must fit (single-packet path).
 pub const send_buf_len: usize = 64 * 1024;
@@ -49,6 +71,7 @@ pub const Config = struct {
     password: []const u8,
     database: []const u8 = "",
     timeout_ms: u32 = 5000,
+    tls: TlsMode = .off,
 };
 
 pub const Conn = struct {
@@ -58,26 +81,50 @@ pub const Conn = struct {
     last_error_number: i32 = 0,
     /// Number of rows the last DONE token reported (when DONE_COUNT set).
     last_row_count: u64 = 0,
+    /// True once the TDS-wrapped TLS handshake has completed; all wire I/O
+    /// then flows through `tls_client` rather than the raw fd.
+    tls_active: bool = false,
     send_buf: [send_buf_len]u8 = undefined,
     recv_buf: [recv_buf_len]u8 = undefined,
 
-    /// Open a TCP connection, perform Pre-Login, then LOGIN7 with SQL auth.
+    // ── TLS state (only populated when `tls_active`) ───────────────────────
+    // `tls_xport` bridges the std TLS client to the TDS-wrapped socket during
+    // the handshake and to the raw socket afterward (see tls_transport.zig).
+    // `tls_threaded`/`tls_io` provide the `Io` the std TLS client requires;
+    // they own no sockets (the fd is owned here).
+    tls_xport: tls_transport.TdsTlsTransport = undefined,
+    tls_client: std.crypto.tls.Client = undefined,
+    tls_threaded: std.Io.Threaded = undefined,
+
+    /// Open a TCP connection, perform Pre-Login, optionally negotiate TLS,
+    /// then LOGIN7 with SQL auth.
     pub fn connect(self: *Conn, cfg: Config) Error!void {
         self.fd = try dialBlocking(cfg.host, cfg.port, cfg.timeout_ms);
         errdefer {
             _ = std.c.close(self.fd);
             self.fd = -1;
         }
+        self.tls_active = false;
 
-        // Pre-Login. We advertise ENCRYPT_NOT_SUP (plaintext) — TLS for TDS
-        // is a follow-on; the wire layer is identical once a TLS stream is
-        // substituted for the raw fd.
-        const pre_len = try tds.buildPreLogin(&self.send_buf, tds.ENCRYPT_NOT_SUP);
+        // Pre-Login. Advertise ENCRYPT_ON when TLS is requested, otherwise
+        // ENCRYPT_NOT_SUP for the plaintext fallback path.
+        const enc_advert: u8 = switch (cfg.tls) {
+            .off => tds.ENCRYPT_NOT_SUP,
+            .require => tds.ENCRYPT_ON,
+        };
+        const pre_len = try tds.buildPreLogin(&self.send_buf, enc_advert);
         try self.writeAll(self.send_buf[0..pre_len]);
         const pre_resp = try self.readResponse();
-        _ = pre_resp; // server's encryption response; we ignore for plaintext.
 
-        // LOGIN7.
+        if (cfg.tls == .require) {
+            const srv_enc = tds.parsePreLoginEncryption(pre_resp) catch return error.ProtocolError;
+            // The server must accept (ENCRYPT_ON) or mandate (ENCRYPT_REQ)
+            // encryption; ENCRYPT_NOT_SUP means it refuses TLS entirely.
+            if (srv_enc == tds.ENCRYPT_NOT_SUP) return error.TlsRequiredButRefused;
+            try self.startTls(cfg.host);
+        }
+
+        // LOGIN7 — over TLS if the handshake activated it, else plaintext.
         const login_len = try tds.buildLogin7(&self.send_buf, .{
             .username = cfg.username,
             .password = cfg.password,
@@ -88,7 +135,46 @@ pub const Conn = struct {
         try self.checkLoginAck(login_resp);
     }
 
+    /// Drive the TDS-wrapped TLS handshake: the std TLS client performs the
+    /// full handshake against `tls_xport`, whose Reader/Writer wrap the TLS
+    /// records in TDS 0x12 packets until completion. On return TLS records
+    /// flow directly over the socket and `tls_active` is set.
+    fn startTls(self: *Conn, host: []const u8) Error!void {
+        self.tls_threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
+        const io = self.tls_threaded.io();
+        errdefer self.tls_threaded.deinit();
+
+        self.tls_xport.init(self.fd, tds.default_packet_size);
+
+        var entropy: [std.crypto.tls.Client.Options.entropy_len]u8 = undefined;
+        io.vtable.randomSecure(io.userdata, &entropy) catch return error.TlsHandshakeFailed;
+        const now = std.Io.Timestamp.now(io, std.Io.Clock.real);
+
+        // `require` mode: encrypt in transit without CA/hostname verification
+        // (SQL Server frequently presents a self-signed certificate). A
+        // future `verify-full` mode would supply a CA bundle + explicit host.
+        const opts: std.crypto.tls.Client.Options = .{
+            .host = .no_verification,
+            .ca = .no_verification,
+            .write_buffer = &self.tls_xport.writer_buf_app,
+            .read_buffer = &self.tls_xport.read_buf_app,
+            .entropy = &entropy,
+            .realtime_now = now,
+        };
+        _ = host;
+        self.tls_client = std.crypto.tls.Client.init(&self.tls_xport.reader, &self.tls_xport.writer, opts) catch
+            return error.TlsHandshakeFailed;
+        // Handshake complete: drop TDS wrapping for subsequent records.
+        self.tls_xport.finishHandshake();
+        self.tls_active = true;
+    }
+
     pub fn close(self: *Conn) void {
+        if (self.tls_active) {
+            self.tls_client.end() catch {};
+            self.tls_threaded.deinit();
+            self.tls_active = false;
+        }
         if (self.fd >= 0) {
             _ = std.c.close(self.fd);
             self.fd = -1;
@@ -114,6 +200,11 @@ pub const Conn = struct {
     // ── Wire I/O ─────────────────────────────────────────────────────────
 
     fn writeAll(self: *Conn, buf: []const u8) Error!void {
+        if (self.tls_active) {
+            self.tls_client.writer.writeAll(buf) catch return error.WriteFailed;
+            self.tls_client.writer.flush() catch return error.WriteFailed;
+            return;
+        }
         var off: usize = 0;
         while (off < buf.len) {
             const n = std.c.write(self.fd, buf.ptr + off, buf.len - off);
@@ -141,6 +232,11 @@ pub const Conn = struct {
     }
 
     fn readExact(self: *Conn, dst: []u8) Error!void {
+        if (self.tls_active) {
+            // Decrypted TDS bytes come from the TLS client's reader.
+            self.tls_client.reader.readSliceAll(dst) catch return error.ReadFailed;
+            return;
+        }
         var off: usize = 0;
         while (off < dst.len) {
             const n = std.c.read(self.fd, dst.ptr + off, dst.len - off);
@@ -231,6 +327,7 @@ fn applyTimeouts(fd: c_int, timeout_ms: u32) void {
 }
 
 test {
-    // Pull the codec tests in when this module is compiled standalone.
+    // Pull the codec + TLS-transport tests in when compiled standalone.
     _ = tds;
+    _ = tls_transport;
 }
