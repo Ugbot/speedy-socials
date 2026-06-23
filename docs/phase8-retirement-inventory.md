@@ -7,6 +7,31 @@ Each entry was verified by grepping the new tree (`src/core/`, `src/app/`,
 reference, or path dependency. The new tree contains zero references to
 any of the following paths.
 
+## Retirement status (verified 2026-06-23)
+
+Re-verified against the tree at `origin/zorm-mssql` (commit 740f215).
+**Result: every item on the `delete` list below is already absent from the
+tree.** The legacy monolith was removed in an earlier commit; this pass
+confirmed there is nothing left to delete and that no live-tree code
+references any retired path.
+
+- All `src/*.zig` legacy modules: already gone.
+- `src/api/`, `src/relay/`: directories already gone.
+- `lib/atproto/`, `lib/zat/`, the whole `lib/` dir: already gone.
+- `third_party/zig-websocket/`: already gone (no `.gitmodules` entry).
+- `build.zig.zon`: already clean — `.paths` has no `lib` entry; no
+  `zig-websocket` reference; only the `sqlite` path dependency remains.
+
+False-positive note: `git grep '@import("server.zig")'` /
+`@import("email.zig")` / `@import("auth.zig")` matches are **new**
+co-located modules (`src/core/server.zig`, `src/core/email.zig`,
+`src/protocols/atproto/auth.zig`, `src/protocols/mastodon/auth.zig`),
+not the deleted legacy files — confirmed by path resolution.
+
+Build state after re-verification: `zig build test --summary all` →
+1132 pass (matches baseline); `zig build sim` → OK. No `build.zig` or
+`root.zig` edits were needed.
+
 ## src/ top-level (legacy monolith)
 
 All `delete`. None are imported by `src/core/`, `src/app/`, or
