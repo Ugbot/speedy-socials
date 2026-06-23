@@ -73,8 +73,16 @@ pub fn onChange(kind: repo.ChangeKind, did: []const u8, collection: []const u8, 
             logTranslation(db, "at_to_ap", at_uri, ap_id, clock.wallUnix());
         },
         .delete => {
-            // AP Delete: signals the bridged AP peer to drop the post.
-            const payload = renderDelete(actor, ap_id, at_uri, clock.wallUnix()) catch return;
+            // Like/repost/block deletions are *undones* on the AP side:
+            //   like deleted   → Undo{Like}      (unlike)
+            //   repost deleted  → Undo{Announce}  (unrepost)
+            //   block deleted   → Undo{Block}     (unblock)
+            // A post deletion is a genuine object Delete.
+            const undo = undoKindFor(collection);
+            const payload = if (undo == .none)
+                (renderDelete(actor, ap_id, at_uri, clock.wallUnix()) catch return)
+            else
+                (renderUndo(actor, ap_id, at_uri, undo, clock.wallUnix()) catch return);
             enqueueOutboxBestEffort(db, actor, payload, clock.wallUnix());
             logTranslation(db, "at_to_ap", at_uri, ap_id, clock.wallUnix());
         },
@@ -87,12 +95,26 @@ fn isBridgedCollection(c_name: []const u8) bool {
         "app.bsky.feed.like",
         "app.bsky.feed.repost",
         "app.bsky.graph.follow",
+        "app.bsky.graph.block",
         "app.bsky.actor.profile",
     };
     for (bridged) |b| {
         if (std.mem.eql(u8, b, c_name)) return true;
     }
     return false;
+}
+
+/// The AP activity type whose *deletion* a given AT collection mirrors.
+/// A like/repost/block deletion on the AT side is an `Undo{Like/Announce/
+/// Block}` on the AP side (unlike / unrepost / unblock), not a generic
+/// object Delete. A post deletion stays a `Delete`.
+const UndoKind = enum { like, announce, block, none };
+
+fn undoKindFor(c_name: []const u8) UndoKind {
+    if (std.mem.eql(u8, c_name, "app.bsky.feed.like")) return .like;
+    if (std.mem.eql(u8, c_name, "app.bsky.feed.repost")) return .announce;
+    if (std.mem.eql(u8, c_name, "app.bsky.graph.block")) return .block;
+    return .none;
 }
 
 fn lookupActorForDid(db: *c.sqlite3, did: []const u8, out: []u8) ?[]const u8 {
@@ -135,6 +157,36 @@ fn renderUpdate(actor: []const u8, ap_id: []const u8, target_id: []const u8, _: 
     ;
     var buf: [2048]u8 = undefined;
     const written = try std.fmt.bufPrint(&buf, fmt, .{ ap_id, actor, target_id });
+    payload_static.len = @intCast(written.len);
+    @memcpy(payload_static.buf[0..written.len], written);
+    return payload_static.buf[0..written.len];
+}
+
+/// Render `Undo{Like|Announce|Block}` for a deleted AT like/repost/block.
+/// The inner activity reproduces the original bridged activity's `id`
+/// (same `ap_id` we minted from the record's AT-URI) and type, so the
+/// receiving peer can match + drop the prior interaction.
+///
+/// The `Undo` wrapper gets its own id (`<ap_id>#undo`) so it doesn't
+/// collide with the original activity id in the peer's dedup store.
+fn renderUndo(actor: []const u8, ap_id: []const u8, target_id: []const u8, kind: UndoKind, _: i64) ![]const u8 {
+    const inner_type: []const u8 = switch (kind) {
+        .like => "Like",
+        .announce => "Announce",
+        .block => "Block",
+        .none => unreachable,
+    };
+    // Undo{Like|Announce}'s inner object is the original interaction's
+    // target object IRI (here the bridged activity id, consistent with
+    // how the create-side enqueues the Like/Announce `object`). Block's
+    // inner object is the blocked actor — also carried as the bridged
+    // record's mirror id. We keep the inner `object` = the activity id
+    // so a peer matching on our original activity `id` undoes it.
+    const fmt =
+        \\{{"@context":"https://www.w3.org/ns/activitystreams","id":"{s}#undo","type":"Undo","actor":"{s}","object":{{"id":"{s}","type":"{s}","actor":"{s}","object":"{s}"}}}}
+    ;
+    var buf: [2048]u8 = undefined;
+    const written = try std.fmt.bufPrint(&buf, fmt, .{ ap_id, actor, ap_id, inner_type, actor, target_id });
     payload_static.len = @intCast(written.len);
     @memcpy(payload_static.buf[0..written.len], written);
     return payload_static.buf[0..written.len];
@@ -396,4 +448,135 @@ test "I2: jsonEscape escapes quotes, backslashes and control chars" {
     try testing.expectEqualStrings("l1\\nl2", jsonEscape(&out, "l1\nl2"));
     try testing.expectEqualStrings("\\u0001", jsonEscape(&out, "\x01"));
     try testing.expectEqualStrings("plain", jsonEscape(&out, "plain"));
+}
+
+test "undoKindFor maps interaction collections; post stays a plain Delete" {
+    try testing.expectEqual(UndoKind.like, undoKindFor("app.bsky.feed.like"));
+    try testing.expectEqual(UndoKind.announce, undoKindFor("app.bsky.feed.repost"));
+    try testing.expectEqual(UndoKind.block, undoKindFor("app.bsky.graph.block"));
+    try testing.expectEqual(UndoKind.none, undoKindFor("app.bsky.feed.post"));
+    try testing.expectEqual(UndoKind.none, undoKindFor("app.bsky.actor.profile"));
+}
+
+test "isBridgedCollection now recognises graph.block" {
+    try testing.expect(isBridgedCollection("app.bsky.graph.block"));
+}
+
+const sqlite_mod_test = core.storage.sqlite;
+const at_schema_test = atproto.schema;
+const ap_schema_test = @import("protocol_activitypub").schema;
+const relay_schema_test = @import("schema.zig");
+
+fn setupChangeDb() !*c.sqlite3 {
+    const db = try sqlite_mod_test.openWriter(":memory:");
+    for (at_schema_test.all_migrations) |m| {
+        const sql_z = try testing.allocator.dupeZ(u8, m.up);
+        defer testing.allocator.free(sql_z);
+        var errmsg: [*c]u8 = null;
+        _ = c.sqlite3_exec(db, sql_z.ptr, null, null, &errmsg);
+        if (errmsg != null) c.sqlite3_free(errmsg);
+    }
+    for (ap_schema_test.all_migrations) |m| {
+        const sql_z = try testing.allocator.dupeZ(u8, m.up);
+        defer testing.allocator.free(sql_z);
+        var errmsg: [*c]u8 = null;
+        _ = c.sqlite3_exec(db, sql_z.ptr, null, null, &errmsg);
+        if (errmsg != null) c.sqlite3_free(errmsg);
+    }
+    for (relay_schema_test.all_migrations) |m| {
+        const sql_z = try testing.allocator.dupeZ(u8, m.up);
+        defer testing.allocator.free(sql_z);
+        var errmsg: [*c]u8 = null;
+        _ = c.sqlite3_exec(db, sql_z.ptr, null, null, &errmsg);
+        if (errmsg != null) c.sqlite3_free(errmsg);
+    }
+    return db;
+}
+
+/// Seed an identity-map row + a follower so `onChange` can resolve the
+/// actor and fan a payload into ap_federation_outbox.
+fn seedActorWithFollower(db: *c.sqlite3, did: []const u8, actor: []const u8, follower_inbox: []const u8) !void {
+    var sc = core.clock.SimClock.init(1);
+    try identity_map.upsert(db, sc.clock(), did, actor);
+    try @import("followers.zig").add(db, sc.clock(), actor, follower_inbox, "", "follow-iri-1");
+}
+
+fn firstOutboxPayload(db: *c.sqlite3, out: []u8) usize {
+    var stmt: ?*c.sqlite3_stmt = null;
+    if (c.sqlite3_prepare_v2(db, "SELECT payload FROM ap_federation_outbox ORDER BY id DESC LIMIT 1", -1, &stmt, null) != c.SQLITE_OK) return 0;
+    defer _ = c.sqlite3_finalize(stmt);
+    if (c.sqlite3_step(stmt.?) != c.SQLITE_ROW) return 0;
+    const ptr = c.sqlite3_column_text(stmt, 0);
+    const n: usize = @intCast(c.sqlite3_column_bytes(stmt, 0));
+    const cap = @min(n, out.len);
+    if (ptr != null and cap > 0) @memcpy(out[0..cap], ptr[0..cap]);
+    return cap;
+}
+
+test "onChange: like delete renders Undo{Like} into the outbox" {
+    const db = try setupChangeDb();
+    defer sqlite_mod_test.closeDb(db);
+    var sc = core.clock.SimClock.init(1_716_800_000);
+    state.init(null, null, sc.clock());
+    defer state.reset();
+    state.attachDb(db);
+    state.setRelayHost("relay.test");
+
+    const did = "did:plc:liker";
+    const actor = "https://relay.test/ap/users/at:plc:liker";
+    try seedActorWithFollower(db, did, actor, "https://m.example/users/peer/inbox");
+
+    onChange(.delete, did, "app.bsky.feed.like", "lk1", "");
+
+    var buf: [2048]u8 = undefined;
+    const n = firstOutboxPayload(db, &buf);
+    try testing.expect(n > 0);
+    try testing.expect(std.mem.indexOf(u8, buf[0..n], "\"type\":\"Undo\"") != null);
+    try testing.expect(std.mem.indexOf(u8, buf[0..n], "\"type\":\"Like\"") != null);
+}
+
+test "onChange: repost delete renders Undo{Announce}, post delete stays Delete" {
+    const db = try setupChangeDb();
+    defer sqlite_mod_test.closeDb(db);
+    var sc = core.clock.SimClock.init(1_716_810_000);
+    state.init(null, null, sc.clock());
+    defer state.reset();
+    state.attachDb(db);
+    state.setRelayHost("relay.test");
+
+    const did = "did:plc:rt";
+    const actor = "https://relay.test/ap/users/at:plc:rt";
+    try seedActorWithFollower(db, did, actor, "https://m.example/users/peer/inbox");
+
+    onChange(.delete, did, "app.bsky.feed.repost", "rp1", "");
+    var buf: [2048]u8 = undefined;
+    var n = firstOutboxPayload(db, &buf);
+    try testing.expect(std.mem.indexOf(u8, buf[0..n], "\"type\":\"Undo\"") != null);
+    try testing.expect(std.mem.indexOf(u8, buf[0..n], "\"type\":\"Announce\"") != null);
+
+    // A post deletion is a genuine Delete, not an Undo.
+    onChange(.delete, did, "app.bsky.feed.post", "p1", "");
+    n = firstOutboxPayload(db, &buf);
+    try testing.expect(std.mem.indexOf(u8, buf[0..n], "\"type\":\"Delete\"") != null);
+    try testing.expect(std.mem.indexOf(u8, buf[0..n], "Undo") == null);
+}
+
+test "onChange: block delete renders Undo{Block} into the outbox" {
+    const db = try setupChangeDb();
+    defer sqlite_mod_test.closeDb(db);
+    var sc = core.clock.SimClock.init(1_716_820_000);
+    state.init(null, null, sc.clock());
+    defer state.reset();
+    state.attachDb(db);
+    state.setRelayHost("relay.test");
+
+    const did = "did:plc:blocker";
+    const actor = "https://relay.test/ap/users/at:plc:blocker";
+    try seedActorWithFollower(db, did, actor, "https://m.example/users/peer/inbox");
+
+    onChange(.delete, did, "app.bsky.graph.block", "bk1", "");
+    var buf: [2048]u8 = undefined;
+    const n = firstOutboxPayload(db, &buf);
+    try testing.expect(std.mem.indexOf(u8, buf[0..n], "\"type\":\"Undo\"") != null);
+    try testing.expect(std.mem.indexOf(u8, buf[0..n], "\"type\":\"Block\"") != null);
 }

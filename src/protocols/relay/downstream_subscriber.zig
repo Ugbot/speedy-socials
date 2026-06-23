@@ -42,6 +42,7 @@ const std = @import("std");
 const core = @import("core");
 const c = @import("sqlite").c;
 const atproto = @import("protocol_atproto");
+const activitypub = @import("protocol_activitypub");
 const dag = atproto.dag_cbor;
 const ws_frame = core.ws.frame;
 const ws_stream = core.ws.stream;
@@ -49,6 +50,8 @@ const Arena = core.arena.Arena;
 
 const plugin = @import("plugin.zig");
 const subscription = @import("subscription.zig");
+const translate = @import("translate.zig");
+const identity_map = @import("identity_map.zig");
 
 /// Stream sub-protocol path. Identical to what the LOCAL server exposes;
 /// an external relay we subscribe to serves the same XRPC method.
@@ -264,9 +267,13 @@ pub const Subscriber = struct {
         var ingested: u32 = 0;
         var arena_buf: [frame_arena_bytes]u8 = undefined;
         for (ops[0..n_ops]) |op| {
-            // Only create/update carry a record we can translate.
-            if (!(std.mem.eql(u8, op.action(), "create") or std.mem.eql(u8, op.action(), "update"))) continue;
-            if (op.record_len == 0) continue;
+            const action = op.action();
+            const is_delete = std.mem.eql(u8, action, "delete");
+            const is_create_update = std.mem.eql(u8, action, "create") or std.mem.eql(u8, action, "update");
+            if (!is_delete and !is_create_update) continue;
+            // A create/update with no record body carries nothing to
+            // translate; a delete legitimately has none.
+            if (is_create_update and op.record_len == 0) continue;
 
             // path = "<collection>/<rkey>"; collection is everything up
             // to the last '/'.
@@ -277,6 +284,32 @@ pub const Subscriber = struct {
             // at_uri = "at://<did>/<path>"
             var uri_buf: [512]u8 = undefined;
             const at_uri = std.fmt.bufPrint(&uri_buf, "at://{s}/{s}", .{ did, path }) catch continue;
+
+            if (is_delete) {
+                // A record deletion on the upstream firehose → an AP
+                // Delete (post) or Undo{Like/Announce/Block} for the
+                // bridged interaction. Only bridged collections produce
+                // an activity; others are logged as seen.
+                if (translate.AtKind.fromCollection(collection) == null) {
+                    var reason_buf: [128]u8 = undefined;
+                    const reason = std.fmt.bufPrint(&reason_buf, "unsupported collection (delete): {s}", .{collection}) catch "unsupported collection";
+                    _ = subscription.appendLog(self.db, self.clock, .at_to_ap, at_uri, "", true, reason) catch {};
+                    continue;
+                }
+                // Dedup the delete on a distinct key so it doesn't clash
+                // with the create's at_uri log row.
+                var dkey_buf: [560]u8 = undefined;
+                const dkey = std.fmt.bufPrint(&dkey_buf, "{s} [deleted]", .{at_uri}) catch at_uri;
+                if (subscription.hasSuccessfulLog(self.db, .at_to_ap, dkey)) continue;
+                self.ingestUpstreamDelete(did, collection, at_uri, dkey) catch |err| {
+                    std.log.warn("relay downstream: delete ingest failed: {s}", .{@errorName(err)});
+                    continue;
+                };
+                ingested += 1;
+                _ = self.stats.records_ingested.fetchAdd(1, .monotonic);
+                core.metrics.incRelayAtToAp();
+                continue;
+            }
 
             // Dedup: a reconnect replays from the cursor and may resend
             // an event we already ingested. The translation log keys on
@@ -323,6 +356,85 @@ pub const Subscriber = struct {
         }
         _ = self.stats.commits_ingested.fetchAdd(1, .monotonic);
         return ingested;
+    }
+
+    /// Translate an upstream record DELETION into an AP activity and log
+    /// it. A post deletion → `Delete`; a like/repost/block deletion →
+    /// `Undo{Like/Announce/Block}` (unlike / unrepost / unblock). The
+    /// synthetic AP actor for the upstream DID is minted on demand so the
+    /// activity carries the same actor IRI the create-side used. The
+    /// activity id reproduces the bridged create's activity id (derived
+    /// from the same at_uri) so a receiving peer matches + undoes it.
+    fn ingestUpstreamDelete(
+        self: *Subscriber,
+        did: []const u8,
+        collection: []const u8,
+        at_uri: []const u8,
+        dedup_key: []const u8,
+    ) !void {
+        const kind = translate.AtKind.fromCollection(collection) orelse return error.UnsupportedKind;
+
+        var arena_buf: [frame_arena_bytes]u8 = undefined;
+        var arena = Arena.init(&arena_buf);
+
+        // Resolve / mint the synthetic AP actor for this DID (same path
+        // the create translator uses).
+        var maybe_actor = try identity_map.actorForDid(self.db, did, &arena);
+        if (maybe_actor == null) {
+            const synth = try identity_map.syntheticActorForDid(self.cfg.relay_host, did, &arena);
+            try identity_map.upsert(self.db, self.clock, did, synth);
+            maybe_actor = synth;
+        }
+        const actor = maybe_actor.?;
+
+        // Bridged activity id = "https://<host>/activities/<at_uri with
+        // '/'→':'>" — identical to plugin.buildApId's encoding.
+        const ap_id = try buildActivityId(self.cfg.relay_host, at_uri, &arena);
+
+        const alloc = arena.allocator();
+        const buf = try alloc.alloc(u8, 4 * 1024);
+        const payload = switch (kind) {
+            .post => try std.fmt.bufPrint(buf,
+                \\{{"@context":"https://www.w3.org/ns/activitystreams","id":"{s}#delete","type":"Delete","actor":"{s}","object":"{s}"}}
+            , .{ ap_id, actor, ap_id }),
+            .like, .repost, .block => blk: {
+                const inner: []const u8 = switch (kind) {
+                    .like => "Like",
+                    .repost => "Announce",
+                    .block => "Block",
+                    else => unreachable,
+                };
+                break :blk try std.fmt.bufPrint(buf,
+                    \\{{"@context":"https://www.w3.org/ns/activitystreams","id":"{s}#undo","type":"Undo","actor":"{s}","object":{{"id":"{s}","type":"{s}","actor":"{s}"}}}}
+                , .{ ap_id, actor, ap_id, inner, actor });
+            },
+            .follow => try std.fmt.bufPrint(buf,
+                \\{{"@context":"https://www.w3.org/ns/activitystreams","id":"{s}#undo","type":"Undo","actor":"{s}","object":{{"id":"{s}","type":"Follow","actor":"{s}"}}}}
+            , .{ ap_id, actor, ap_id, actor }),
+        };
+
+        // Fan the activity out to the actor's AP followers (parity with
+        // the create-side delivery), then log.
+        self.deliverToFollowers(actor, payload, &arena);
+        _ = subscription.appendLog(self.db, self.clock, .at_to_ap, dedup_key, ap_id, true, "") catch {};
+    }
+
+    /// Enqueue `payload` into `ap_federation_outbox` for every follower of
+    /// `actor`. Best-effort — delivery failures are non-fatal.
+    fn deliverToFollowers(self: *Subscriber, actor: []const u8, payload: []const u8, arena: *Arena) void {
+        var followers_buf: [64]@import("followers.zig").Follower = undefined;
+        const n = @import("followers.zig").list(self.db, actor, &followers_buf) catch return;
+        var key_id_buf: [256 + 9]u8 = undefined;
+        if (actor.len + 9 > key_id_buf.len) return;
+        @memcpy(key_id_buf[0..actor.len], actor);
+        @memcpy(key_id_buf[actor.len..][0..9], "#main-key");
+        const key_id = key_id_buf[0 .. actor.len + 9];
+        _ = arena;
+        for (followers_buf[0..n]) |f| {
+            const recipients = [_]activitypub.delivery.Recipient{.{ .inbox = f.inbox() }};
+            _ = activitypub.delivery.enqueueDeliveries(self.db, self.clock, &recipients, payload, key_id) catch continue;
+            core.metrics.incApOutboxEnqueued();
+        }
     }
 
     /// Advance the cursor for a non-commit event (no AP activity). The
@@ -503,6 +615,30 @@ fn skipValue(dec: *dag.Decoder) !void {
             else => {},
         }
     }
+}
+
+/// Build the bridged AP activity id from an AT-URI, matching the
+/// encoding `plugin.buildApId(host, "activities", at_uri, …)` uses for
+/// create-side activities: `https://<host>/activities/<at_uri with the
+/// `at://` prefix stripped and '/'→':'>`. Used by the delete path so the
+/// Delete/Undo references the same id the original Create/Like/etc. got.
+fn buildActivityId(host: []const u8, at_uri: []const u8, arena: *Arena) ![]const u8 {
+    const alloc = arena.allocator();
+    const tail = if (std.mem.startsWith(u8, at_uri, "at://")) at_uri[5..] else at_uri;
+    const total = "https://".len + host.len + "/activities/".len + tail.len;
+    const buf = try alloc.alloc(u8, total);
+    var w: usize = 0;
+    @memcpy(buf[w..][0.."https://".len], "https://");
+    w += "https://".len;
+    @memcpy(buf[w..][0..host.len], host);
+    w += host.len;
+    @memcpy(buf[w..][0.."/activities/".len], "/activities/");
+    w += "/activities/".len;
+    for (tail) |ch| {
+        buf[w] = if (ch == '/') ':' else ch;
+        w += 1;
+    }
+    return buf[0..w];
 }
 
 // ── Encoder (faithful model of an external relay's frame) ───────────
@@ -850,7 +986,6 @@ pub fn stop(self: *Subscriber) void {
 const testing = std.testing;
 const schema_mod = @import("schema.zig");
 const at_schema = atproto.schema;
-const activitypub = @import("protocol_activitypub");
 
 fn setupDb() !*c.sqlite3 {
     const sqlite_mod = core.storage.sqlite;
@@ -1047,7 +1182,7 @@ test "R1: non-commit frame advances cursor without ingesting" {
     try testing.expectEqual(@as(i64, 555), sub.cursor_seq);
 }
 
-test "R1: multi-op commit ingests each create/update and skips deletes" {
+test "R1: multi-op commit ingests each create/update AND each bridged delete" {
     const db = try setupDb();
     defer core.storage.sqlite.closeDb(db);
 
@@ -1080,13 +1215,15 @@ test "R1: multi-op commit ingests each create/update and skips deletes" {
     const ops = [_]EncodeOp{
         .{ .action = "create", .path = path1, .record = rec_post },
         .{ .action = "create", .path = path2, .record = rec_like },
-        .{ .action = "delete", .path = path3, .record = "" }, // delete: no record, skipped
+        // A bridged-collection delete now translates to an AP Delete
+        // (post) — it is no longer skipped.
+        .{ .action = "delete", .path = path3, .record = "" },
     };
     var msg_buf: [4096]u8 = undefined;
     const msg = try encodeCommitMessage(&msg_buf, 9001, "did:plc:multi", 1_717_000_000, &ops);
 
     const ingested = try sub.ingestEventBytes(msg);
-    try testing.expectEqual(@as(u32, 2), ingested); // post + like, delete skipped
+    try testing.expectEqual(@as(u32, 3), ingested); // post + like + post-delete
     try testing.expectEqual(@as(i64, 9001), sub.cursor_seq);
 }
 
@@ -1118,6 +1255,101 @@ test "R1: feed() decodes a real WS binary frame end-to-end" {
     const ingested = try sub.feed(frame_mut[0..framed.len]);
     try testing.expectEqual(@as(u32, 1), ingested);
     try testing.expectEqual(@as(u64, 1), sub.stats.frames_seen.load(.monotonic));
+}
+
+fn logContains(db: *c.sqlite3, needle: []const u8) bool {
+    var rows: [16]subscription.LogEntry = undefined;
+    const n = subscription.listLog(db, 0, &rows) catch return false;
+    for (rows[0..n]) |r| {
+        if (std.mem.indexOf(u8, r.sourceId(), needle) != null) return true;
+        if (std.mem.indexOf(u8, r.translatedId(), needle) != null) return true;
+    }
+    return false;
+}
+
+fn outboxPayloadContains(db: *c.sqlite3, needle: []const u8) bool {
+    var stmt: ?*c.sqlite3_stmt = null;
+    if (c.sqlite3_prepare_v2(db, "SELECT payload FROM ap_federation_outbox", -1, &stmt, null) != c.SQLITE_OK) return false;
+    defer _ = c.sqlite3_finalize(stmt);
+    var buf: [4096]u8 = undefined;
+    while (c.sqlite3_step(stmt.?) == c.SQLITE_ROW) {
+        const ptr = c.sqlite3_column_text(stmt, 0);
+        const n: usize = @intCast(c.sqlite3_column_bytes(stmt, 0));
+        const cap = @min(n, buf.len);
+        if (ptr != null and cap > 0) {
+            @memcpy(buf[0..cap], ptr[0..cap]);
+            if (std.mem.indexOf(u8, buf[0..cap], needle) != null) return true;
+        }
+    }
+    return false;
+}
+
+test "R1: upstream post DELETE → AP Delete logged + fanned to followers" {
+    const db = try setupDb();
+    defer core.storage.sqlite.closeDb(db);
+
+    var sc = core.clock.SimClock.init(1_719_000_000);
+    var sub: Subscriber = .{
+        .db = db,
+        .clock = sc.clock(),
+        .cfg = .{ .url = "ws://upstream.test", .enable = true, .relay_host = "relay.test" },
+    };
+    try sub.ensureSubscription();
+
+    const did = "did:plc:deleter";
+    // First a create so the synthetic actor exists.
+    const rec = "{\"$type\":\"app.bsky.feed.post\",\"text\":\"doomed\",\"createdAt\":\"2026-06-22T00:00:00Z\"}";
+    const create_ops = [_]EncodeOp{.{ .action = "create", .path = "app.bsky.feed.post/del1", .record = rec }};
+    var cb: [2048]u8 = undefined;
+    _ = try sub.ingestEventBytes(try encodeCommitMessage(&cb, 10, did, 1_719_000_000, &create_ops));
+
+    // Resolve the minted actor + add a follower so the Delete has
+    // somewhere to go.
+    var ab2: [1024]u8 = undefined;
+    var a2 = Arena.init(&ab2);
+    const minted_actor = (try plugin.identity_map.actorForDid(db, did, &a2)).?;
+    try @import("followers.zig").add(db, sc.clock(), minted_actor, "https://m.example/users/peer/inbox", "", "fi-del");
+
+    // Now the delete op.
+    const del_ops = [_]EncodeOp{.{ .action = "delete", .path = "app.bsky.feed.post/del1", .record = "" }};
+    var db_buf: [2048]u8 = undefined;
+    const ingested = try sub.ingestEventBytes(try encodeCommitMessage(&db_buf, 11, did, 1_719_000_001, &del_ops));
+    try testing.expectEqual(@as(u32, 1), ingested);
+
+    try testing.expect(logContains(db, "[deleted]"));
+    try testing.expect(outboxPayloadContains(db, "\"type\":\"Delete\""));
+}
+
+test "R1: upstream like DELETE → Undo{Like} fanned to followers" {
+    const db = try setupDb();
+    defer core.storage.sqlite.closeDb(db);
+
+    var sc = core.clock.SimClock.init(1_719_100_000);
+    var sub: Subscriber = .{
+        .db = db,
+        .clock = sc.clock(),
+        .cfg = .{ .url = "ws://upstream.test", .enable = true, .relay_host = "relay.test" },
+    };
+    try sub.ensureSubscription();
+
+    const did = "did:plc:unliker";
+    const rec = "{\"$type\":\"app.bsky.feed.like\",\"subject\":{\"uri\":\"at://did:plc:x/app.bsky.feed.post/y\"},\"createdAt\":\"2026-06-22T00:00:00Z\"}";
+    const create_ops = [_]EncodeOp{.{ .action = "create", .path = "app.bsky.feed.like/lk1", .record = rec }};
+    var cb: [2048]u8 = undefined;
+    _ = try sub.ingestEventBytes(try encodeCommitMessage(&cb, 20, did, 1_719_100_000, &create_ops));
+
+    var ab2: [1024]u8 = undefined;
+    var a2 = Arena.init(&ab2);
+    const minted_actor = (try plugin.identity_map.actorForDid(db, did, &a2)).?;
+    try @import("followers.zig").add(db, sc.clock(), minted_actor, "https://m.example/users/peer/inbox", "", "fi-unlike");
+
+    const del_ops = [_]EncodeOp{.{ .action = "delete", .path = "app.bsky.feed.like/lk1", .record = "" }};
+    var db_buf: [2048]u8 = undefined;
+    const ingested = try sub.ingestEventBytes(try encodeCommitMessage(&db_buf, 21, did, 1_719_100_001, &del_ops));
+    try testing.expectEqual(@as(u32, 1), ingested);
+
+    try testing.expect(outboxPayloadContains(db, "\"type\":\"Undo\""));
+    try testing.expect(outboxPayloadContains(db, "\"type\":\"Like\""));
 }
 
 test "R1: cursor resumes from persisted value on a fresh subscriber" {

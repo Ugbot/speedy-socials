@@ -17,12 +17,14 @@
 //!     app.bsky.feed.like     → Like
 //!     app.bsky.feed.repost   → Announce
 //!     app.bsky.graph.follow  → Follow
+//!     app.bsky.graph.block   → Block
 //!
 //!   AP → AT
 //!     Create(Note)           → app.bsky.feed.post
 //!     Like                   → app.bsky.feed.like
 //!     Announce               → app.bsky.feed.repost
 //!     Follow                 → app.bsky.graph.follow
+//!     Block                  → app.bsky.graph.block
 
 const std = @import("std");
 const core = @import("core");
@@ -51,12 +53,14 @@ pub const AtKind = enum {
     like,
     repost,
     follow,
+    block,
 
     pub fn fromCollection(collection: []const u8) ?AtKind {
         if (std.mem.eql(u8, collection, "app.bsky.feed.post")) return .post;
         if (std.mem.eql(u8, collection, "app.bsky.feed.like")) return .like;
         if (std.mem.eql(u8, collection, "app.bsky.feed.repost")) return .repost;
         if (std.mem.eql(u8, collection, "app.bsky.graph.follow")) return .follow;
+        if (std.mem.eql(u8, collection, "app.bsky.graph.block")) return .block;
         return null;
     }
 
@@ -66,6 +70,7 @@ pub const AtKind = enum {
             .like => "app.bsky.feed.like",
             .repost => "app.bsky.feed.repost",
             .follow => "app.bsky.graph.follow",
+            .block => "app.bsky.graph.block",
         };
     }
 };
@@ -168,6 +173,7 @@ pub fn atRecordToApActivity(
         .like => out.activity_type = .like,
         .repost => out.activity_type = .announce,
         .follow => out.activity_type = .follow,
+        .block => out.activity_type = .block,
     }
 
     out.id = dupeBounded(alloc, activity_ap_id) catch return error.TranslationBufferTooSmall;
@@ -216,6 +222,10 @@ pub fn apActivityToAtRecord(
         .like => .like,
         .announce => .repost,
         .follow => .follow,
+        // AP `Block` → `app.bsky.graph.block`. The subject (blocked
+        // actor) rides in `subject`; the caller resolves the AP target
+        // actor to its AT DID before building the record.
+        .block => .block,
         // Update / Delete / Accept / Reject have no direct AT mirror;
         // we surface them as posts with an empty text + the activity id
         // recorded as subject. The relay's higher-level pipeline can
@@ -226,7 +236,7 @@ pub fn apActivityToAtRecord(
         // AP-16: Question (poll) bridges to a future
         // `app.bsky.feed.post` with a poll embed (not yet implemented
         // upstream); drop for now.
-        .update, .delete, .accept, .reject, .undo, .move, .block, .flag, .add, .remove, .question => return error.UnsupportedKind,
+        .update, .delete, .accept, .reject, .undo, .move, .flag, .add, .remove, .question => return error.UnsupportedKind,
     };
 
     if (out.kind == .post) {
@@ -507,7 +517,7 @@ fn makeArena(buf: []u8) Arena {
 }
 
 test "AtKind round-trips through collection name" {
-    inline for (.{ .post, .like, .repost, .follow }) |k| {
+    inline for (.{ .post, .like, .repost, .follow, .block }) |k| {
         const collection = (@as(AtKind, k)).toCollection();
         try testing.expectEqual(@as(AtKind, k), AtKind.fromCollection(collection).?);
     }
@@ -560,6 +570,88 @@ test "atRecordToApActivity translates like → Like" {
     try testing.expectEqual(ActivityType.like, out.activity_type);
     try testing.expectEqualStrings("https://other/ap/notes/p1", out.object_id);
     try testing.expectEqualStrings("", out.content_html);
+}
+
+test "atRecordToApActivity translates block → Block" {
+    var buf: [2048]u8 = undefined;
+    var arena = makeArena(&buf);
+    const record: AtRecord = .{
+        .kind = .block,
+        .at_uri = "at://did:plc:alice/app.bsky.graph.block/b1",
+        .did = "did:plc:alice",
+        .text = "",
+        .created_at = "2026-05-14T12:00:00Z",
+        .subject = "did:plc:bob",
+    };
+    const out = try atRecordToApActivity(
+        record,
+        "https://example/ap/users/alice",
+        "https://example/ap/activities/b1",
+        "https://example/ap/users/bob",
+        &arena,
+    );
+    try testing.expectEqual(ActivityType.block, out.activity_type);
+    try testing.expectEqualStrings("https://example/ap/users/bob", out.object_id);
+    try testing.expectEqualStrings("", out.content_html);
+}
+
+test "apActivityToAtRecord translates Block → app.bsky.graph.block" {
+    var buf: [2048]u8 = undefined;
+    var arena = makeArena(&buf);
+    const activity: Activity = .{
+        .activity_type = .block,
+        .id = "https://m/act/b1",
+        .actor = "https://m/users/alice",
+        .object_id = "https://m/users/bob",
+        .object_type = "",
+        .target = "",
+        .published = "2026-05-14T00:00:00Z",
+        .to_first = "",
+    };
+    const out = try apActivityToAtRecord(
+        .{ .activity = activity, .content_html = "" },
+        "did:web:m:alice",
+        "at://did:web:m:alice/app.bsky.graph.block/synthb1",
+        "https://m/users/bob",
+        "2026-05-14T00:00:00Z",
+        &arena,
+    );
+    try testing.expectEqual(AtKind.block, out.kind);
+    try testing.expectEqualStrings("https://m/users/bob", out.subject);
+}
+
+test "block round-trip preserves kind + subject" {
+    var buf: [4096]u8 = undefined;
+    var arena = makeArena(&buf);
+    const at: AtRecord = .{
+        .kind = .block,
+        .at_uri = "at://did:plc:a/app.bsky.graph.block/r",
+        .did = "did:plc:a",
+        .text = "",
+        .created_at = "2026-05-14T00:00:00Z",
+        .subject = "did:plc:b",
+    };
+    const ap = try atRecordToApActivity(at, "https://h/u/a", "https://h/act/r", "did:plc:b", &arena);
+    const activity: Activity = .{
+        .activity_type = ap.activity_type,
+        .id = ap.id,
+        .actor = ap.actor,
+        .object_id = ap.object_id,
+        .object_type = "",
+        .target = "",
+        .published = ap.published,
+        .to_first = ap.to,
+    };
+    const at2 = try apActivityToAtRecord(
+        .{ .activity = activity, .content_html = "" },
+        "did:plc:a",
+        at.at_uri,
+        at.subject,
+        ap.published,
+        &arena,
+    );
+    try testing.expectEqual(AtKind.block, at2.kind);
+    try testing.expectEqualStrings(at.subject, at2.subject);
 }
 
 test "atRecordToApActivity translates repost → Announce and follow → Follow" {

@@ -96,7 +96,10 @@ pub fn collectionFor(act: *const Activity) ?[]const u8 {
         .like => "app.bsky.feed.like",
         .announce => "app.bsky.feed.repost",
         .follow => "app.bsky.graph.follow",
-        .delete => "app.bsky.feed.post", // probe order: post → like → repost → follow
+        // B: AP `Block` → `app.bsky.graph.block`. The subject is the
+        // blocked actor's DID, resolved from `act.object_id`.
+        .block => "app.bsky.graph.block",
+        .delete => "app.bsky.feed.post", // probe order: post → like → repost → follow → block
         else => null,
     };
 }
@@ -118,14 +121,23 @@ pub fn onActivityReceived(act: *const Activity, raw_body: []const u8, db: *c.sql
 }
 
 fn onActivityReceivedImpl(act: *const Activity, raw_body: []const u8, db: *c.sqlite3, clock: core.clock.Clock) !void {
-    // B4: Undo runs BEFORE the `collectionFor` early-return because
-    // it has no AT-collection mapping. AP `Undo{Follow}` references
-    // the inner Follow activity by its `id`. Map: act.object_id ==
-    // follow.id. Remove the follower row keyed on that follow_iri.
+    // B4 + Undo{Like|Announce|Block}: Undo runs BEFORE the
+    // `collectionFor` early-return because it has no AT-collection
+    // mapping. AP `Undo{X}` references the inner activity by its `id`
+    // (`act.object_id == X.id`).
+    //
+    //   Undo{Follow}              → remove the follower row (B4) AND
+    //                               delete the bridged graph.follow record.
+    //   Undo{Like|Announce|Block} → delete the bridged like / repost /
+    //                               block record (unlike / unrepost /
+    //                               unblock).
+    //
+    // The bridged AT record's rkey was derived from the inner activity's
+    // id (`act.object_id`) when it was first created, so we re-derive the
+    // same rkey here and probe each collection to delete it. This mirrors
+    // the Delete path but is scoped to the interaction collections.
     if (act.activity_type == .undo and act.object_id.len > 0) {
-        const removed = followers_mod.removeByFollowIri(db, act.object_id) catch false;
-        const status_msg: []const u8 = if (removed) "" else "undo: no follower row";
-        _ = subscription.appendLog(db, clock, .ap_to_at, act.object_id, "[undone]", true, status_msg) catch {};
+        try processUndo(act, db, clock, &.{ "app.bsky.feed.like", "app.bsky.feed.repost", "app.bsky.graph.block", "app.bsky.graph.follow" });
         return;
     }
 
@@ -137,12 +149,18 @@ fn onActivityReceivedImpl(act: *const Activity, raw_body: []const u8, db: *c.sql
             _ = subscription.appendLog(db, clock, .ap_to_at, act.id, "", true, "dropped: Move not bridged (identity migration logic pending)") catch {};
             return;
         },
-        .block => {
-            _ = subscription.appendLog(db, clock, .ap_to_at, act.id, "", true, "dropped: Block has no AT primitive") catch {};
-            return;
-        },
         .flag => {
             _ = subscription.appendLog(db, clock, .ap_to_at, act.id, "", true, "dropped: Flag has no AT primitive") catch {};
+            return;
+        },
+        // Accept/Reject{Follow}: a remote peer is responding to a follow
+        // request we (or a bridged actor) sent. AT has no follow-request
+        // lifecycle — follows take effect immediately — so there's no
+        // record to commit. We record the accept/reject so follow state
+        // is observable + consistent through the translation log, and (on
+        // Reject) drop any follower row keyed on the inner Follow's id.
+        .accept, .reject => {
+            try processFollowResponse(act, db, clock);
             return;
         },
         else => {},
@@ -304,6 +322,7 @@ fn processDelete(act: *const Activity, db: *c.sqlite3, clock: core.clock.Clock, 
         "app.bsky.feed.like",
         "app.bsky.feed.repost",
         "app.bsky.graph.follow",
+        "app.bsky.graph.block",
     };
     var hit_collection: []const u8 = "";
     for (probe_order) |col| {
@@ -331,6 +350,124 @@ fn processDelete(act: *const Activity, db: *c.sqlite3, clock: core.clock.Clock, 
     _ = subscription.appendLog(db, clock, .ap_to_at, act.object_id, translated, true, "") catch {};
 }
 
+/// Undo{Follow|Like|Announce|Block} → delete the bridged AT record.
+///
+/// AP `Undo` carries `object` = the IRI of the inner activity being
+/// undone (`act.object_id`). The bridged record we created for that
+/// inner activity stored it in its `bridgedFrom` field, so we locate
+/// the record by matching `bridgedFrom` and delete it. `deleteRecord`
+/// fires the change hook, so an AP Delete won't loop back (the synthetic
+/// repo has no AP followers of its own interactions).
+///
+/// Follow undones ALSO drop the follower row (B4 parity) so the AT→AP
+/// fanout stops reaching the unfollowing peer.
+fn processUndo(act: *const Activity, db: *c.sqlite3, clock: core.clock.Clock, probe_order: []const []const u8) !void {
+    const inner_id = act.object_id;
+
+    // B4: drop any follower row keyed on the inner Follow's id. Harmless
+    // for non-follow undones (no row matches).
+    const removed_follower = followers_mod.removeByFollowIri(db, inner_id) catch false;
+
+    // Resolve the actor's DID. If the AP actor was never bridged there's
+    // no synthetic repo and nothing to delete — log + return.
+    var arena_buf: [4 * 1024]u8 = undefined;
+    var arena = Arena.init(&arena_buf);
+    const maybe_did = identity_map.didForActor(db, act.actor, &arena) catch null;
+    const did = maybe_did orelse {
+        const status_msg: []const u8 = if (removed_follower) "" else "undo: no follower row / no bridged actor";
+        _ = subscription.appendLog(db, clock, .ap_to_at, inner_id, "[undone]", true, status_msg) catch {};
+        return;
+    };
+
+    // Find + delete the bridged record by its `bridgedFrom` == inner_id.
+    var hit_collection: []const u8 = "";
+    var rkey_buf: [256]u8 = undefined;
+    var rkey_len: usize = 0;
+    for (probe_order) |col| {
+        if (findRkeyByBridgedFrom(db, did, col, inner_id, &rkey_buf, &rkey_len)) {
+            const deleted = atproto.repo.deleteRecord(db, did, col, rkey_buf[0..rkey_len]) catch false;
+            if (deleted) {
+                hit_collection = col;
+                break;
+            }
+        }
+    }
+
+    if (hit_collection.len == 0) {
+        const status_msg: []const u8 = if (removed_follower) "" else "undo: no bridged record";
+        _ = subscription.appendLog(db, clock, .ap_to_at, inner_id, "[undone]", true, status_msg) catch {};
+        return;
+    }
+
+    var translated_buf: [512]u8 = undefined;
+    const translated = std.fmt.bufPrint(
+        &translated_buf,
+        "at://{s}/{s}/{s} [undone]",
+        .{ did, hit_collection, rkey_buf[0..rkey_len] },
+    ) catch "[undone]";
+    _ = subscription.appendLog(db, clock, .ap_to_at, inner_id, translated, true, "") catch {};
+    core.metrics.incRelayApToAt();
+}
+
+/// Locate the rkey of a bridged record whose DAG-CBOR `value` carries
+/// `bridgedFrom == bridged_from`. The activity id is stored verbatim as
+/// a CBOR text value, so a substring match on the blob is exact enough:
+/// the id is a full URL, collisions would be pathological. Scoped to a
+/// single (did, collection). Returns false when none matches.
+fn findRkeyByBridgedFrom(
+    db: *c.sqlite3,
+    did: []const u8,
+    collection: []const u8,
+    bridged_from: []const u8,
+    rkey_out: []u8,
+    rkey_len: *usize,
+) bool {
+    if (bridged_from.len == 0) return false;
+    const sql = "SELECT rkey FROM atp_records WHERE did = ? AND collection = ? AND instr(value, ?) > 0 LIMIT 1";
+    var stmt: ?*c.sqlite3_stmt = null;
+    if (c.sqlite3_prepare_v2(db, sql, -1, &stmt, null) != c.SQLITE_OK) return false;
+    defer _ = c.sqlite3_finalize(stmt);
+    _ = c.sqlite3_bind_text(stmt, 1, did.ptr, @intCast(did.len), c.sqliteTransientAsDestructor());
+    _ = c.sqlite3_bind_text(stmt, 2, collection.ptr, @intCast(collection.len), c.sqliteTransientAsDestructor());
+    _ = c.sqlite3_bind_text(stmt, 3, bridged_from.ptr, @intCast(bridged_from.len), c.sqliteTransientAsDestructor());
+    if (c.sqlite3_step(stmt.?) != c.SQLITE_ROW) return false;
+    const ptr = c.sqlite3_column_text(stmt, 0);
+    const n: usize = @intCast(c.sqlite3_column_bytes(stmt, 0));
+    const cap = @min(n, rkey_out.len);
+    if (cap == 0 or ptr == null) return false;
+    @memcpy(rkey_out[0..cap], ptr[0..cap]);
+    rkey_len.* = cap;
+    return true;
+}
+
+/// Accept/Reject{Follow}: a remote peer responded to a follow request.
+/// AT follows take effect immediately (no request lifecycle), so there's
+/// no AT record to commit. We:
+///   * record the accept/reject in the translation log (so follow state
+///     is observable);
+///   * on Reject, drop any follower row keyed on the inner Follow's id
+///     (the peer refused — stop fanning out to them).
+/// The inner Follow's id is `act.object_id`.
+fn processFollowResponse(act: *const Activity, db: *c.sqlite3, clock: core.clock.Clock) !void {
+    const inner_id = if (act.object_id.len > 0) act.object_id else act.id;
+    const accepted = act.activity_type == .accept;
+
+    var note_buf: [64]u8 = undefined;
+    var removed: bool = false;
+    if (!accepted and inner_id.len > 0) {
+        removed = followers_mod.removeByFollowIri(db, inner_id) catch false;
+    }
+    const note = std.fmt.bufPrint(
+        &note_buf,
+        "follow {s}{s}",
+        .{ if (accepted) "accepted" else "rejected", if (removed) " (follower dropped)" else "" },
+    ) catch (if (accepted) "follow accepted" else "follow rejected");
+
+    const translated: []const u8 = if (accepted) "[follow-accepted]" else "[follow-rejected]";
+    _ = subscription.appendLog(db, clock, .ap_to_at, inner_id, translated, true, note) catch {};
+    core.metrics.incRelayApToAt();
+}
+
 /// Build the minimum-viable AT record body. We emit:
 ///   * `$type`: the collection NSID
 ///   * `bridgedFrom`: the original AP id
@@ -350,6 +487,7 @@ fn buildBridgeRecord(act: *const Activity, collection: []const u8, inner_content
         .create, .update => 5, // $type, bridgedFrom, bridgedActor, text, createdAt
         .like, .announce => 4, // $type, bridgedFrom, bridgedActor, subject
         .follow => 4, // $type, bridgedFrom, bridgedActor, subject
+        .block => 4, // $type, bridgedFrom, bridgedActor, subject
         else => 3,
     };
     try enc.writeMapHeader(map_size);
@@ -373,7 +511,9 @@ fn buildBridgeRecord(act: *const Activity, collection: []const u8, inner_content
             try enc.writeText("subject");
             try enc.writeText(act.object_id);
         },
-        .follow => {
+        .follow, .block => {
+            // Follow: subject = followed actor. Block: subject = blocked
+            // actor. Both carry the AP target IRI in `object_id`.
             try enc.writeText("subject");
             try enc.writeText(act.object_id);
         },
@@ -938,6 +1078,197 @@ test "I3: buildProfileRecord falls back to preferredUsername when name is absent
     const rec = try buildProfileRecord(body, &out);
     try testing.expect(std.mem.indexOf(u8, rec, "solo") != null);
     try testing.expect(std.mem.indexOf(u8, rec, "app.bsky.actor.profile") != null);
+}
+
+fn countRecords(db: *c.sqlite3, did: []const u8, collection: []const u8) i64 {
+    var stmt: ?*c.sqlite3_stmt = null;
+    if (c.sqlite3_prepare_v2(db, "SELECT count(*) FROM atp_records WHERE did = ? AND collection = ?", -1, &stmt, null) != c.SQLITE_OK) return -1;
+    defer _ = c.sqlite3_finalize(stmt);
+    _ = c.sqlite3_bind_text(stmt, 1, did.ptr, @intCast(did.len), c.sqliteTransientAsDestructor());
+    _ = c.sqlite3_bind_text(stmt, 2, collection.ptr, @intCast(collection.len), c.sqliteTransientAsDestructor());
+    if (c.sqlite3_step(stmt.?) != c.SQLITE_ROW) return -1;
+    return c.sqlite3_column_int64(stmt, 0);
+}
+
+test "Block: AP Block commits an app.bsky.graph.block record with the subject" {
+    const db = try setupDb();
+    defer core.storage.sqlite.closeDb(db);
+    var sc = core.clock.SimClock.init(1_716_700_000);
+    setRelayHost("relay.test");
+    defer setRelayHost("");
+
+    const act: Activity = .{
+        .activity_type = .block,
+        .id = "https://m.example/users/han/blocks/1",
+        .actor = "https://m.example/users/han",
+        .object_id = "https://m.example/users/greedo",
+        .object_type = "Person",
+        .target = "",
+        .published = "2026-05-21T00:00:00Z",
+        .to_first = "",
+    };
+    onActivityReceived(&act, "", db, sc.clock());
+
+    var arena_buf: [1024]u8 = undefined;
+    var arena = Arena.init(&arena_buf);
+    const did = (try identity_map.didForActor(db, act.actor, &arena)).?;
+    try testing.expectEqual(@as(i64, 1), countRecords(db, did, "app.bsky.graph.block"));
+
+    // The committed record carries the blocked actor as `subject`.
+    // The rkey was derived from object_id's trailing segment.
+    var row: atproto.repo.RecordRow = .{};
+    const found = try atproto.repo.getRecord(db, did, "app.bsky.graph.block", "greedo", &row);
+    try testing.expect(found);
+    const value = row.value_buf[0..row.value_len];
+    try testing.expect(std.mem.indexOf(u8, value, "https://m.example/users/greedo") != null);
+
+    var rows: [4]subscription.LogEntry = undefined;
+    const n = try subscription.listLog(db, 0, &rows);
+    try testing.expect(n >= 1);
+    try testing.expect(std.mem.indexOf(u8, rows[0].translatedId(), "app.bsky.graph.block") != null);
+}
+
+test "Undo{Block}: AP Block then Undo deletes the bridged block record" {
+    const db = try setupDb();
+    defer core.storage.sqlite.closeDb(db);
+    var sc = core.clock.SimClock.init(1_716_710_000);
+    setRelayHost("relay.test");
+    defer setRelayHost("");
+
+    const block_act: Activity = .{
+        .activity_type = .block,
+        .id = "https://m.example/users/lando/blocks/7",
+        .actor = "https://m.example/users/lando",
+        .object_id = "https://m.example/users/vader",
+        .object_type = "Person",
+        .target = "",
+        .published = "2026-05-21T00:00:00Z",
+        .to_first = "",
+    };
+    onActivityReceived(&block_act, "", db, sc.clock());
+
+    var arena_buf: [1024]u8 = undefined;
+    var arena = Arena.init(&arena_buf);
+    const did = (try identity_map.didForActor(db, block_act.actor, &arena)).?;
+    try testing.expectEqual(@as(i64, 1), countRecords(db, did, "app.bsky.graph.block"));
+
+    // Undo references the inner Block's id in `object`.
+    const undo_act: Activity = .{
+        .activity_type = .undo,
+        .id = "https://m.example/users/lando/undo/9",
+        .actor = "https://m.example/users/lando",
+        .object_id = "https://m.example/users/lando/blocks/7",
+        .object_type = "",
+        .target = "",
+        .published = "",
+        .to_first = "",
+    };
+    onActivityReceived(&undo_act, "", db, sc.clock());
+
+    try testing.expectEqual(@as(i64, 0), countRecords(db, did, "app.bsky.graph.block"));
+}
+
+test "Undo{Like}: AP Like then Undo deletes the bridged like record" {
+    const db = try setupDb();
+    defer core.storage.sqlite.closeDb(db);
+    var sc = core.clock.SimClock.init(1_716_720_000);
+    setRelayHost("relay.test");
+    defer setRelayHost("");
+
+    const like_act: Activity = .{
+        .activity_type = .like,
+        .id = "https://m.example/users/leia/likes/3",
+        .actor = "https://m.example/users/leia",
+        .object_id = "https://m.example/notes/xyz",
+        .object_type = "",
+        .target = "",
+        .published = "2026-05-21T00:00:00Z",
+        .to_first = "",
+    };
+    onActivityReceived(&like_act, "", db, sc.clock());
+
+    var arena_buf: [1024]u8 = undefined;
+    var arena = Arena.init(&arena_buf);
+    const did = (try identity_map.didForActor(db, like_act.actor, &arena)).?;
+    try testing.expectEqual(@as(i64, 1), countRecords(db, did, "app.bsky.feed.like"));
+
+    const undo_act: Activity = .{
+        .activity_type = .undo,
+        .id = "https://m.example/users/leia/undo/4",
+        .actor = "https://m.example/users/leia",
+        .object_id = "https://m.example/users/leia/likes/3",
+        .object_type = "",
+        .target = "",
+        .published = "",
+        .to_first = "",
+    };
+    onActivityReceived(&undo_act, "", db, sc.clock());
+
+    try testing.expectEqual(@as(i64, 0), countRecords(db, did, "app.bsky.feed.like"));
+}
+
+test "Accept{Follow}: recorded in the translation log, no record committed" {
+    const db = try setupDb();
+    defer core.storage.sqlite.closeDb(db);
+    var sc = core.clock.SimClock.init(1_716_730_000);
+    setRelayHost("relay.test");
+    defer setRelayHost("");
+
+    const accept_act: Activity = .{
+        .activity_type = .accept,
+        .id = "https://m.example/users/yoda/accept/1",
+        .actor = "https://m.example/users/yoda",
+        .object_id = "https://relay.test/activities/at::did:plc:luke:app.bsky.graph.follow:f1",
+        .object_type = "Follow",
+        .target = "",
+        .published = "2026-05-21T00:00:00Z",
+        .to_first = "",
+    };
+    onActivityReceived(&accept_act, "", db, sc.clock());
+
+    var rows: [4]subscription.LogEntry = undefined;
+    const n = try subscription.listLog(db, 0, &rows);
+    try testing.expectEqual(@as(u32, 1), n);
+    try testing.expectEqualStrings("[follow-accepted]", rows[0].translatedId());
+    try testing.expect(std.mem.startsWith(u8, rows[0].errorMsg(), "follow accepted"));
+}
+
+test "Reject{Follow}: drops the follower row + logs the rejection" {
+    const db = try setupDb();
+    defer core.storage.sqlite.closeDb(db);
+    var sc = core.clock.SimClock.init(1_716_740_000);
+    setRelayHost("relay.test");
+    defer setRelayHost("");
+
+    // First a Follow comes in so a follower row exists.
+    const follow_act: Activity = .{
+        .activity_type = .follow,
+        .id = "https://m.example/follow/fr",
+        .actor = "https://m.example/users/jabba",
+        .object_id = "https://relay.test/ap/users/at:plc:han",
+        .object_type = "Person",
+        .target = "",
+        .published = "",
+        .to_first = "",
+    };
+    onActivityReceived(&follow_act, "", db, sc.clock());
+    var f_buf: [4]followers_mod.Follower = undefined;
+    try testing.expectEqual(@as(u32, 1), try followers_mod.list(db, follow_act.object_id, &f_buf));
+
+    // Reject referencing the inner Follow's id undoes the pending follow.
+    const reject_act: Activity = .{
+        .activity_type = .reject,
+        .id = "https://m.example/users/han/reject/1",
+        .actor = "https://relay.test/ap/users/at:plc:han",
+        .object_id = "https://m.example/follow/fr",
+        .object_type = "Follow",
+        .target = "",
+        .published = "",
+        .to_first = "",
+    };
+    onActivityReceived(&reject_act, "", db, sc.clock());
+
+    try testing.expectEqual(@as(u32, 0), try followers_mod.list(db, follow_act.object_id, &f_buf));
 }
 
 test "onActivityReceived: unsupported activity type is silently dropped" {

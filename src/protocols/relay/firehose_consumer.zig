@@ -455,6 +455,7 @@ fn buildApActivityJson(arena: *Arena, out: anytype) ![]const u8 {
         .like => "Like",
         .announce => "Announce",
         .follow => "Follow",
+        .block => "Block",
         else => "Note",
     };
     const written = switch (out.activity_type) {
@@ -467,6 +468,12 @@ fn buildApActivityJson(arena: *Arena, out: anytype) ![]const u8 {
         .follow => try std.fmt.bufPrint(buf,
             \\{{"@context":"https://www.w3.org/ns/activitystreams","id":"{s}","type":"Follow","actor":"{s}","object":"{s}","to":["{s}"]}}
         , .{ out.id, out.actor, out.object_id, out.to }),
+        // AP `Block` is addressed privately to the blocked actor (its
+        // `object`), not to the public collection — Mastodon-compatible
+        // shape. `object_id` is the blocked actor's AP IRI.
+        .block => try std.fmt.bufPrint(buf,
+            \\{{"@context":"https://www.w3.org/ns/activitystreams","id":"{s}","type":"Block","actor":"{s}","object":"{s}","to":["{s}"]}}
+        , .{ out.id, out.actor, out.object_id, out.object_id }),
         else => try std.fmt.bufPrint(buf,
             \\{{"@context":"https://www.w3.org/ns/activitystreams","id":"{s}","type":"{s}","actor":"{s}"}}
         , .{ out.id, type_str, out.actor }),
