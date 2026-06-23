@@ -91,7 +91,7 @@ pub const MysqlBackend = struct {
 
     fn mapDriverError(err: mysql.ConnError, fallback: Error) Error {
         return switch (err) {
-            error.WriteFailed, error.ReadFailed, error.ConnectFailed, error.SocketError, error.DnsFailed => error.BackendFailed,
+            error.WriteFailed, error.ReadFailed, error.ConnectFailed, error.SocketError, error.DnsFailed, error.TlsFailed => error.BackendFailed,
             error.ProtocolError, error.UnsupportedAuth, error.PacketTooLarge, error.Truncated, error.Unsupported => error.StepFailed,
             else => fallback,
         };
@@ -289,7 +289,35 @@ pub fn parseMysqlUrl(uri_str: []const u8) ?mysql.Options {
         .percent_encoded => |p| p,
     };
     if (path.len > 1) opts.database = path[1..];
+
+    // Query: `?tls=require` (or `tls=disable`/absent) selects transport
+    // security. We scan the raw query for a `tls=` token rather than a
+    // full key/value parse — the only knob the driver honours today.
+    if (uri.query) |q| {
+        const qs = switch (q) {
+            .raw => |r| r,
+            .percent_encoded => |p| p,
+        };
+        if (tlsModeFromQuery(qs)) |m| opts.tls = m;
+    }
     return opts;
+}
+
+/// Extract the `tls=` value from a URL query string. Recognises
+/// `require` (TLS mandatory) and `disable`/`disabled` (plain TCP);
+/// returns null when no `tls=` token is present so the caller keeps its
+/// default.
+fn tlsModeFromQuery(query: []const u8) ?mysql.TlsMode {
+    var it = std.mem.splitScalar(u8, query, '&');
+    while (it.next()) |pair| {
+        const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
+        const key = pair[0..eq];
+        const val = pair[eq + 1 ..];
+        if (!std.mem.eql(u8, key, "tls")) continue;
+        if (std.mem.eql(u8, val, "require")) return .require;
+        if (std.mem.eql(u8, val, "disable") or std.mem.eql(u8, val, "disabled")) return .disabled;
+    }
+    return null;
 }
 
 test "parseMysqlUrl: extracts host/port/user/pass/db" {
@@ -305,6 +333,25 @@ test "parseMysqlUrl: defaults port + empty db" {
     const o = parseMysqlUrl("mysql://root@127.0.0.1/").?;
     try testing.expectEqual(@as(u16, 3306), o.port);
     try testing.expectEqualStrings("", o.database);
+    // No query → TLS disabled by default (plain TCP, RSA full-auth path).
+    try testing.expectEqual(mysql.TlsMode.disabled, o.tls);
+}
+
+test "parseMysqlUrl: tls=require selects TLS; tls=disable / absent stays plain" {
+    const req = parseMysqlUrl("mysql://app:pw@db.example:3306/speedy?tls=require").?;
+    try testing.expectEqual(mysql.TlsMode.require, req.tls);
+    try testing.expectEqualStrings("speedy", req.database);
+
+    const dis = parseMysqlUrl("mysql://app:pw@db.example/speedy?tls=disable").?;
+    try testing.expectEqual(mysql.TlsMode.disabled, dis.tls);
+
+    // Other params alongside tls= are ignored; tls= is still found.
+    const mixed = parseMysqlUrl("mysql://app@h/db?charset=utf8&tls=require").?;
+    try testing.expectEqual(mysql.TlsMode.require, mixed.tls);
+
+    // Absent tls= leaves the default.
+    const none = parseMysqlUrl("mysql://app@h/db?charset=utf8").?;
+    try testing.expectEqual(mysql.TlsMode.disabled, none.tls);
 }
 
 test "MysqlBackend: live exec + queryOne + transaction (skips if no server)" {

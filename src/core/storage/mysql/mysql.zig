@@ -15,6 +15,7 @@
 pub const protocol = @import("protocol.zig");
 pub const Conn = @import("conn.zig").Conn;
 pub const Options = @import("conn.zig").Options;
+pub const TlsMode = @import("conn.zig").TlsMode;
 pub const Value = @import("conn.zig").Value;
 pub const Row = @import("conn.zig").Row;
 pub const RowCallback = @import("conn.zig").RowCallback;

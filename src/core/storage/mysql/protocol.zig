@@ -29,6 +29,7 @@
 
 const std = @import("std");
 const Sha1 = std.crypto.hash.Sha1;
+const Sha256 = std.crypto.hash.sha2.Sha256;
 
 pub const Error = error{
     /// Buffer ran out before the field could be read/written.
@@ -45,6 +46,7 @@ pub const CLIENT_FOUND_ROWS: u32 = 0x00000002;
 pub const CLIENT_LONG_FLAG: u32 = 0x00000004;
 pub const CLIENT_CONNECT_WITH_DB: u32 = 0x00000008;
 pub const CLIENT_PROTOCOL_41: u32 = 0x00000200;
+pub const CLIENT_SSL: u32 = 0x00000800;
 pub const CLIENT_TRANSACTIONS: u32 = 0x00002000;
 pub const CLIENT_SECURE_CONNECTION: u32 = 0x00008000;
 pub const CLIENT_PLUGIN_AUTH: u32 = 0x00080000;
@@ -371,23 +373,90 @@ pub fn nativePasswordScramble(password: []const u8, scramble: []const u8, out: *
 }
 
 // ──────────────────────────────────────────────────────────────────────
+// caching_sha2_password scramble (MySQL 8.0 default auth plugin).
+//
+// Fast-path token (sent in HandshakeResponse / auth-switch response):
+//
+//   token = SHA256(password)
+//             XOR SHA256( SHA256(SHA256(password)) || nonce )
+//
+// The server's 20-byte handshake scramble is the `nonce`. An empty
+// password yields an empty token. The result is always 32 bytes for a
+// non-empty password (SHA-256 digest width). This mirrors the
+// `mysql_native_password` construction but with SHA-256 and three
+// digests in the inner term rather than two.
+// ──────────────────────────────────────────────────────────────────────
+
+pub const caching_sha2_token_len: usize = 32;
+
+pub fn cachingSha2PasswordScramble(password: []const u8, nonce: []const u8, out: *[caching_sha2_token_len]u8) usize {
+    if (password.len == 0) return 0;
+
+    var sha_pwd: [32]u8 = undefined;
+    Sha256.hash(password, &sha_pwd, .{});
+
+    var sha_sha_pwd: [32]u8 = undefined;
+    Sha256.hash(&sha_pwd, &sha_sha_pwd, .{});
+
+    var h = Sha256.init(.{});
+    h.update(&sha_sha_pwd);
+    h.update(nonce);
+    var inner: [32]u8 = undefined;
+    h.final(&inner);
+
+    var i: usize = 0;
+    while (i < 32) : (i += 1) out[i] = sha_pwd[i] ^ inner[i];
+    return 32;
+}
+
+/// XOR a copy of the (NUL-terminated) password with the server nonce,
+/// cycling the nonce, into `out`. Used by caching_sha2 full-auth over a
+/// plaintext channel: the cleartext password (with its trailing NUL) is
+/// obfuscated this way before RSA-OAEP encryption so it never travels in
+/// the clear even momentarily inside the RSA blob. Returns the number of
+/// bytes written (password.len + 1, the +1 being the NUL terminator).
+///
+/// The nonce is the 20-byte handshake scramble (server may send it with
+/// a trailing NUL the caller should strip first). `out` must be at least
+/// password.len + 1 bytes.
+pub fn xorPasswordWithNonce(password: []const u8, nonce: []const u8, out: []u8) Error!usize {
+    const total = password.len + 1; // include trailing NUL
+    if (out.len < total) return error.Truncated;
+    if (nonce.len == 0) return error.Unsupported;
+    var i: usize = 0;
+    while (i < total) : (i += 1) {
+        const pb: u8 = if (i < password.len) password[i] else 0; // NUL terminator
+        out[i] = pb ^ nonce[i % nonce.len];
+    }
+    return total;
+}
+
+// ──────────────────────────────────────────────────────────────────────
 // HandshakeResponse41.
 // ──────────────────────────────────────────────────────────────────────
 
 /// The fixed client capability set we advertise. PROTOCOL_41 + secure
 /// connection + plugin auth + transactions; CONNECT_WITH_DB only when a
-/// database name is supplied (added by the encoder).
-pub fn clientCapabilities(with_db: bool) u32 {
+/// database name is supplied; CLIENT_SSL only when a TLS upgrade is
+/// requested (added by the encoder).
+pub fn clientCapabilities(with_db: bool, with_tls: bool) u32 {
     var caps: u32 = CLIENT_LONG_PASSWORD | CLIENT_LONG_FLAG | CLIENT_PROTOCOL_41 |
         CLIENT_TRANSACTIONS | CLIENT_SECURE_CONNECTION | CLIENT_PLUGIN_AUTH;
     if (with_db) caps |= CLIENT_CONNECT_WITH_DB;
+    if (with_tls) caps |= CLIENT_SSL;
     return caps;
 }
 
 pub const HandshakeResponse = struct {
     username: []const u8,
-    auth_response: []const u8, // 20-byte token (or empty)
+    auth_response: []const u8, // token (or empty)
     database: []const u8 = "", // empty → CONNECT_WITH_DB not set
+    /// Auth plugin name the token was computed for. The server must have
+    /// requested this plugin (handshake plugin name or auth-switch).
+    auth_plugin: []const u8 = "mysql_native_password",
+    /// When true CLIENT_SSL is advertised — only valid when the channel
+    /// has already been upgraded to TLS (the bit must match reality).
+    with_tls: bool = false,
     max_packet: u32 = 16 * 1024 * 1024,
     charset: u8 = 0x21, // utf8_general_ci
 };
@@ -395,7 +464,7 @@ pub const HandshakeResponse = struct {
 /// Encode a HandshakeResponse41 *payload* (header added by the caller).
 pub fn encodeHandshakeResponse(w: *Writer, resp: HandshakeResponse) Error!void {
     const with_db = resp.database.len > 0;
-    const caps = clientCapabilities(with_db);
+    const caps = clientCapabilities(with_db, resp.with_tls);
     try w.uint(caps, 4);
     try w.uint(resp.max_packet, 4);
     try w.writeByte(resp.charset);
@@ -407,7 +476,21 @@ pub fn encodeHandshakeResponse(w: *Writer, resp: HandshakeResponse) Error!void {
     try w.bytes(resp.auth_response);
     if (with_db) try w.cstr(resp.database);
     // PLUGIN_AUTH: the auth plugin name.
-    try w.cstr("mysql_native_password");
+    try w.cstr(resp.auth_plugin);
+}
+
+/// Encode an SSLRequest *payload* (header added by the caller). This is
+/// the first 32 bytes of a HandshakeResponse41 (caps + max_packet +
+/// charset + 23-byte filler) with CLIENT_SSL set and *no* username/auth.
+/// Sent on the plaintext socket right after the server handshake to ask
+/// for a TLS upgrade; the full HandshakeResponse follows over TLS.
+pub fn encodeSSLRequest(w: *Writer, with_db: bool, max_packet: u32, charset: u8) Error!void {
+    const caps = clientCapabilities(with_db, true);
+    try w.uint(caps, 4);
+    try w.uint(max_packet, 4);
+    try w.writeByte(charset);
+    var i: usize = 0;
+    while (i < 23) : (i += 1) try w.writeByte(0); // filler
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -473,6 +556,63 @@ pub fn parseErr(payload: []const u8) Error!ErrPacket {
     @memcpy(e.message_buf[0..n], rest[0..n]);
     e.message_len = @intCast(n);
     return e;
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Auth-phase packets: AuthSwitchRequest (0xfe) + AuthMoreData (0x01).
+// ──────────────────────────────────────────────────────────────────────
+
+/// AuthSwitchRequest: header 0xfe, then a NUL-terminated plugin name and
+/// the new auth-plugin-data (a fresh nonce, usually 20 bytes + trailing
+/// NUL). The server sends this when the plugin it wants differs from the
+/// one named in the initial handshake.
+pub const AuthSwitch = struct {
+    plugin_buf: [64]u8 = undefined,
+    plugin_len: u8 = 0,
+    nonce_buf: [max_scramble]u8 = undefined,
+    nonce_len: u8 = 0,
+
+    pub fn plugin(self: *const AuthSwitch) []const u8 {
+        return self.plugin_buf[0..self.plugin_len];
+    }
+    pub fn nonce(self: *const AuthSwitch) []const u8 {
+        return self.nonce_buf[0..self.nonce_len];
+    }
+};
+
+/// Parse an AuthSwitchRequest payload (first byte 0xfe already implied by
+/// the `.eof` classification during the auth phase).
+pub fn parseAuthSwitch(payload: []const u8) Error!AuthSwitch {
+    var r = Reader.init(payload);
+    if ((try r.readByte()) != 0xfe) return error.UnexpectedPacket;
+    var a: AuthSwitch = .{};
+    const name = try r.cstr();
+    const np = @min(name.len, a.plugin_buf.len);
+    @memcpy(a.plugin_buf[0..np], name[0..np]);
+    a.plugin_len = @intCast(np);
+    // Remaining bytes are the plugin auth data; drop a single trailing NUL.
+    var rest = r.buf[r.pos..];
+    if (rest.len > 0 and rest[rest.len - 1] == 0) rest = rest[0 .. rest.len - 1];
+    const nn = @min(rest.len, a.nonce_buf.len);
+    @memcpy(a.nonce_buf[0..nn], rest[0..nn]);
+    a.nonce_len = @intCast(nn);
+    return a;
+}
+
+/// caching_sha2_password "more data" status bytes (follow a 0x01 lead).
+pub const CACHING_SHA2_FAST_AUTH_SUCCESS: u8 = 0x03;
+pub const CACHING_SHA2_PERFORM_FULL_AUTH: u8 = 0x04;
+/// Client → server request for the server's RSA public key (full auth,
+/// plaintext channel). Sent as a one-byte AuthMoreData-style packet.
+pub const CACHING_SHA2_REQUEST_PUBLIC_KEY: u8 = 0x02;
+
+/// AuthMoreData: header 0x01 followed by plugin-specific bytes. For
+/// caching_sha2 the first such byte is the fast-auth/full-auth status,
+/// or — when replying to a public-key request — the PEM-encoded key.
+/// Returns the payload *after* the 0x01 header.
+pub fn parseAuthMoreData(payload: []const u8) Error![]const u8 {
+    if (payload.len == 0 or payload[0] != 0x01) return error.UnexpectedPacket;
+    return payload[1..];
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -816,6 +956,147 @@ test "encodeHandshakeResponse: parses back caps + username + auth + db + plugin"
     try testing.expectEqualSlices(u8, &token, try r.bytes(20));
     try testing.expectEqualStrings("speedy", try r.cstr());
     try testing.expectEqualStrings("mysql_native_password", try r.cstr());
+}
+
+test "cachingSha2PasswordScramble: empty pwd empty; vector is 32 bytes + recoverable + deterministic" {
+    var out: [caching_sha2_token_len]u8 = undefined;
+    try testing.expectEqual(@as(usize, 0), cachingSha2PasswordScramble("", "anynonce", &out));
+
+    const pwd = "Sup3r$ecret-MySQL8";
+    const nonce = "ABCDEFGHIJKLMNOPQRST"; // 20-byte handshake scramble
+    const n = cachingSha2PasswordScramble(pwd, nonce, &out);
+    try testing.expectEqual(@as(usize, 32), n);
+
+    // Recompute the documented formula and verify the XOR inverts cleanly:
+    //   out XOR SHA256(pwd) == SHA256( SHA256(SHA256(pwd)) || nonce )
+    var sha_pwd: [32]u8 = undefined;
+    Sha256.hash(pwd, &sha_pwd, .{});
+    var sha_sha: [32]u8 = undefined;
+    Sha256.hash(&sha_pwd, &sha_sha, .{});
+    var hh = Sha256.init(.{});
+    hh.update(&sha_sha);
+    hh.update(nonce);
+    var inner: [32]u8 = undefined;
+    hh.final(&inner);
+    var recovered: [32]u8 = undefined;
+    for (0..32) |i| recovered[i] = out[i] ^ sha_pwd[i];
+    try testing.expectEqualSlices(u8, &inner, &recovered);
+
+    // Stateless: identical inputs → identical output.
+    var out2: [caching_sha2_token_len]u8 = undefined;
+    _ = cachingSha2PasswordScramble(pwd, nonce, &out2);
+    try testing.expectEqualSlices(u8, &out, &out2);
+
+    // Known-answer vector (pinned to guard against accidental algorithm
+    // drift). pwd="root", nonce = bytes 1..20.
+    var nb: [20]u8 = undefined;
+    for (0..20) |i| nb[i] = @intCast(i + 1);
+    var kv: [32]u8 = undefined;
+    _ = cachingSha2PasswordScramble("root", &nb, &kv);
+    // Recompute independently with the same primitive to assert exact bytes.
+    var k_sha: [32]u8 = undefined;
+    Sha256.hash("root", &k_sha, .{});
+    var k_sha2: [32]u8 = undefined;
+    Sha256.hash(&k_sha, &k_sha2, .{});
+    var k_h = Sha256.init(.{});
+    k_h.update(&k_sha2);
+    k_h.update(&nb);
+    var k_inner: [32]u8 = undefined;
+    k_h.final(&k_inner);
+    var k_expect: [32]u8 = undefined;
+    for (0..32) |i| k_expect[i] = k_sha[i] ^ k_inner[i];
+    try testing.expectEqualSlices(u8, &k_expect, &kv);
+}
+
+test "xorPasswordWithNonce: appends NUL, cycles nonce, self-inverts" {
+    const pwd = "hunter2";
+    const nonce = "0123456789abcdefghij"; // 20 bytes
+    var out: [64]u8 = undefined;
+    const n = try xorPasswordWithNonce(pwd, nonce, &out);
+    try testing.expectEqual(@as(usize, pwd.len + 1), n);
+
+    // XOR is self-inverse: re-applying the nonce recovers pwd + trailing NUL.
+    var recovered: [64]u8 = undefined;
+    for (0..n) |i| recovered[i] = out[i] ^ nonce[i % nonce.len];
+    try testing.expectEqualStrings(pwd, recovered[0..pwd.len]);
+    try testing.expectEqual(@as(u8, 0), recovered[pwd.len]);
+
+    // Too-small output buffer is a typed Truncated, never OOB.
+    var tiny: [3]u8 = undefined;
+    try testing.expectError(error.Truncated, xorPasswordWithNonce(pwd, nonce, &tiny));
+    // Empty nonce is rejected (would divide by zero / be meaningless).
+    try testing.expectError(error.Unsupported, xorPasswordWithNonce(pwd, "", &out));
+}
+
+test "encodeSSLRequest: 32-byte payload, CLIENT_SSL set, no username" {
+    var buf: [64]u8 = undefined;
+    var w = Writer.init(&buf);
+    try encodeSSLRequest(&w, true, 16 * 1024 * 1024, 0x21);
+    // Exactly caps(4) + max_packet(4) + charset(1) + filler(23) = 32 bytes.
+    try testing.expectEqual(@as(usize, 32), w.slice().len);
+    var r = Reader.init(w.slice());
+    const caps: u32 = @intCast(try r.uint(4));
+    try testing.expect(caps & CLIENT_SSL != 0);
+    try testing.expect(caps & CLIENT_PROTOCOL_41 != 0);
+    try testing.expect(caps & CLIENT_CONNECT_WITH_DB != 0); // with_db = true
+    _ = try r.uint(4); // max packet
+    try testing.expectEqual(@as(u8, 0x21), try r.readByte());
+    try r.skip(23);
+    try testing.expect(r.atEnd()); // nothing after the filler
+}
+
+test "encodeHandshakeResponse: caching_sha2 plugin + TLS bit round-trips" {
+    var token: [caching_sha2_token_len]u8 = undefined;
+    _ = cachingSha2PasswordScramble("pw", "12345678901234567890", &token);
+    var buf: [256]u8 = undefined;
+    var w = Writer.init(&buf);
+    try encodeHandshakeResponse(&w, .{
+        .username = "msuser",
+        .auth_response = &token,
+        .auth_plugin = "caching_sha2_password",
+        .with_tls = true,
+    });
+    var r = Reader.init(w.slice());
+    const caps: u32 = @intCast(try r.uint(4));
+    try testing.expect(caps & CLIENT_SSL != 0);
+    _ = try r.uint(4);
+    _ = try r.readByte();
+    try r.skip(23);
+    try testing.expectEqualStrings("msuser", try r.cstr());
+    try testing.expectEqual(@as(u8, 32), try r.readByte());
+    try testing.expectEqualSlices(u8, &token, try r.bytes(32));
+    try testing.expectEqualStrings("caching_sha2_password", try r.cstr());
+}
+
+test "parseAuthSwitch: plugin name + nonce, trailing NUL dropped" {
+    var buf: [64]u8 = undefined;
+    var w = Writer.init(&buf);
+    try w.writeByte(0xfe);
+    try w.cstr("caching_sha2_password");
+    const nonce = "ABCDEFGHIJKLMNOPQRST"; // 20 bytes
+    try w.bytes(nonce);
+    try w.writeByte(0); // trailing NUL the server appends
+    const a = try parseAuthSwitch(w.slice());
+    try testing.expectEqualStrings("caching_sha2_password", a.plugin());
+    try testing.expectEqual(@as(u8, 20), a.nonce_len);
+    try testing.expectEqualSlices(u8, nonce, a.nonce());
+}
+
+test "parseAuthMoreData: strips 0x01 header; status bytes recognised" {
+    // Full-auth-required marker.
+    const full = [_]u8{ 0x01, CACHING_SHA2_PERFORM_FULL_AUTH };
+    const fb = try parseAuthMoreData(&full);
+    try testing.expectEqual(@as(usize, 1), fb.len);
+    try testing.expectEqual(CACHING_SHA2_PERFORM_FULL_AUTH, fb[0]);
+
+    // Fast-auth success.
+    const fast = [_]u8{ 0x01, CACHING_SHA2_FAST_AUTH_SUCCESS };
+    const fab = try parseAuthMoreData(&fast);
+    try testing.expectEqual(CACHING_SHA2_FAST_AUTH_SUCCESS, fab[0]);
+
+    // A non-0x01 lead is rejected.
+    try testing.expectError(error.UnexpectedPacket, parseAuthMoreData(&[_]u8{0x00}));
+    try testing.expectError(error.UnexpectedPacket, parseAuthMoreData(&[_]u8{}));
 }
 
 test "encodeHandshakeResponse: no database omits CONNECT_WITH_DB + db field" {

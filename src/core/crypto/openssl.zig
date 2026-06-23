@@ -159,6 +159,61 @@ pub fn extractSpkiDerFromPrivatePem(pem: []const u8, out_der: []u8) Error![]u8 {
     return out_der[0..der_len];
 }
 
+// ── RSA-OAEP encrypt (MySQL caching_sha2 full-auth, plaintext channel) ──
+
+/// Encrypt `msg` with RSA-OAEP using the PEM-encoded *public* key in
+/// `pem`, writing the ciphertext into `out` and returning its length
+/// (equal to the RSA modulus size: 256 for RSA-2048).
+///
+/// Used by the MySQL driver's `caching_sha2_password` full-authentication
+/// path when the connection is *not* over TLS: the server hands us its
+/// RSA public key (PEM), and we send back the password (XOR-obfuscated
+/// with the handshake nonce) encrypted under it. MySQL 8 uses OAEP with
+/// the default SHA-1 MGF1/digest (the server's
+/// `caching_sha2_password_public_key_path` key), so we leave OpenSSL's
+/// default OAEP parameters in place rather than overriding the digest.
+///
+/// Bounded: `out` must be ≥ modulus length (checked → BufferTooSmall).
+/// No allocator on the call path (mirrors `rsaSignPkcs1v15Sha256`).
+pub fn rsaEncryptOaepFromPublicPem(pem: []const u8, msg: []const u8, out: []u8) Error!usize {
+    ensureLibraryInit();
+    const bio = c.BIO_new_mem_buf(pem.ptr, @intCast(pem.len)) orelse return error.InitFailed;
+    defer _ = c.BIO_free(bio);
+
+    const pkey = c.PEM_read_bio_PUBKEY(bio, null, null, null) orelse {
+        clearError();
+        return error.BadPem;
+    };
+    defer c.EVP_PKEY_free(pkey);
+
+    if (c.EVP_PKEY_base_id(pkey) != c.EVP_PKEY_RSA) return error.NotRsa;
+
+    const modulus_len: usize = @intCast(c.EVP_PKEY_size(pkey));
+    if (out.len < modulus_len) return error.BufferTooSmall;
+
+    const ctx = c.EVP_PKEY_CTX_new(pkey, null) orelse {
+        clearError();
+        return error.InitFailed;
+    };
+    defer c.EVP_PKEY_CTX_free(ctx);
+
+    if (c.EVP_PKEY_encrypt_init(ctx) != 1) {
+        clearError();
+        return error.SignFailed;
+    }
+    if (c.EVP_PKEY_CTX_set_rsa_padding(ctx, c.RSA_PKCS1_OAEP_PADDING) != 1) {
+        clearError();
+        return error.SignFailed;
+    }
+
+    var out_len: usize = out.len;
+    if (c.EVP_PKEY_encrypt(ctx, out.ptr, &out_len, msg.ptr, msg.len) != 1) {
+        clearError();
+        return error.SignFailed;
+    }
+    return out_len;
+}
+
 // ── TLS server context ────────────────────────────────────────────────
 
 pub const SslCtx = struct {
@@ -376,6 +431,45 @@ test "openssl: rsaSignPkcs1v15Sha256 + rsaVerifyPkcs1v15Sha256Pem round-trip" {
     var bad = sig;
     bad[0] ^= 0x01;
     try testing.expect(!rsaVerifyPkcs1v15Sha256Pem(pub_pem, msg, bad[0..n]));
+}
+
+test "openssl: rsaEncryptOaepFromPublicPem round-trips via private-key decrypt" {
+    // Derive the public PEM from the embedded private key, encrypt a
+    // sample message under it with OAEP, then decrypt with the private key
+    // and confirm the plaintext survives. This exercises exactly the
+    // MySQL caching_sha2 full-auth (plaintext channel) crypto path.
+    const bio_in = c.BIO_new_mem_buf(test_rsa_priv_pem.ptr, @intCast(test_rsa_priv_pem.len)) orelse return error.InitFailed;
+    defer _ = c.BIO_free(bio_in);
+    const priv = c.PEM_read_bio_PrivateKey(bio_in, null, null, null) orelse return error.SkipZigTest;
+    defer c.EVP_PKEY_free(priv);
+
+    const bio_out = c.BIO_new(c.BIO_s_mem()) orelse return error.InitFailed;
+    defer _ = c.BIO_free(bio_out);
+    try testing.expect(c.PEM_write_bio_PUBKEY(bio_out, priv) == 1);
+    var pub_ptr: ?[*]u8 = null;
+    const pub_len = c.BIO_get_mem_data(bio_out, &pub_ptr);
+    try testing.expect(pub_len > 0);
+    const pub_pem = pub_ptr.?[0..@intCast(pub_len)];
+
+    const msg = "password-xor-nonce\x00bytes";
+    var ct: [512]u8 = undefined;
+    const ct_len = try rsaEncryptOaepFromPublicPem(pub_pem, msg, &ct);
+    try testing.expectEqual(@as(usize, 256), ct_len); // RSA-2048 modulus
+
+    // Decrypt with the private key (default OAEP padding) and compare.
+    const dctx = c.EVP_PKEY_CTX_new(priv, null) orelse return error.InitFailed;
+    defer c.EVP_PKEY_CTX_free(dctx);
+    try testing.expect(c.EVP_PKEY_decrypt_init(dctx) == 1);
+    try testing.expect(c.EVP_PKEY_CTX_set_rsa_padding(dctx, c.RSA_PKCS1_OAEP_PADDING) == 1);
+    var pt: [256]u8 = undefined;
+    var pt_len: usize = pt.len;
+    try testing.expect(c.EVP_PKEY_decrypt(dctx, &pt, &pt_len, &ct, ct_len) == 1);
+    try testing.expectEqualSlices(u8, msg, pt[0..pt_len]);
+}
+
+test "openssl: rsaEncryptOaepFromPublicPem rejects garbage PEM" {
+    var out: [256]u8 = undefined;
+    try testing.expectError(error.BadPem, rsaEncryptOaepFromPublicPem("not a pem", "x", &out));
 }
 
 test "openssl: rsaSignPkcs1v15Sha256 rejects garbage PEM" {
