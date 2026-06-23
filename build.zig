@@ -437,6 +437,41 @@ pub fn build(b: *std.Build) void {
     const bench_fh_step = b.step("bench-firehose", "Run the firehose throughput benchmark (D3)");
     bench_fh_step.dependOn(&run_bench_firehose.step);
 
+    // Incremental MST: blocks written on a +1 commit vs a full rebuild.
+    const bench_mst = b.addExecutable(.{
+        .name = "mst-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("bench/mst_bench.zig"),
+            .target = target,
+            .optimize = bench_optimize,
+            .imports = &.{
+                .{ .name = "core", .module = core_mod },
+                .{ .name = "protocol_atproto", .module = atproto_mod },
+            },
+        }),
+    });
+    const run_bench_mst = b.addRunArtifact(bench_mst);
+    const bench_mst_step = b.step("bench-mst", "Run the incremental-MST block-write benchmark");
+    bench_mst_step.dependOn(&run_bench_mst.step);
+
+    // zorm CRUD overhead vs hand-written SQL on the same SQLite backend.
+    const bench_zorm = b.addExecutable(.{
+        .name = "zorm-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("bench/zorm_bench.zig"),
+            .target = target,
+            .optimize = bench_optimize,
+            .imports = &.{
+                .{ .name = "core", .module = core_mod },
+                .{ .name = "sqlite", .module = sqlite_mod },
+                .{ .name = "zorm", .module = zorm_mod },
+            },
+        }),
+    });
+    const run_bench_zorm = b.addRunArtifact(bench_zorm);
+    const bench_zorm_step = b.step("bench-zorm", "Run the zorm CRUD overhead benchmark");
+    bench_zorm_step.dependOn(&run_bench_zorm.step);
+
     // ── simulation harness ─────────────────────────────────────────
     // `zig build sim` runs the federation scenario(s) in tests/sim/.
     // They link against `core` (which re-exports the TB-derived TimeSim /
