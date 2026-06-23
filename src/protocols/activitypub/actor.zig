@@ -76,14 +76,18 @@ pub const Config = struct {
     /// emitted as a `#key-N` Multikey in both `assertionMethod` and
     /// `verificationMethod`. Bounded by `max_extra_keys`.
     extra_keys: []const ExtraKey = &.{},
+    /// AP4 / FEP-844e: when non-empty, the actor advertises its server's
+    /// capabilities actor-attached via a `generator` Application object
+    /// carrying an `implements` array. Peers fetching the actor discover
+    /// supported FEPs without a second request.
+    capabilities: []const Capability = &.{},
 };
 
 pub fn writePerson(cfg: Config, out: []u8) WriteError![]const u8 {
     // Build using bufPrint segments to keep within line-length but
     // produce a single contiguous JSON-LD object.
     var w: usize = 0;
-    w += try copy(out[w..],
-        "{\"@context\":[\"https://www.w3.org/ns/activitystreams\"," ++
+    w += try copy(out[w..], "{\"@context\":[\"https://www.w3.org/ns/activitystreams\"," ++
         "{\"toot\":\"http://joinmastodon.org/ns#\"," ++
         "\"discoverable\":\"toot:discoverable\"," ++
         "\"indexable\":\"toot:indexable\"," ++
@@ -102,23 +106,21 @@ pub fn writePerson(cfg: Config, out: []u8) WriteError![]const u8 {
     if (cfg.bio.len > 0) {
         w += try fmtInto(out[w..], "\"summary\":\"{s}\",", .{cfg.bio});
     }
-    w += try fmtInto(out[w..],
-        "\"inbox\":\"https://{s}/users/{s}/inbox\"," ++
+    w += try fmtInto(out[w..], "\"inbox\":\"https://{s}/users/{s}/inbox\"," ++
         "\"outbox\":\"https://{s}/users/{s}/outbox\"," ++
         "\"followers\":\"https://{s}/users/{s}/followers\"," ++
         "\"following\":\"https://{s}/users/{s}/following\"," ++
         "\"featured\":\"https://{s}/users/{s}/collections/featured\"," ++
         "\"liked\":\"https://{s}/users/{s}/liked\"," ++ // AP-14
-        "\"endpoints\":{{\"sharedInbox\":\"https://{s}/inbox\"}},",
-        .{
-            cfg.hostname, cfg.username,
-            cfg.hostname, cfg.username,
-            cfg.hostname, cfg.username,
-            cfg.hostname, cfg.username,
-            cfg.hostname, cfg.username,
-            cfg.hostname, cfg.username,
-            cfg.hostname,
-        });
+        "\"endpoints\":{{\"sharedInbox\":\"https://{s}/inbox\"}},", .{
+        cfg.hostname, cfg.username,
+        cfg.hostname, cfg.username,
+        cfg.hostname, cfg.username,
+        cfg.hostname, cfg.username,
+        cfg.hostname, cfg.username,
+        cfg.hostname, cfg.username,
+        cfg.hostname,
+    });
     w += try fmtInto(out[w..], "\"manuallyApprovesFollowers\":{s},", .{
         if (cfg.manually_approves_followers) "true" else "false",
     });
@@ -129,10 +131,8 @@ pub fn writePerson(cfg: Config, out: []u8) WriteError![]const u8 {
         if (cfg.indexable) "true" else "false",
     });
     // publicKey
-    w += try fmtInto(out[w..],
-        "\"publicKey\":{{\"id\":\"https://{s}/users/{s}#main-key\"," ++
-        "\"owner\":\"https://{s}/users/{s}\",\"publicKeyPem\":\"",
-        .{ cfg.hostname, cfg.username, cfg.hostname, cfg.username });
+    w += try fmtInto(out[w..], "\"publicKey\":{{\"id\":\"https://{s}/users/{s}#main-key\"," ++
+        "\"owner\":\"https://{s}/users/{s}\",\"publicKeyPem\":\"", .{ cfg.hostname, cfg.username, cfg.hostname, cfg.username });
     // PEM contains newlines — JSON-escape them to `\n`.
     w += try escapePem(out[w..], cfg.public_key_pem);
     w += try copy(out[w..], "\"}"); // close publicKeyPem string + publicKey object
@@ -148,6 +148,11 @@ pub fn writePerson(cfg: Config, out: []u8) WriteError![]const u8 {
         w += try writeMultikeyArray(out[w..], cfg, has_primary);
         w += try copy(out[w..], ",\"verificationMethod\":");
         w += try writeMultikeyArray(out[w..], cfg, has_primary);
+    }
+    // AP4 / FEP-844e: actor-attached capability advertisement.
+    if (cfg.capabilities.len > 0) {
+        w += try copy(out[w..], ",\"generator\":");
+        w += try writeGenerator(out[w..], cfg.hostname, cfg.capabilities);
     }
     w += try copy(out[w..], "}"); // close actor object
     return out[0..w];
@@ -172,8 +177,7 @@ pub const SyntheticConfig = struct {
 
 pub fn writeSyntheticPerson(cfg: SyntheticConfig, out: []u8) WriteError![]const u8 {
     var w: usize = 0;
-    w += try copy(out[w..],
-        "{\"@context\":[\"https://www.w3.org/ns/activitystreams\"," ++
+    w += try copy(out[w..], "{\"@context\":[\"https://www.w3.org/ns/activitystreams\"," ++
         "\"https://w3id.org/security/v1\"," ++
         "{\"toot\":\"http://joinmastodon.org/ns#\"," ++
         "\"discoverable\":\"toot:discoverable\"," ++
@@ -188,25 +192,87 @@ pub fn writeSyntheticPerson(cfg: SyntheticConfig, out: []u8) WriteError![]const 
     if (cfg.bio.len > 0) {
         w += try fmtInto(out[w..], "\"summary\":\"{s}\",", .{cfg.bio});
     }
-    w += try fmtInto(out[w..],
-        "\"inbox\":\"{s}/inbox\"," ++
+    w += try fmtInto(out[w..], "\"inbox\":\"{s}/inbox\"," ++
         "\"outbox\":\"{s}/outbox\"," ++
         "\"followers\":\"{s}/followers\"," ++
         "\"following\":\"{s}/following\"," ++
-        "\"endpoints\":{{\"sharedInbox\":\"{s}\"}},",
-        .{ cfg.actor_url, cfg.actor_url, cfg.actor_url, cfg.actor_url, cfg.shared_inbox_url });
+        "\"endpoints\":{{\"sharedInbox\":\"{s}\"}},", .{ cfg.actor_url, cfg.actor_url, cfg.actor_url, cfg.actor_url, cfg.shared_inbox_url });
     // Bridge actors approve followers manually (we don't yet do
     // auto-accept on Follow) and are discoverable by default.
     w += try copy(out[w..], "\"manuallyApprovesFollowers\":false,");
     w += try copy(out[w..], "\"discoverable\":true,");
     w += try copy(out[w..], "\"indexable\":true,");
-    w += try fmtInto(out[w..],
-        "\"publicKey\":{{\"id\":\"{s}#main-key\"," ++
-        "\"owner\":\"{s}\",\"publicKeyPem\":\"",
-        .{ cfg.actor_url, cfg.actor_url });
+    w += try fmtInto(out[w..], "\"publicKey\":{{\"id\":\"{s}#main-key\"," ++
+        "\"owner\":\"{s}\",\"publicKeyPem\":\"", .{ cfg.actor_url, cfg.actor_url });
     w += try escapePem(out[w..], cfg.public_key_pem);
     w += try copy(out[w..], "\"}}");
     return out[0..w];
+}
+
+/// AP4 / FEP-844e: a single advertised capability. `href` uniquely
+/// identifies the capability (a FEP URI or spec URL); `name` is a short
+/// human description. Per FEP-844e the value of `implements` is an array
+/// of such objects, each with a required `href` and recommended `name`.
+pub const Capability = struct {
+    href: []const u8,
+    name: []const u8 = "",
+};
+
+/// AP4 / FEP-844e: bound on advertised capabilities (Tiger Style —
+/// keeps the capabilities document buffer bounded).
+pub const max_capabilities: usize = 32;
+
+/// AP4 / FEP-844e: render the server capability-negotiation document.
+/// This is a standalone `Application` object whose `implements` array
+/// lists every FEP / collection this node supports. The `@context`
+/// pins both ActivityStreams and the FEP-844e namespace. `id` is the
+/// discoverable document URL (`https://{host}/.well-known/fep-844e`).
+/// Pure: writes into a caller buffer (Tiger Style). The same `implements`
+/// body is reused by `writeGenerator` for actor-attached discovery.
+pub fn writeCapabilities(host: []const u8, caps: []const Capability, out: []u8) WriteError![]const u8 {
+    if (caps.len > max_capabilities) return error.BufferTooSmall;
+    var w: usize = 0;
+    w += try copy(out[w..], "{\"@context\":[\"https://www.w3.org/ns/activitystreams\"," ++
+        "\"https://w3id.org/fep/844e\"],");
+    w += try fmtInto(out[w..], "\"id\":\"https://{s}/.well-known/fep-844e\"," ++
+        "\"type\":\"Application\",", .{host});
+    w += try copy(out[w..], "\"implements\":");
+    w += try writeImplements(out[w..], caps);
+    w += try copy(out[w..], "}");
+    return out[0..w];
+}
+
+/// AP4 / FEP-844e: the actor-attached `generator` partial object —
+/// an `Application` carrying the same `implements` array, embedded in
+/// the actor document so peers fetching the actor discover capabilities
+/// without a second request (FEP-844e §Discovery, `generator` form).
+pub fn writeGenerator(dest: []u8, host: []const u8, caps: []const Capability) WriteError!usize {
+    if (caps.len > max_capabilities) return error.BufferTooSmall;
+    var w: usize = 0;
+    w += try fmtInto(dest[w..], "{{\"type\":\"Application\"," ++
+        "\"id\":\"https://{s}/.well-known/fep-844e\"," ++
+        "\"implements\":", .{host});
+    w += try writeImplements(dest[w..], caps);
+    w += try copy(dest[w..], "}");
+    return w;
+}
+
+/// Shared writer for the FEP-844e `implements` array. Each entry emits
+/// the required `href` and, when present, the recommended `name`.
+fn writeImplements(dest: []u8, caps: []const Capability) WriteError!usize {
+    var w: usize = 0;
+    w += try copy(dest[w..], "[");
+    var i: usize = 0;
+    while (i < caps.len) : (i += 1) {
+        if (i > 0) w += try copy(dest[w..], ",");
+        w += try fmtInto(dest[w..], "{{\"href\":\"{s}\"", .{caps[i].href});
+        if (caps[i].name.len > 0) {
+            w += try fmtInto(dest[w..], ",\"name\":\"{s}\"", .{caps[i].name});
+        }
+        w += try copy(dest[w..], "}");
+    }
+    w += try copy(dest[w..], "]");
+    return w;
 }
 
 /// AP-15: write the JSON array of Multikey entries (FEP-d36d). The
@@ -218,21 +284,17 @@ fn writeMultikeyArray(dest: []u8, cfg: Config, with_primary: bool) WriteError!us
     w += try copy(dest[w..], "[");
     var wrote_one = false;
     if (with_primary) {
-        w += try fmtInto(dest[w..],
-            "{{\"id\":\"https://{s}/users/{s}#main-key\"," ++
+        w += try fmtInto(dest[w..], "{{\"id\":\"https://{s}/users/{s}#main-key\"," ++
             "\"type\":\"Multikey\",\"controller\":\"https://{s}/users/{s}\"," ++
-            "\"publicKeyMultibase\":\"{s}\"}}",
-            .{ cfg.hostname, cfg.username, cfg.hostname, cfg.username, cfg.assertion_multibase });
+            "\"publicKeyMultibase\":\"{s}\"}}", .{ cfg.hostname, cfg.username, cfg.hostname, cfg.username, cfg.assertion_multibase });
         wrote_one = true;
     }
     var idx: usize = 0;
     while (idx < cfg.extra_keys.len) : (idx += 1) {
         if (wrote_one) w += try copy(dest[w..], ",");
-        w += try fmtInto(dest[w..],
-            "{{\"id\":\"https://{s}/users/{s}#key-{d}\"," ++
+        w += try fmtInto(dest[w..], "{{\"id\":\"https://{s}/users/{s}#key-{d}\"," ++
             "\"type\":\"Multikey\",\"controller\":\"https://{s}/users/{s}\"," ++
-            "\"publicKeyMultibase\":\"{s}\"}}",
-            .{ cfg.hostname, cfg.username, idx + 1, cfg.hostname, cfg.username, cfg.extra_keys[idx].multibase });
+            "\"publicKeyMultibase\":\"{s}\"}}", .{ cfg.hostname, cfg.username, idx + 1, cfg.hostname, cfg.username, cfg.extra_keys[idx].multibase });
         wrote_one = true;
     }
     w += try copy(dest[w..], "]");
@@ -379,4 +441,50 @@ test "AP-15: too many extra keys is rejected" {
         .username = "u",
         .extra_keys = extras[0..],
     }, &buf));
+}
+
+test "AP4 / FEP-844e: writeCapabilities advertises an Application with implements[]" {
+    var buf: [4096]u8 = undefined;
+    const caps = [_]Capability{
+        .{ .href = "https://w3id.org/fep/67ff", .name = "FEDERATION doc" },
+        .{ .href = "https://w3id.org/fep/d36d", .name = "Multikey rotation" },
+        .{ .href = "https://www.w3.org/TR/activitypub/", .name = "ActivityPub" },
+    };
+    const out = try writeCapabilities("speedy.example", caps[0..], &buf);
+    // The document is a standalone Application pinned to the FEP-844e context.
+    try testing.expect(std.mem.indexOf(u8, out, "\"type\":\"Application\"") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "https://w3id.org/fep/844e") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "https://speedy.example/.well-known/fep-844e") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "\"implements\":[") != null);
+    // Each advertised capability's href + name is present.
+    for (caps) |cap| {
+        try testing.expect(std.mem.indexOf(u8, out, cap.href) != null);
+        try testing.expect(std.mem.indexOf(u8, out, cap.name) != null);
+    }
+}
+
+test "AP4 / FEP-844e: writeCapabilities omits name when absent and bounds count" {
+    var buf: [4096]u8 = undefined;
+    const caps = [_]Capability{.{ .href = "https://w3id.org/fep/c648" }};
+    const out = try writeCapabilities("h", caps[0..], &buf);
+    try testing.expect(std.mem.indexOf(u8, out, "\"href\":\"https://w3id.org/fep/c648\"") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "\"name\"") == null);
+
+    // Over the cap is rejected.
+    var many: [max_capabilities + 1]Capability = undefined;
+    for (&many) |*cp| cp.* = .{ .href = "https://x" };
+    try testing.expectError(error.BufferTooSmall, writeCapabilities("h", many[0..], &buf));
+}
+
+test "AP4 / FEP-844e: writeGenerator embeds the same implements[] for actor-attach" {
+    var buf: [4096]u8 = undefined;
+    const caps = [_]Capability{
+        .{ .href = "https://w3id.org/fep/844e", .name = "Capability negotiation" },
+    };
+    const n = try writeGenerator(&buf, "h.example", caps[0..]);
+    const out = buf[0..n];
+    try testing.expect(std.mem.indexOf(u8, out, "\"type\":\"Application\"") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "\"implements\":[") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "https://w3id.org/fep/844e") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "https://h.example/.well-known/fep-844e") != null);
 }

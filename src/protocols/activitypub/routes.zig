@@ -283,11 +283,12 @@ fn formatIsoTime(unix_seconds: i64, out: []u8) ![]const u8 {
     const ymd = ed.calculateYearDay();
     const md = ymd.calculateMonthDay();
     const ds = es.getDaySeconds();
-    return std.fmt.bufPrint(out,
+    return std.fmt.bufPrint(
+        out,
         "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z",
         .{
-            @as(u32, ymd.year), @as(u32, md.month.numeric()), @as(u32, md.day_index + 1),
-            ds.getHoursIntoDay(), ds.getMinutesIntoHour(), ds.getSecondsIntoMinute(),
+            @as(u32, ymd.year),   @as(u32, md.month.numeric()), @as(u32, md.day_index + 1),
+            ds.getHoursIntoDay(), ds.getMinutesIntoHour(),      ds.getSecondsIntoMinute(),
         },
     );
 }
@@ -352,19 +353,50 @@ fn handleFediverse(hc: *HandlerContext) anyerror!void {
 /// instance name + policy knobs, writes into a caller buffer.
 fn writeFederationInfo(host: []const u8, atproto: bool, signed_fetch: bool, out: []u8) ![]const u8 {
     const protocols: []const u8 = if (atproto) "\"activitypub\",\"atproto\"" else "\"activitypub\"";
-    return std.fmt.bufPrint(out,
+    return std.fmt.bufPrint(
+        out,
         "{{\"@context\":[\"https://www.w3.org/ns/activitystreams\"," ++
-        "{{\"fediverse\":\"https://w3id.org/fep/67ff#\"}}]," ++
-        "\"type\":\"FederationInfo\"," ++
-        "\"name\":\"{s}\"," ++
-        "\"protocols\":[{s}]," ++
-        "\"policies\":{{" ++
-        "\"openRegistrations\":false," ++
-        "\"manualFollowApproval\":false," ++
-        "\"federation\":\"open\"," ++
-        "\"signedFetch\":{s}}}}}",
+            "{{\"fediverse\":\"https://w3id.org/fep/67ff#\"}}]," ++
+            "\"type\":\"FederationInfo\"," ++
+            "\"name\":\"{s}\"," ++
+            "\"protocols\":[{s}]," ++
+            "\"policies\":{{" ++
+            "\"openRegistrations\":false," ++
+            "\"manualFollowApproval\":false," ++
+            "\"federation\":\"open\"," ++
+            "\"signedFetch\":{s}}}}}",
         .{ host, protocols, if (signed_fetch) "true" else "false" },
     );
+}
+
+// AP4 / FEP-844e: the canonical set of capabilities (FEPs + AP
+// collections) this node implements. Advertised both at the
+// `/.well-known/fep-844e` document and, actor-attached, as the
+// `generator` of each served actor. Keep this list in sync with the
+// features the AP plugin actually serves.
+const server_capabilities = [_]actor_mod.Capability{
+    .{ .href = "https://www.w3.org/TR/activitypub/", .name = "ActivityPub" },
+    .{ .href = "https://w3id.org/fep/844e", .name = "Capability negotiation" },
+    .{ .href = "https://w3id.org/fep/67ff", .name = "FEDERATION machine-readable doc" },
+    .{ .href = "https://w3id.org/fep/f1d5", .name = "NodeInfo discovery" },
+    .{ .href = "https://w3id.org/fep/d36d", .name = "Multikey publication & rotation" },
+    .{ .href = "https://w3id.org/fep/c648", .name = "Actor liked collection" },
+    .{ .href = "https://w3id.org/fep/c0e0", .name = "EmojiReact reactions" },
+    .{ .href = "https://www.w3.org/ns/activitystreams#Question", .name = "Question polls with vote tallies" },
+};
+
+// AP4 / FEP-844e: serve the capability-negotiation document. A
+// standalone `Application` object whose `implements` array lists the
+// FEPs/collections this node supports, discoverable at
+// `/.well-known/fep-844e`. Complements the FEP-67ff FEDERATION doc.
+fn handleCapabilities(hc: *HandlerContext) anyerror!void {
+    var body: [4096]u8 = undefined;
+    const out = actor_mod.writeCapabilities(
+        state_mod.get().hostname(),
+        server_capabilities[0..],
+        &body,
+    ) catch return writeJson(hc, .internal, "{\"error\":\"capabilities buf\"}");
+    try writeJsonLd(hc, .ok, out);
 }
 
 fn handleNodeInfo21(hc: *HandlerContext) anyerror!void {
@@ -420,10 +452,8 @@ fn handleUserActor(hc: *HandlerContext) anyerror!void {
     if (!wantsActivityJson(accept)) {
         // Serve a tiny HTML stub.
         var html_buf: [1024]u8 = undefined;
-        const html = std.fmt.bufPrint(&html_buf,
-            "<!doctype html><html><head><title>@{s}</title></head>" ++
-            "<body><h1>@{s}</h1><p>{s}</p></body></html>",
-            .{ user.username(), user.username(), user.bio() }) catch return writeJson(hc, .internal, "{\"error\":\"html buf\"}");
+        const html = std.fmt.bufPrint(&html_buf, "<!doctype html><html><head><title>@{s}</title></head>" ++
+            "<body><h1>@{s}</h1><p>{s}</p></body></html>", .{ user.username(), user.username(), user.bio() }) catch return writeJson(hc, .internal, "{\"error\":\"html buf\"}");
         return writeHtml(hc, .ok, html);
     }
 
@@ -452,6 +482,8 @@ fn handleUserActor(hc: *HandlerContext) anyerror!void {
         .actor_type = actor_mod.ActorType.parse(user.actorType()) orelse .person,
         .assertion_multibase = assertion_mb,
         .extra_keys = extra_keys,
+        // AP4 / FEP-844e: actor-attached capability advertisement.
+        .capabilities = server_capabilities[0..],
     }, &body) catch return writeJson(hc, .internal, "{\"error\":\"actor buf\"}");
     try writeJsonLd(hc, .ok, out);
 }
@@ -467,16 +499,18 @@ fn writeTombstone(hc: *HandlerContext, db: *c.sqlite3, uri: []const u8) !void {
                 break :blk fallbackTombstone(&body, uri);
             const former = tomb.formerType();
             if (former.len > 0) {
-                break :blk std.fmt.bufPrint(&body,
+                break :blk std.fmt.bufPrint(
+                    &body,
                     "{{\"@context\":\"https://www.w3.org/ns/activitystreams\"," ++
-                    "\"id\":\"{s}\",\"type\":\"Tombstone\"," ++
-                    "\"formerType\":\"{s}\",\"deleted\":\"{s}\"}}",
+                        "\"id\":\"{s}\",\"type\":\"Tombstone\"," ++
+                        "\"formerType\":\"{s}\",\"deleted\":\"{s}\"}}",
                     .{ uri, former, iso },
                 ) catch break :blk fallbackTombstone(&body, uri);
             }
-            break :blk std.fmt.bufPrint(&body,
+            break :blk std.fmt.bufPrint(
+                &body,
                 "{{\"@context\":\"https://www.w3.org/ns/activitystreams\"," ++
-                "\"id\":\"{s}\",\"type\":\"Tombstone\",\"deleted\":\"{s}\"}}",
+                    "\"id\":\"{s}\",\"type\":\"Tombstone\",\"deleted\":\"{s}\"}}",
                 .{ uri, iso },
             ) catch break :blk fallbackTombstone(&body, uri);
         }
@@ -491,9 +525,10 @@ fn writeTombstone(hc: *HandlerContext, db: *c.sqlite3, uri: []const u8) !void {
 }
 
 fn fallbackTombstone(body: []u8, uri: []const u8) []const u8 {
-    return std.fmt.bufPrint(body,
+    return std.fmt.bufPrint(
+        body,
         "{{\"@context\":\"https://www.w3.org/ns/activitystreams\"," ++
-        "\"id\":\"{s}\",\"type\":\"Tombstone\"}}",
+            "\"id\":\"{s}\",\"type\":\"Tombstone\"}}",
         .{uri},
     ) catch body[0..0];
 }
@@ -1352,7 +1387,8 @@ fn renderCollection(hc: *HandlerContext, kind: collections.CollectionKind) !void
     // AP-11: featured collection counts entries in `ap_collection_items`
     // for the actor's `/collections/featured` URL.
     var featured_uri_buf: [320]u8 = undefined;
-    const featured_uri = std.fmt.bufPrint(&featured_uri_buf,
+    const featured_uri = std.fmt.bufPrint(
+        &featured_uri_buf,
         "https://{s}/users/{s}/collections/featured",
         .{ st.hostname(), user.username() },
     ) catch return writeJson(hc, .internal, "{\"error\":\"uri buf\"}");
@@ -1418,16 +1454,31 @@ fn handleUserStatus(hc: *HandlerContext) anyerror!void {
     const uri = std.fmt.bufPrint(&uri_buf, "https://{s}/users/{s}/statuses/{s}", .{ st.hostname(), username, id }) catch
         return writeJson(hc, .internal, "{\"error\":\"uri buf\"}");
     if (isTombstoned(db, uri)) return writeTombstone(hc, db, uri);
+
+    // AP4: if this object has recorded poll votes, it is a Question —
+    // serve the full poll results (per-option tallies). This holds even
+    // when no local Create activity recorded the object, so a poll's
+    // results are exposed for any Question we have votes for.
+    var tally: PollTally = .{};
+    tallyPollVotes(db, uri, &tally);
+    if (tally.len > 0) {
+        var body: [max_response_bytes]u8 = undefined;
+        const out = writeQuestionObject(uri, &tally, &body) catch
+            return writeJson(hc, .internal, "{\"error\":\"poll buf\"}");
+        return writeJsonLd(hc, .ok, out);
+    }
+
     // If we have a Create activity that produced this object, serve a
     // minimal AS2 object stub carrying the `replies` collection link
     // (the Mastodon API serves the full object; here we only need to
     // advertise the per-object replies collection). Otherwise 404.
     if (objectExists(db, uri)) {
         var body: [640]u8 = undefined;
-        const out = std.fmt.bufPrint(&body,
+        const out = std.fmt.bufPrint(
+            &body,
             "{{\"@context\":\"https://www.w3.org/ns/activitystreams\"," ++
-            "\"id\":\"{s}\",\"type\":\"Note\"," ++
-            "\"replies\":\"{s}/replies\"}}",
+                "\"id\":\"{s}\",\"type\":\"Note\"," ++
+                "\"replies\":\"{s}/replies\"}}",
             .{ uri, uri },
         ) catch return writeJson(hc, .internal, "{\"error\":\"obj buf\"}");
         return writeJsonLd(hc, .ok, out);
@@ -1435,6 +1486,32 @@ fn handleUserStatus(hc: *HandlerContext) anyerror!void {
     // Today we don't render local statuses via AP — the Mastodon API
     // handles object responses. Surface a 404 here rather than 410.
     return writeJson(hc, .not_found, "{\"error\":\"unknown\"}");
+}
+
+// AP4: render a `Question` poll object embedding its vote tally. Each
+// option is emitted as a `oneOf[]` entry with `name` and an inline
+// `replies` Collection whose `totalItems` is that option's vote count
+// (Mastodon's poll-results shape). The aggregate is exposed as both
+// `votersCount` and `votes` (total votes recorded). Closed is implied
+// by `closed` being absent — we expose live tallies. Pure: writes into
+// the caller buffer (Tiger Style, bounded by `max_poll_options`).
+fn writeQuestionObject(uri: []const u8, tally: *const PollTally, out: []u8) ![]const u8 {
+    var w: usize = 0;
+    const head = try std.fmt.bufPrint(out[w..], "{{\"@context\":\"https://www.w3.org/ns/activitystreams\"," ++
+        "\"id\":\"{s}\",\"type\":\"Question\"," ++
+        "\"replies\":\"{s}/replies\",\"oneOf\":[", .{ uri, uri });
+    w += head.len;
+    var i: usize = 0;
+    while (i < tally.len) : (i += 1) {
+        const sep = if (i > 0) "," else "";
+        const seg = try std.fmt.bufPrint(out[w..], "{s}{{\"type\":\"Note\",\"name\":\"{s}\"," ++
+            "\"replies\":{{\"type\":\"Collection\",\"totalItems\":{d}}}}}", .{ sep, tally.option(i), tally.counts[i] });
+        w += seg.len;
+    }
+    const total = tally.totalVotes();
+    const tail = try std.fmt.bufPrint(out[w..], "],\"votersCount\":{d},\"votes\":{d}}}", .{ total, total });
+    w += tail.len;
+    return out[0..w];
 }
 
 // True when some Create activity recorded `object_iri` as its object —
@@ -1543,6 +1620,7 @@ pub fn register(router: *Router, plugin_index: u16) !void {
     try router.register(.get, "/.well-known/webfinger", handleWebFinger, plugin_index);
     try router.register(.get, "/.well-known/nodeinfo", handleNodeInfoJrd, plugin_index);
     try router.register(.get, "/.well-known/fediverse", handleFediverse, plugin_index); // FEP-67ff
+    try router.register(.get, "/.well-known/fep-844e", handleCapabilities, plugin_index); // FEP-844e (AP4)
     try router.register(.get, "/nodeinfo/2.1", handleNodeInfo21, plugin_index);
     try router.register(.get, "/users/:u", handleUserActor, plugin_index);
     try router.register(.post, "/users/:u/inbox", handleUserInbox, plugin_index);
@@ -1588,8 +1666,8 @@ test "register binds the expected route count" {
     var r = Router.init();
     try register(&r, 0);
     // 10 base + AP-30 (×2 status/activity) + AP-14 (liked) + AP-1 outbox POST
-    // + per-object replies + FEP-67ff fediverse.
-    try testing.expectEqual(@as(u32, 16), r.count);
+    // + per-object replies + FEP-67ff fediverse + FEP-844e capabilities (AP4).
+    try testing.expectEqual(@as(u32, 17), r.count);
 }
 
 test "loadUser returns null on missing user" {
@@ -1606,10 +1684,8 @@ test "loadUser returns row for inserted user" {
     defer sqlite_mod.closeDb(db);
     try @import("schema.zig").applyAllForTests(db);
     var em: [*c]u8 = null;
-    _ = c.sqlite3_exec(db,
-        "INSERT INTO ap_users(username, display_name, bio, is_locked, discoverable, indexable, created_at) " ++
-        "VALUES ('alice','Alice','hello',0,1,1,0)",
-        null, null, &em);
+    _ = c.sqlite3_exec(db, "INSERT INTO ap_users(username, display_name, bio, is_locked, discoverable, indexable, created_at) " ++
+        "VALUES ('alice','Alice','hello',0,1,1,0)", null, null, &em);
     if (em != null) c.sqlite3_free(em);
 
     const u = loadUser(db, "alice") orelse return error.TestUserMissing;
@@ -1780,10 +1856,8 @@ test "AP-10: actor_type persists and renders" {
     defer sqlite_mod.closeDb(db);
     try @import("schema.zig").applyAllForTests(db);
     var em: [*c]u8 = null;
-    _ = c.sqlite3_exec(db,
-        "INSERT INTO ap_users(username, display_name, bio, is_locked, discoverable, indexable, created_at, actor_type) " ++
-        "VALUES ('svc','Service Bot','',0,1,1,0,'Service')",
-        null, null, &em);
+    _ = c.sqlite3_exec(db, "INSERT INTO ap_users(username, display_name, bio, is_locked, discoverable, indexable, created_at, actor_type) " ++
+        "VALUES ('svc','Service Bot','',0,1,1,0,'Service')", null, null, &em);
     if (em != null) c.sqlite3_free(em);
 
     const u = loadUser(db, "svc") orelse return error.TestUserMissing;
@@ -1879,9 +1953,7 @@ test "FEP-c648: countLikedByActor scopes by actor_id" {
     const n_bob: u32 = 1 + rnd.uintLessThan(u32, 12);
 
     var ins: ?*c.sqlite3_stmt = null;
-    try testing.expect(c.sqlite3_prepare_v2(db,
-        "INSERT INTO ap_activities(ap_id,actor_id,type,object_id,published,raw) VALUES (?,?,'like',?,0,X'7B7D')",
-        -1, &ins, null) == c.SQLITE_OK);
+    try testing.expect(c.sqlite3_prepare_v2(db, "INSERT INTO ap_activities(ap_id,actor_id,type,object_id,published,raw) VALUES (?,?,'like',?,0,X'7B7D')", -1, &ins, null) == c.SQLITE_OK);
     defer _ = c.sqlite3_finalize(ins);
 
     var i: u32 = 0;
@@ -1920,7 +1992,10 @@ test "FEP-c648: countLikedByActor scopes by actor_id" {
     var iter = PageIter{ .stmt = stmt };
     var buf: [max_response_bytes]u8 = undefined;
     const out = try collections.writePage(.{
-        .hostname = "h", .actor_username = "alice", .kind = .liked, .total_items = 0,
+        .hostname = "h",
+        .actor_username = "alice",
+        .kind = .liked,
+        .total_items = 0,
     }, 1, @ptrCast(&iter), PageIter.next, &buf);
     try testing.expect(std.mem.indexOf(u8, out, "https://peer/p/0") != null);
     try testing.expect(std.mem.indexOf(u8, out, "https://peer/q/0") == null);
@@ -1940,9 +2015,7 @@ test "per-object replies: countReplies + page query filter by object_id" {
     const n_replies: u32 = 1 + rnd.uintLessThan(u32, 10);
 
     var ins: ?*c.sqlite3_stmt = null;
-    try testing.expect(c.sqlite3_prepare_v2(db,
-        "INSERT INTO ap_activities(ap_id,actor_id,type,object_id,published,raw) VALUES (?,0,'create',?,?,X'7B7D')",
-        -1, &ins, null) == c.SQLITE_OK);
+    try testing.expect(c.sqlite3_prepare_v2(db, "INSERT INTO ap_activities(ap_id,actor_id,type,object_id,published,raw) VALUES (?,0,'create',?,?,X'7B7D')", -1, &ins, null) == c.SQLITE_OK);
     defer _ = c.sqlite3_finalize(ins);
 
     var i: u32 = 0;
@@ -1974,7 +2047,10 @@ test "per-object replies: countReplies + page query filter by object_id" {
     var iter = PageIter{ .stmt = stmt };
     var buf: [max_response_bytes]u8 = undefined;
     const out = try collections.writePage(.{
-        .hostname = "h", .actor_username = "alice", .kind = .replies, .total_items = 0,
+        .hostname = "h",
+        .actor_username = "alice",
+        .kind = .replies,
+        .total_items = 0,
         .path = "users/alice/statuses/42/replies",
     }, 1, @ptrCast(&iter), PageIter.next, &buf);
     try testing.expect(std.mem.indexOf(u8, out, "https://peer/reply/0") != null);
@@ -2024,6 +2100,65 @@ test "AP-16: tallyPollVotes groups by option_name" {
     try testing.expectEqual(@as(i64, a_votes + b_votes), tally.totalVotes());
 }
 
+test "AP4: served Question embeds per-option tallies as oneOf[].replies.totalItems" {
+    const sqlite_mod = core.storage.sqlite;
+    const db = try sqlite_mod.openWriter(":memory:");
+    defer sqlite_mod.closeDb(db);
+    try @import("schema.zig").applyAllForTests(db);
+
+    var sc = core.clock.SimClock.init(0);
+    const clock = sc.clock();
+    const q = "https://h/users/alice/statuses/pollX";
+
+    // Randomized vote distribution across three options.
+    var prng = std.Random.DefaultPrng.init(0x5EED);
+    const rnd = prng.random();
+    const options = [_][]const u8{ "Red", "Green", "Blue" };
+    var expected: [3]u32 = undefined;
+    var abuf: [80]u8 = undefined;
+    var vbuf: [80]u8 = undefined;
+    var total: u32 = 0;
+    for (options, 0..) |opt, oi| {
+        const n: u32 = 1 + rnd.uintLessThan(u32, 15);
+        expected[oi] = n;
+        total += n;
+        var k: u32 = 0;
+        while (k < n) : (k += 1) {
+            const ai = try std.fmt.bufPrint(&abuf, "https://h/act/{s}-{d}", .{ opt, k });
+            const voter = try std.fmt.bufPrint(&vbuf, "https://peer/{s}-voter{d}", .{ opt, k });
+            try recordPollVote(db, clock, ai, q, voter, opt);
+        }
+    }
+
+    var tally: PollTally = .{};
+    tallyPollVotes(db, q, &tally);
+    try testing.expectEqual(@as(usize, 3), tally.len);
+
+    var body: [max_response_bytes]u8 = undefined;
+    const out = try writeQuestionObject(q, &tally, &body);
+
+    // Served as a Question carrying its replies link.
+    try testing.expect(std.mem.indexOf(u8, out, "\"type\":\"Question\"") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "\"id\":\"https://h/users/alice/statuses/pollX\"") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "\"replies\":\"https://h/users/alice/statuses/pollX/replies\"") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "\"oneOf\":[") != null);
+
+    // Each option name + its Collection totalItems matches the recorded count.
+    for (options, 0..) |opt, oi| {
+        var nbuf: [64]u8 = undefined;
+        const namefrag = try std.fmt.bufPrint(&nbuf, "\"name\":\"{s}\"", .{opt});
+        try testing.expect(std.mem.indexOf(u8, out, namefrag) != null);
+        var tbuf: [80]u8 = undefined;
+        const totfrag = try std.fmt.bufPrint(&tbuf, "\"type\":\"Collection\",\"totalItems\":{d}", .{expected[oi]});
+        try testing.expect(std.mem.indexOf(u8, out, totfrag) != null);
+    }
+
+    // Aggregate vote count exposed as votersCount + votes.
+    var aggbuf: [64]u8 = undefined;
+    const aggfrag = try std.fmt.bufPrint(&aggbuf, "\"votersCount\":{d},\"votes\":{d}", .{ total, total });
+    try testing.expect(std.mem.indexOf(u8, out, aggfrag) != null);
+}
+
 test "FEP-c0e0: recordReaction persists the emoji" {
     const sqlite_mod = core.storage.sqlite;
     const db = try sqlite_mod.openWriter(":memory:");
@@ -2065,9 +2200,7 @@ test "AP-15: loadExtraKeys converts published PEMs to multibase #key-N entries" 
 
     // Publish two Ed25519 rotation keys for alice.
     var ins: ?*c.sqlite3_stmt = null;
-    try testing.expect(c.sqlite3_prepare_v2(db,
-        "INSERT INTO ap_actor_extra_keys(username, key_id, key_type, public_pem, created_at) VALUES ('alice',?,'ed25519',?,0)",
-        -1, &ins, null) == c.SQLITE_OK);
+    try testing.expect(c.sqlite3_prepare_v2(db, "INSERT INTO ap_actor_extra_keys(username, key_id, key_type, public_pem, created_at) VALUES ('alice',?,'ed25519',?,0)", -1, &ins, null) == c.SQLITE_OK);
     defer _ = c.sqlite3_finalize(ins);
 
     var n: u8 = 1;
@@ -2093,7 +2226,10 @@ test "AP-15: loadExtraKeys converts published PEMs to multibase #key-N entries" 
     // And the actor doc advertises them under #key-1 / #key-2.
     var body: [max_response_bytes]u8 = undefined;
     const out = try actor_mod.writePerson(.{
-        .hostname = "h", .username = "alice", .public_key_pem = "", .extra_keys = extras,
+        .hostname = "h",
+        .username = "alice",
+        .public_key_pem = "",
+        .extra_keys = extras,
     }, &body);
     try testing.expect(std.mem.indexOf(u8, out, "#key-1") != null);
     try testing.expect(std.mem.indexOf(u8, out, "#key-2") != null);
@@ -2121,4 +2257,20 @@ test "FEP-67ff: writeFederationInfo body shape" {
     // Tiny buffer fails cleanly.
     var tiny: [8]u8 = undefined;
     try testing.expectError(error.NoSpaceLeft, writeFederationInfo("h", false, false, &tiny));
+}
+
+test "AP4 / FEP-844e: capability doc advertises every server capability" {
+    var body: [4096]u8 = undefined;
+    const out = try actor_mod.writeCapabilities("speedy.test", server_capabilities[0..], &body);
+    // Application object pinned to the FEP-844e namespace + discoverable id.
+    try testing.expect(std.mem.indexOf(u8, out, "\"type\":\"Application\"") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "https://w3id.org/fep/844e") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "https://speedy.test/.well-known/fep-844e") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "\"implements\":[") != null);
+    // Every advertised capability's href appears in the document.
+    for (server_capabilities) |cap| {
+        try testing.expect(std.mem.indexOf(u8, out, cap.href) != null);
+    }
+    // And FEP-844e itself is in the advertised set (self-advertisement).
+    try testing.expect(std.mem.indexOf(u8, out, "\"href\":\"https://w3id.org/fep/844e\"") != null);
 }
