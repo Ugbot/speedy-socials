@@ -133,8 +133,6 @@ pub const Pool = struct {
 // acquire/release reuse test that skips cleanly without a broker.
 
 const testing = std.testing;
-const test_server_host = "127.0.0.1";
-const test_server_port: u16 = 6379;
 
 test "Pool: max_size is a sane fixed bound; init clamps capacity" {
     try testing.expect(max_size >= 1 and max_size <= 256);
@@ -145,7 +143,7 @@ test "Pool: max_size is a sane fixed bound; init clamps capacity" {
 
 test "redis Pool live acquire/release reuse (skips if no broker)" {
     const gpa = testing.allocator;
-    var pool = Pool.init(gpa, .{ .host = test_server_host, .port = test_server_port }, 4) catch
+    var pool = Pool.init(gpa, conn_mod.testOptions(), 4) catch
         return error.SkipZigTest;
     defer pool.deinit();
 

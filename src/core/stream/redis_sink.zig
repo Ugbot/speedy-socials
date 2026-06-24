@@ -78,38 +78,10 @@ pub const RedisSink = struct {
     }
 };
 
-/// Parse `host:port` or `redis://[user:pass@]host:port[/db]` (also
-/// `rediss://`, recognised but TLS not yet implemented) into client options.
+/// Parse `host:port` or `redis://[user:pass@]host:port[/db]` into client
+/// options (the single parser lives in `conn`).
 fn parseServer(server: []const u8) conn_mod.Options {
-    var s = server;
-    inline for (.{ "redis://", "rediss://" }) |scheme| {
-        if (std.mem.startsWith(u8, s, scheme)) {
-            s = s[scheme.len..];
-            break;
-        }
-    }
-    var opts = conn_mod.Options{};
-    if (std.mem.indexOfScalar(u8, s, '@')) |at| {
-        const userinfo = s[0..at];
-        s = s[at + 1 ..];
-        if (std.mem.indexOfScalar(u8, userinfo, ':')) |colon| {
-            if (colon > 0) opts.username = userinfo[0..colon];
-            opts.password = userinfo[colon + 1 ..];
-        } else if (userinfo.len > 0) {
-            opts.password = userinfo;
-        }
-    }
-    if (std.mem.indexOfScalar(u8, s, '/')) |slash| {
-        opts.db = std.fmt.parseInt(u32, s[slash + 1 ..], 10) catch 0;
-        s = s[0..slash];
-    }
-    if (std.mem.lastIndexOfScalar(u8, s, ':')) |colon| {
-        opts.host = s[0..colon];
-        opts.port = std.fmt.parseInt(u16, s[colon + 1 ..], 10) catch 6379;
-    } else if (s.len > 0) {
-        opts.host = s;
-    }
-    return opts;
+    return conn_mod.parseOptions(server);
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -118,7 +90,9 @@ fn parseServer(server: []const u8) conn_mod.Options {
 // missing broker surfaces as an init error we map to a skip.
 // ──────────────────────────────────────────────────────────────────────
 
-const test_server = "127.0.0.1:6379";
+fn testServer() []const u8 {
+    return if (std.c.getenv("REDIS_TEST_URL")) |p| std.mem.sliceTo(p, 0) else "127.0.0.1:6379";
+}
 
 test "parseServer: host:port, scheme, auth, db" {
     {
@@ -144,7 +118,7 @@ test "parseServer: host:port, scheme, auth, db" {
 
 test "RedisSink live XADD round-trip (skips if no broker)" {
     const gpa = std.testing.allocator;
-    var rsink = RedisSink.init(gpa, test_server) catch return error.SkipZigTest;
+    var rsink = RedisSink.init(gpa, testServer()) catch return error.SkipZigTest;
     defer rsink.deinit();
     const s = rsink.sink();
 

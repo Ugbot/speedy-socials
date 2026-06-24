@@ -441,14 +441,57 @@ fn applyTimeouts(fd: std.c.fd_t, timeout_ms: u32) void {
 }
 
 // ──────────────────────────────────────────────────────────────────────
+// Endpoint parsing.
+// ──────────────────────────────────────────────────────────────────────
+
+/// Parse `host:port` or `redis://[user:pass@]host:port[/db]` (`rediss://`
+/// recognised; TLS wired separately) into connection `Options`.
+pub fn parseOptions(url: []const u8) Options {
+    var s = url;
+    inline for (.{ "redis://", "rediss://" }) |scheme| {
+        if (std.mem.startsWith(u8, s, scheme)) {
+            s = s[scheme.len..];
+            break;
+        }
+    }
+    var opts = Options{};
+    if (std.mem.indexOfScalar(u8, s, '@')) |at| {
+        const userinfo = s[0..at];
+        s = s[at + 1 ..];
+        if (std.mem.indexOfScalar(u8, userinfo, ':')) |colon| {
+            if (colon > 0) opts.username = userinfo[0..colon];
+            opts.password = userinfo[colon + 1 ..];
+        } else if (userinfo.len > 0) {
+            opts.password = userinfo;
+        }
+    }
+    if (std.mem.indexOfScalar(u8, s, '/')) |slash| {
+        opts.db = std.fmt.parseInt(u32, s[slash + 1 ..], 10) catch 0;
+        s = s[0..slash];
+    }
+    if (std.mem.lastIndexOfScalar(u8, s, ':')) |colon| {
+        opts.host = s[0..colon];
+        opts.port = std.fmt.parseInt(u16, s[colon + 1 ..], 10) catch 6379;
+    } else if (s.len > 0) {
+        opts.host = s;
+    }
+    return opts;
+}
+
+/// Live-test endpoint, from `REDIS_TEST_URL` (default `127.0.0.1:6379`) — lets
+/// CI point the gated live tests at any broker, mirroring `PG_TEST_URL`.
+pub fn testOptions() Options {
+    const url = if (std.c.getenv("REDIS_TEST_URL")) |p| std.mem.sliceTo(p, 0) else "127.0.0.1:6379";
+    return parseOptions(url);
+}
+
+// ──────────────────────────────────────────────────────────────────────
 // Tests. Pure-logic tests (no socket) assert the exact request bytes the
-// handshake/exec paths emit for randomized credentials. The live tests
-// skip cleanly when no broker is on 127.0.0.1:6379.
+// handshake/exec paths emit for randomized credentials. The live tests skip
+// cleanly when no broker is reachable (REDIS_TEST_URL, default :6379).
 // ──────────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
-const test_server_host = "127.0.0.1";
-const test_server_port: u16 = 6379;
 
 test "dialBlocking: unresolvable host fails cleanly (no hang, no crash)" {
     const r = dialBlocking("nonexistent.invalid", 6379, 500);
@@ -525,7 +568,7 @@ test "AUTH/HELLO/SELECT command bytes match encodeCommand for random creds" {
 
 test "redis Conn live round-trip SET/GET/DEL/INCR/XADD/XLEN (skips if no broker)" {
     const gpa = testing.allocator;
-    var c = Conn.connect(gpa, .{ .host = test_server_host, .port = test_server_port }) catch
+    var c = Conn.connect(gpa, testOptions()) catch
         return error.SkipZigTest;
     defer c.deinit();
     c.ping() catch return error.SkipZigTest;
