@@ -816,15 +816,17 @@ pub fn main() !void {
     activitypub.keys.setRsaVerifyHook(core.crypto.rsa.verifyPkcs1v15Sha256);
     log_ptr.info("boot", "rsa verify hook wired (core.crypto.rsa.verifyPkcs1v15Sha256)");
 
-    // G4: STRICT_HTTP_SIG=1 makes the AP inbox reject unverified
-    // activities. Default soft acceptance matches the historic
-    // behaviour; production deployments that federate with
-    // strict-verifying peers should set this.
-    if (std.c.getenv("STRICT_HTTP_SIG")) |envp| {
+    // FIXSIG: the AP inbox verifies HTTP signatures and REJECTS
+    // unverified activities (401, no store, no fanout) by default —
+    // this is mandatory to stop forged Create/Delete/Follow activities
+    // from being attributed to any actor. The dev escape hatch
+    // `AP_ALLOW_UNSIGNED_INBOX=1` restores the historic soft-acceptance
+    // behaviour for local testing only; never set it in production.
+    if (std.c.getenv("AP_ALLOW_UNSIGNED_INBOX")) |envp| {
         const v = std.mem.sliceTo(envp, 0);
         if (v.len > 0 and (v[0] == '1' or v[0] == 't' or v[0] == 'T')) {
-            activitypub.state.setStrictHttpSig(true);
-            log_ptr.info("boot", "AP inbox strict HTTP-signature mode enabled");
+            activitypub.state.setStrictHttpSig(false);
+            log_ptr.info("boot", "AP inbox DEV escape hatch: unsigned activities accepted (AP_ALLOW_UNSIGNED_INBOX=1) — INSECURE");
         }
     }
 

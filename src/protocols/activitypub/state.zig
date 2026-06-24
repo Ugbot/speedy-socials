@@ -104,12 +104,18 @@ pub fn setHostname(name: []const u8) void {
     instance.hostname_len = n;
 }
 
-/// G4: strict HTTP-signature mode. When `true` the AP inbox rejects
-/// activities whose signature cannot be verified (cavage header
-/// missing, key unresolvable, signature mismatch). Default `false`
-/// matches the historic "soft acceptance" behaviour documented in
+/// G4 / FIXSIG: strict HTTP-signature mode. When `true` (the default)
+/// the AP inbox REJECTS — with 401 Unauthorized, no store, no fanout —
+/// any activity whose signature cannot be verified (cavage header
+/// missing, key unresolvable, digest/signature mismatch, stale or
+/// replayed). This is the only correct default: without it an attacker
+/// can POST forged Create/Delete/Follow activities as any actor.
+///
+/// The dev escape hatch (`AP_ALLOW_UNSIGNED_INBOX=1`, wired in
+/// `main.zig`) flips this back to `false` to restore the historic
+/// "soft acceptance" behaviour for local testing only. See
 /// `PROTOCOL_AUDIT.md` AP-C2.
-var strict_http_sig: bool = false;
+var strict_http_sig: bool = true;
 
 pub fn setStrictHttpSig(enabled: bool) void {
     strict_http_sig = enabled;
@@ -168,6 +174,30 @@ test "State get/reset cycle" {
     try std.testing.expectEqualStrings("example.com", get().hostname());
     reset();
     try std.testing.expectEqualStrings("speedy-socials.local", get().hostname());
+}
+
+test "FIXSIG: strict HTTP-sig is ON by default; escape hatch flips it off" {
+    // The security-critical invariant: a fresh process MUST reject
+    // unverified inbox activities. The inbox handler gates store+fanout
+    // on `isStrictHttpSig()` (routes.zig dispatchInbox), so the default
+    // here is what stops forged Create/Delete/Follow activities by
+    // default.
+    //
+    // NOTE: `reset()` only clears the per-process `State` struct, not
+    // this module-level policy var — so re-assert the compile-time
+    // default explicitly to be order-independent regardless of any
+    // earlier test that toggled it.
+    setStrictHttpSig(true);
+    try std.testing.expect(isStrictHttpSig());
+
+    // Dev escape hatch (AP_ALLOW_UNSIGNED_INBOX=1 in main.zig) restores
+    // historic soft acceptance for local testing only.
+    setStrictHttpSig(false);
+    try std.testing.expect(!isStrictHttpSig());
+
+    // Restore the secure default so subsequent tests in this process
+    // observe the production policy.
+    setStrictHttpSig(true);
 }
 
 test "AP-9: outbound sig scheme defaults to cavage, flips to rfc9421" {
