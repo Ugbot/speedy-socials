@@ -83,12 +83,17 @@ pub const http = struct {
     pub const router = @import("http/router.zig");
 };
 
-/// Pure-Zig RESP2/RESP3 wire codec + reply model — the byte-level
-/// foundation of the in-tree, from-scratch Redis/Valkey client (no sockets
-/// here). See `redis/resp.zig` and `redis/reply.zig`.
+/// Pure-Zig RESP2/RESP3 wire codec + reply model + live transport — the
+/// in-tree, from-scratch Redis/Valkey client. `resp.zig`/`reply.zig` are the
+/// byte-level codec (no sockets); `conn.zig`/`pool.zig` are the blocking TCP
+/// connection + bounded pool built on top.
 pub const redis = struct {
     pub const resp = @import("redis/resp.zig");
     pub const reply = @import("redis/reply.zig");
+    pub const conn = @import("redis/conn.zig");
+    pub const pool = @import("redis/pool.zig");
+    pub const Conn = conn.Conn;
+    pub const Pool = pool.Pool;
 };
 
 pub const ws = struct {
@@ -141,6 +146,8 @@ test {
     _ = queue;
     _ = redis.resp;
     _ = redis.reply;
+    _ = redis.conn;
+    _ = redis.pool;
     _ = crypto.ed25519;
     _ = crypto.multibase;
     _ = crypto.multicodec;
