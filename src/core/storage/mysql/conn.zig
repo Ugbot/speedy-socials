@@ -48,9 +48,17 @@ pub const TlsMode = enum {
     /// Plain TCP. caching_sha2 full-auth (if the server demands it) uses
     /// the RSA-public-key exchange to protect the password.
     disabled,
-    /// Upgrade to TLS via SSLRequest before sending credentials. Over TLS,
-    /// caching_sha2 full-auth sends the cleartext password (no RSA).
+    /// Upgrade to TLS via SSLRequest before sending credentials AND verify
+    /// the server certificate chain against the system trust store plus the
+    /// server hostname. This is the secure default for `?tls=require`: a
+    /// network MITM cannot intercept the (eventually cleartext, over TLS)
+    /// password without a certificate the trust store accepts for `host`.
     require,
+    /// Upgrade to TLS but DISABLE certificate + hostname verification.
+    /// Encrypts in transit but provides no authentication of the peer — a
+    /// MITM with any certificate can intercept. Opt-in only, for
+    /// self-signed/dev servers, via `?tls=require-noverify`.
+    require_noverify,
 };
 
 /// Largest single packet we will buffer (MySQL's default max_allowed_packet
@@ -180,7 +188,7 @@ pub const Conn = struct {
         // (it's the client's first reply), so we do NOT reset self.seq
         // before sending it; writePacket continues numbering from the
         // server handshake (seq 0 → our reply seq 1).
-        if (opts.tls == .require) {
+        if (opts.tls != .disabled) {
             if (hs.capabilities & proto.CLIENT_SSL == 0) return error.TlsFailed;
             try self.sendSslRequest(opts);
             try self.upgradeToTls(opts);
@@ -350,34 +358,65 @@ pub const Conn = struct {
     }
 
     /// Upgrade the live fd to a TLS client session via OpenSSL. After this
-    /// returns, packet I/O routes through SSL_read/SSL_write. We do not
-    /// verify the peer certificate here (DB endpoints are typically pinned
-    /// by network topology / private CA); the goal of tls=require is to
-    /// encrypt the channel so caching_sha2 full-auth can send cleartext.
+    /// returns, packet I/O routes through SSL_read/SSL_write.
+    ///
+    /// Security: in `.require` mode (the secure default for `?tls=require`)
+    /// we load the system trust store, demand `SSL_VERIFY_PEER`, and bind
+    /// the certificate to the requested hostname via `SSL_set1_host` — a
+    /// network MITM cannot present a certificate the trust store accepts for
+    /// `host`, so the channel that later carries the cleartext password is
+    /// authenticated. In `.require_noverify` mode (opt-in, for
+    /// self-signed/dev servers via `?tls=require-noverify`) verification is
+    /// disabled and the channel is encrypted but unauthenticated.
     fn upgradeToTls(self: *Conn, opts: Options) Error!void {
+        const verify = (opts.tls == .require);
+
         openssl.ensureLibraryInit();
         const ctx = ossl.SSL_CTX_new(ossl.TLS_client_method()) orelse return error.TlsFailed;
         errdefer ossl.SSL_CTX_free(ctx);
-        ossl.SSL_CTX_set_verify(ctx, ossl.SSL_VERIFY_NONE, null);
+
+        // Require TLS 1.2 minimum regardless of mode (no SSLv3/TLS1.0/1.1).
+        _ = ossl.SSL_CTX_set_min_proto_version(ctx, 0x0303);
+
+        if (verify) {
+            // Load the OS default CA trust store and demand peer verification.
+            // A failure to load any trust anchors would make every handshake
+            // fail closed (the verify result below catches it), which is the
+            // safe direction.
+            if (ossl.SSL_CTX_set_default_verify_paths(ctx) != 1) return error.TlsFailed;
+            ossl.SSL_CTX_set_verify(ctx, ossl.SSL_VERIFY_PEER, null);
+        } else {
+            ossl.SSL_CTX_set_verify(ctx, ossl.SSL_VERIFY_NONE, null);
+        }
 
         const ssl = ossl.SSL_new(ctx) orelse return error.TlsFailed;
         errdefer ossl.SSL_free(ssl);
         if (ossl.SSL_set_fd(ssl, @intCast(self.fd)) != 1) return error.TlsFailed;
 
-        // SNI: hand the server the requested hostname.
+        // SNI + (when verifying) the hostname the certificate must match.
         var host_z: [256]u8 = undefined;
-        if (opts.host.len < host_z.len) {
-            @memcpy(host_z[0..opts.host.len], opts.host);
-            host_z[opts.host.len] = 0;
-            _ = ossl.SSL_ctrl(
-                ssl,
-                ossl.SSL_CTRL_SET_TLSEXT_HOSTNAME,
-                ossl.TLSEXT_NAMETYPE_host_name,
-                @ptrCast(&host_z),
-            );
+        if (opts.host.len >= host_z.len) return error.TlsFailed;
+        @memcpy(host_z[0..opts.host.len], opts.host);
+        host_z[opts.host.len] = 0;
+        _ = ossl.SSL_ctrl(
+            ssl,
+            ossl.SSL_CTRL_SET_TLSEXT_HOSTNAME,
+            ossl.TLSEXT_NAMETYPE_host_name,
+            @ptrCast(&host_z),
+        );
+        if (verify) {
+            // Bind certificate verification to the requested hostname. With
+            // an empty/whitespace name SSL_set1_host returns 0; treat that as
+            // a hard failure rather than silently skipping the host check.
+            if (ossl.SSL_set1_host(ssl, @ptrCast(&host_z)) != 1) return error.TlsFailed;
         }
 
         if (ossl.SSL_connect(ssl) != 1) return error.TlsFailed;
+
+        // Defense in depth: even with SSL_VERIFY_PEER, confirm the verdict.
+        if (verify and ossl.SSL_get_verify_result(ssl) != ossl.X509_V_OK) {
+            return error.TlsFailed;
+        }
 
         self.ssl = ssl;
         self.ssl_ctx = ctx;

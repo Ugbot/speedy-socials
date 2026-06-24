@@ -180,8 +180,15 @@ fn parseUri(uri_str: []const u8) ?conn_mod.Config {
 }
 
 /// Scan a URI query string for a `tls=` key and map its value to a `TlsMode`.
-/// Recognized values: `require`/`on`/`1` → require; `off`/`disable`/`0` →
-/// off. An unrecognized or absent value yields null (caller defaults to off).
+/// Recognized values:
+///   * `require`/`on`/`1`        → require WITH CA + hostname verification
+///                                 (the secure default; MITM-resistant).
+///   * `require-noverify`        → TLS WITHOUT verification (encrypt only).
+///                                 Opt-in escape hatch for self-signed/dev.
+///   * `off`/`disable`/`0`       → plaintext.
+/// An unrecognized or absent value yields null (caller defaults to off).
+/// Verification is never silently disabled: skipping it requires the explicit
+/// `require-noverify` value.
 fn parseTlsQuery(query: []const u8) ?conn_mod.TlsMode {
     var it = std.mem.splitScalar(u8, query, '&');
     while (it.next()) |pair| {
@@ -189,6 +196,9 @@ fn parseTlsQuery(query: []const u8) ?conn_mod.TlsMode {
         const key = pair[0..eq];
         const val = pair[eq + 1 ..];
         if (!std.mem.eql(u8, key, "tls")) continue;
+        // Check the noverify variant before the plain `require` prefix.
+        if (std.mem.eql(u8, val, "require-noverify"))
+            return .require_noverify;
         if (std.mem.eql(u8, val, "require") or std.mem.eql(u8, val, "on") or std.mem.eql(u8, val, "1"))
             return .require;
         if (std.mem.eql(u8, val, "off") or std.mem.eql(u8, val, "disable") or std.mem.eql(u8, val, "0"))
@@ -248,8 +258,24 @@ test "MssqlProvider: parseUri tls flag defaults off and honors require/on/1" {
     try testing.expectEqual(conn_mod.TlsMode.require, mixed.tls);
 }
 
+test "MssqlProvider: tls=require verifies; only require-noverify opts out" {
+    // Plain `require` selects the verifying mode — verification is never the
+    // implicit default that gets skipped.
+    const req = parseUri("mssql://u:p@h:1433/db?tls=require") orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(conn_mod.TlsMode.require, req.tls);
+
+    // The explicit escape hatch selects the unverified mode.
+    const nv = parseUri("mssql://u:p@h:1433/db?tls=require-noverify") orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(conn_mod.TlsMode.require_noverify, nv.tls);
+
+    // require-noverify mixed with other query keys still resolves.
+    const nv_mixed = parseUri("mssql://u:p@h:1433/db?foo=bar&tls=require-noverify&x=y") orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(conn_mod.TlsMode.require_noverify, nv_mixed.tls);
+}
+
 test "parseTlsQuery: recognized + unrecognized values" {
     try testing.expectEqual(conn_mod.TlsMode.require, parseTlsQuery("tls=require").?);
+    try testing.expectEqual(conn_mod.TlsMode.require_noverify, parseTlsQuery("tls=require-noverify").?);
     try testing.expectEqual(conn_mod.TlsMode.off, parseTlsQuery("tls=off").?);
     try testing.expect(parseTlsQuery("tls=maybe") == null);
     try testing.expect(parseTlsQuery("other=1") == null);

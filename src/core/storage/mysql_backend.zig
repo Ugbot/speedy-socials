@@ -303,10 +303,15 @@ pub fn parseMysqlUrl(uri_str: []const u8) ?mysql.Options {
     return opts;
 }
 
-/// Extract the `tls=` value from a URL query string. Recognises
-/// `require` (TLS mandatory) and `disable`/`disabled` (plain TCP);
-/// returns null when no `tls=` token is present so the caller keeps its
-/// default.
+/// Extract the `tls=` value from a URL query string. Recognises:
+///   * `require`           — TLS with full CA + hostname verification (the
+///                           secure default; a MITM cannot intercept).
+///   * `require-noverify`  — TLS WITHOUT verification (encrypt only). Opt-in
+///                           escape hatch for self-signed/dev servers.
+///   * `disable`/`disabled`— plain TCP.
+/// Returns null when no `tls=` token is present so the caller keeps its
+/// default. Verification is never silently disabled: skipping it requires
+/// the explicit `require-noverify` value.
 fn tlsModeFromQuery(query: []const u8) ?mysql.TlsMode {
     var it = std.mem.splitScalar(u8, query, '&');
     while (it.next()) |pair| {
@@ -315,6 +320,7 @@ fn tlsModeFromQuery(query: []const u8) ?mysql.TlsMode {
         const val = pair[eq + 1 ..];
         if (!std.mem.eql(u8, key, "tls")) continue;
         if (std.mem.eql(u8, val, "require")) return .require;
+        if (std.mem.eql(u8, val, "require-noverify")) return .require_noverify;
         if (std.mem.eql(u8, val, "disable") or std.mem.eql(u8, val, "disabled")) return .disabled;
     }
     return null;
@@ -352,6 +358,26 @@ test "parseMysqlUrl: tls=require selects TLS; tls=disable / absent stays plain" 
     // Absent tls= leaves the default.
     const none = parseMysqlUrl("mysql://app@h/db?charset=utf8").?;
     try testing.expectEqual(mysql.TlsMode.disabled, none.tls);
+}
+
+test "parseMysqlUrl: tls=require verifies; only require-noverify opts out" {
+    // The plain `require` token must select the verifying mode — skipping
+    // certificate/hostname verification must never be the default.
+    const req = parseMysqlUrl("mysql://app:pw@db.example/speedy?tls=require").?;
+    try testing.expectEqual(mysql.TlsMode.require, req.tls);
+
+    // The explicit escape hatch selects the unverified mode.
+    const nv = parseMysqlUrl("mysql://app:pw@db.example/speedy?tls=require-noverify").?;
+    try testing.expectEqual(mysql.TlsMode.require_noverify, nv.tls);
+
+    // require-noverify alongside other params is still recognised.
+    const nv_mixed = parseMysqlUrl("mysql://app@h/db?charset=utf8&tls=require-noverify").?;
+    try testing.expectEqual(mysql.TlsMode.require_noverify, nv_mixed.tls);
+
+    // A bare `require` (not the noverify variant) is the verifying mode even
+    // when other tls-shaped values appear — guards against prefix confusion.
+    const req2 = parseMysqlUrl("mysql://app@h/db?tls=require&extra=1").?;
+    try testing.expectEqual(mysql.TlsMode.require, req2.tls);
 }
 
 test "MysqlBackend: live exec + queryOne + transaction (skips if no server)" {

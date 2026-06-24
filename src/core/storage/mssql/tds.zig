@@ -49,12 +49,21 @@ pub const header_len: usize = 8;
 /// responses are reassembled across packets by the backend's reader.
 pub const default_packet_size: u32 = 4096;
 
+/// Hard ceiling on a single TDS packet length. The length field is a u16,
+/// so 0xFFFF is the absolute protocol maximum; a server claiming more is
+/// impossible by construction, but callers additionally bound against their
+/// own receive buffer via `parseHeaderBounded`.
+pub const max_packet_len: usize = std.math.maxInt(u16);
+
 pub const Error = error{
     BufferTooSmall,
     Truncated,
     Malformed,
     UnsupportedToken,
     TooManyColumns,
+    /// A server-supplied packet length exceeds the receive buffer it must
+    /// fit into — a malicious/buggy server trying to drive an over-read.
+    PacketTooLarge,
 };
 
 pub const max_columns: usize = 64;
@@ -100,9 +109,18 @@ pub const Header = struct {
 };
 
 pub fn parseHeader(buf: []const u8) Error!Header {
+    return parseHeaderBounded(buf, max_packet_len);
+}
+
+/// Parse a TDS packet header, rejecting any packet whose declared total
+/// length exceeds `max_len`. The wire layer passes its receive-buffer size
+/// here so a malicious server cannot announce an oversized packet and drive
+/// an over-read/overflow when the body is read into a fixed buffer.
+pub fn parseHeaderBounded(buf: []const u8, max_len: usize) Error!Header {
     if (buf.len < header_len) return error.Truncated;
     const length = (@as(u16, buf[2]) << 8) | @as(u16, buf[3]);
     if (length < header_len) return error.Malformed;
+    if (length > max_len) return error.PacketTooLarge;
     return .{
         .ptype = buf[0],
         .status = buf[1],

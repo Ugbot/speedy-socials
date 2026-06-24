@@ -37,6 +37,11 @@ pub const Error = error{
     InitFailed,
     BadPem,
     NotRsa,
+    /// The supplied RSA key is below the minimum accepted modulus size.
+    /// Guards the MySQL caching_sha2 full-auth path: a malicious server
+    /// must not be able to force the client to encrypt the password under
+    /// a trivially-factorable weak key.
+    WeakKey,
     SignFailed,
     BufferTooSmall,
     CtxCreateFailed,
@@ -187,6 +192,12 @@ pub fn rsaEncryptOaepFromPublicPem(pem: []const u8, msg: []const u8, out: []u8) 
     defer c.EVP_PKEY_free(pkey);
 
     if (c.EVP_PKEY_base_id(pkey) != c.EVP_PKEY_RSA) return error.NotRsa;
+
+    // Reject weak keys. A malicious MySQL server could otherwise hand us a
+    // small RSA public key during caching_sha2 full-auth and recover the
+    // password by factoring it. 2048 bits is the modern floor.
+    const min_rsa_bits: c_int = 2048;
+    if (c.EVP_PKEY_get_bits(pkey) < min_rsa_bits) return error.WeakKey;
 
     const modulus_len: usize = @intCast(c.EVP_PKEY_size(pkey));
     if (out.len < modulus_len) return error.BufferTooSmall;
@@ -470,6 +481,32 @@ test "openssl: rsaEncryptOaepFromPublicPem round-trips via private-key decrypt" 
 test "openssl: rsaEncryptOaepFromPublicPem rejects garbage PEM" {
     var out: [256]u8 = undefined;
     try testing.expectError(error.BadPem, rsaEncryptOaepFromPublicPem("not a pem", "x", &out));
+}
+
+// A valid but UNDERSIZED (1024-bit) RSA public key. The caching_sha2
+// full-auth path must refuse it so a malicious server cannot force the
+// client to encrypt the password under a factorable key.
+const test_rsa_pub_pem_1024 =
+    \\-----BEGIN PUBLIC KEY-----
+    \\MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQCpKmrHfBpFPLRY3IcIWnBpoLy8
+    \\jHw0iOwnTmgQfNJwuJDnSHZctIMZyWp1vY3xWhGSc0PWzQIfPEu46c2Y+rhphWXZ
+    \\qgG1hBN29lBRBi5guLwUC9RhX7gG8EwLiGKZ8I/cwED2AJfpgItdnmYJ/oB/W3tl
+    \\W77Pgt9Ytz6dNu/btQIDAQAB
+    \\-----END PUBLIC KEY-----
+    \\
+;
+
+test "openssl: rsaEncryptOaepFromPublicPem rejects a sub-2048-bit key (WeakKey)" {
+    var out: [256]u8 = undefined;
+    const r = rsaEncryptOaepFromPublicPem(test_rsa_pub_pem_1024, "pw\x00", &out);
+    // If this OpenSSL build can't parse the embedded 1024-bit PEM we'd see
+    // BadPem; otherwise the size floor must reject it as WeakKey. Either way
+    // the encryption must NOT succeed.
+    if (r) |_| {
+        return error.TestUnexpectedResult;
+    } else |err| {
+        try testing.expect(err == error.WeakKey or err == error.BadPem);
+    }
 }
 
 test "openssl: rsaSignPkcs1v15Sha256 rejects garbage PEM" {

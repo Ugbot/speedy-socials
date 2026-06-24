@@ -31,6 +31,7 @@
 const std = @import("std");
 const tds = @import("tds.zig");
 const tls_transport = @import("tls_transport.zig");
+const Certificate = std.crypto.Certificate;
 
 pub const Error = error{
     DnsFailed,
@@ -46,16 +47,25 @@ pub const Error = error{
     ServerError,
     TlsHandshakeFailed,
     TlsRequiredButRefused,
+    /// `tls=require` demanded a verified channel but the system CA trust
+    /// store could not be loaded — fail closed rather than fall back to an
+    /// unverified connection.
+    TlsTrustStoreUnavailable,
 } || tds.Error;
 
 /// TLS negotiation policy, selected via the `mssql://...?tls=...` URL flag.
-///   * `off`     — plaintext (advertise ENCRYPT_NOT_SUP); never start TLS.
-///   * `require` — advertise ENCRYPT_ON; perform the TDS-wrapped TLS
-///                 handshake and run LOGIN7 + all later traffic over TLS.
-///                 Encryption-in-transit without certificate authority
-///                 verification (SQL Server commonly uses self-signed certs);
-///                 a future `verify-full` mode can add CA/hostname checks.
-pub const TlsMode = enum { off, require };
+///   * `off`              — plaintext (advertise ENCRYPT_NOT_SUP); never TLS.
+///   * `require`          — advertise ENCRYPT_ON; perform the TDS-wrapped TLS
+///                          handshake and run LOGIN7 + all later traffic over
+///                          TLS, VERIFYING the server certificate chain
+///                          against the system trust store AND the requested
+///                          hostname. This is the secure default: a network
+///                          MITM cannot intercept the cleartext credentials.
+///   * `require_noverify` — TLS as above but with certificate + hostname
+///                          verification DISABLED (encrypt only). Opt-in
+///                          escape hatch for self-signed/dev SQL Servers, via
+///                          `?tls=require-noverify`.
+pub const TlsMode = enum { off, require, require_noverify };
 
 /// Per-connection send buffer. One request must fit (single-packet path).
 pub const send_buf_len: usize = 64 * 1024;
@@ -95,6 +105,11 @@ pub const Conn = struct {
     tls_xport: tls_transport.TdsTlsTransport = undefined,
     tls_client: std.crypto.tls.Client = undefined,
     tls_threaded: std.Io.Threaded = undefined,
+    /// System CA trust store, loaded only for the verifying `.require` mode.
+    /// `tls_bundle_loaded` gates its `deinit` in `close`.
+    tls_bundle: Certificate.Bundle = Certificate.Bundle.empty,
+    tls_bundle_lock: std.Io.RwLock = std.Io.RwLock.init,
+    tls_bundle_loaded: bool = false,
 
     /// Open a TCP connection, perform Pre-Login, optionally negotiate TLS,
     /// then LOGIN7 with SQL auth.
@@ -110,18 +125,18 @@ pub const Conn = struct {
         // ENCRYPT_NOT_SUP for the plaintext fallback path.
         const enc_advert: u8 = switch (cfg.tls) {
             .off => tds.ENCRYPT_NOT_SUP,
-            .require => tds.ENCRYPT_ON,
+            .require, .require_noverify => tds.ENCRYPT_ON,
         };
         const pre_len = try tds.buildPreLogin(&self.send_buf, enc_advert);
         try self.writeAll(self.send_buf[0..pre_len]);
         const pre_resp = try self.readResponse();
 
-        if (cfg.tls == .require) {
+        if (cfg.tls != .off) {
             const srv_enc = tds.parsePreLoginEncryption(pre_resp) catch return error.ProtocolError;
             // The server must accept (ENCRYPT_ON) or mandate (ENCRYPT_REQ)
             // encryption; ENCRYPT_NOT_SUP means it refuses TLS entirely.
             if (srv_enc == tds.ENCRYPT_NOT_SUP) return error.TlsRequiredButRefused;
-            try self.startTls(cfg.host);
+            try self.startTls(cfg.host, cfg.tls == .require);
         }
 
         // LOGIN7 — over TLS if the handshake activated it, else plaintext.
@@ -139,7 +154,12 @@ pub const Conn = struct {
     /// full handshake against `tls_xport`, whose Reader/Writer wrap the TLS
     /// records in TDS 0x12 packets until completion. On return TLS records
     /// flow directly over the socket and `tls_active` is set.
-    fn startTls(self: *Conn, host: []const u8) Error!void {
+    /// `verify` true (the `.require` default): load the system CA trust store
+    /// and verify the server certificate chain AND that it was issued for
+    /// `host` — a network MITM cannot intercept the channel that carries
+    /// LOGIN7's credentials. `verify` false (`.require_noverify`): encrypt
+    /// only, no peer authentication (opt-in, for self-signed/dev servers).
+    fn startTls(self: *Conn, host: []const u8, verify: bool) Error!void {
         self.tls_threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
         const io = self.tls_threaded.io();
         errdefer self.tls_threaded.deinit();
@@ -150,18 +170,38 @@ pub const Conn = struct {
         io.vtable.randomSecure(io.userdata, &entropy) catch return error.TlsHandshakeFailed;
         const now = std.Io.Timestamp.now(io, std.Io.Clock.real);
 
-        // `require` mode: encrypt in transit without CA/hostname verification
-        // (SQL Server frequently presents a self-signed certificate). A
-        // future `verify-full` mode would supply a CA bundle + explicit host.
+        const HostOpt = @FieldType(std.crypto.tls.Client.Options, "host");
+        const CaOpt = @FieldType(std.crypto.tls.Client.Options, "ca");
+        var host_opt: HostOpt = .no_verification;
+        var ca_opt: CaOpt = .no_verification;
+        if (verify) {
+            // Fail closed if the OS trust store can't be loaded: a `require`
+            // connection must never silently downgrade to unverified.
+            self.tls_bundle = Certificate.Bundle.empty;
+            self.tls_bundle.rescan(std.heap.page_allocator, io, now) catch
+                return error.TlsTrustStoreUnavailable;
+            self.tls_bundle_loaded = true;
+            errdefer {
+                self.tls_bundle.deinit(std.heap.page_allocator);
+                self.tls_bundle_loaded = false;
+            }
+            host_opt = .{ .explicit = host };
+            ca_opt = .{ .bundle = .{
+                .gpa = std.heap.page_allocator,
+                .io = io,
+                .lock = &self.tls_bundle_lock,
+                .bundle = &self.tls_bundle,
+            } };
+        }
+
         const opts: std.crypto.tls.Client.Options = .{
-            .host = .no_verification,
-            .ca = .no_verification,
+            .host = host_opt,
+            .ca = ca_opt,
             .write_buffer = &self.tls_xport.writer_buf_app,
             .read_buffer = &self.tls_xport.read_buf_app,
             .entropy = &entropy,
             .realtime_now = now,
         };
-        _ = host;
         self.tls_client = std.crypto.tls.Client.init(&self.tls_xport.reader, &self.tls_xport.writer, opts) catch
             return error.TlsHandshakeFailed;
         // Handshake complete: drop TDS wrapping for subsequent records.
@@ -174,6 +214,10 @@ pub const Conn = struct {
             self.tls_client.end() catch {};
             self.tls_threaded.deinit();
             self.tls_active = false;
+        }
+        if (self.tls_bundle_loaded) {
+            self.tls_bundle.deinit(std.heap.page_allocator);
+            self.tls_bundle_loaded = false;
         }
         if (self.fd >= 0) {
             _ = std.c.close(self.fd);
@@ -221,7 +265,10 @@ pub const Conn = struct {
         while (true) {
             var hdr: [tds.header_len]u8 = undefined;
             try self.readExact(&hdr);
-            const h = try tds.parseHeader(&hdr);
+            // Bound the declared packet length against our receive buffer so a
+            // malicious server cannot announce an oversized packet and drive
+            // an over-read into `recv_buf`.
+            const h = try tds.parseHeaderBounded(&hdr, self.recv_buf.len);
             const body_len = h.payloadLen();
             if (payload_len + body_len > self.recv_buf.len) return error.ResponseTooLarge;
             try self.readExact(self.recv_buf[payload_len .. payload_len + body_len]);

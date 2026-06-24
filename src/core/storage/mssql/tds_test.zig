@@ -43,6 +43,26 @@ test "header: parse rejects truncated and malformed length" {
     try testing.expectError(error.Malformed, tds.parseHeader(&bad));
 }
 
+test "header: parseHeaderBounded rejects a packet larger than the recv buffer" {
+    // A malicious server announces the maximum u16 packet length (0xFFFF)
+    // but our receive buffer is small — the bound must reject it rather than
+    // letting the body read over-run the buffer.
+    var huge: [tds.header_len]u8 = .{ 0x04, 0x01, 0xFF, 0xFF, 0, 0, 0, 0 };
+    try testing.expectError(error.PacketTooLarge, tds.parseHeaderBounded(&huge, 1024));
+
+    // A length that fits within the bound parses cleanly (full length incl
+    // header is 0x0100 = 256 ≤ 1024).
+    var ok: [tds.header_len]u8 = .{ 0x04, 0x01, 0x01, 0x00, 0, 0, 0, 0 };
+    const h = try tds.parseHeaderBounded(&ok, 1024);
+    try testing.expectEqual(@as(u16, 256), h.length);
+
+    // Exactly at the bound is accepted; one over is rejected.
+    var at: [tds.header_len]u8 = .{ 0x04, 0x01, 0x04, 0x00, 0, 0, 0, 0 }; // 0x0400 = 1024
+    _ = try tds.parseHeaderBounded(&at, 1024);
+    var over: [tds.header_len]u8 = .{ 0x04, 0x01, 0x04, 0x01, 0, 0, 0, 0 }; // 0x0401 = 1025
+    try testing.expectError(error.PacketTooLarge, tds.parseHeaderBounded(&over, 1024));
+}
+
 // ── Pre-Login ──────────────────────────────────────────────────────────
 
 test "prelogin: header type, EOM, and length consistency" {
