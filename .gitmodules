@@ -5,9 +5,6 @@
 	path = third_party/zig-kafka
 	url = https://github.com/Ugbot/zig-kafka.git
 	branch = zig-0.16
-[submodule "third_party/redis.zig"]
-	path = third_party/redis.zig
-	url = https://github.com/lalinsky/redis.zig.git
 [submodule "third_party/nats.zig"]
 	path = third_party/nats.zig
 	url = https://github.com/nats-io/nats.zig.git
