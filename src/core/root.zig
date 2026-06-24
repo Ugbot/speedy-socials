@@ -83,6 +83,14 @@ pub const http = struct {
     pub const router = @import("http/router.zig");
 };
 
+/// Pure-Zig RESP2/RESP3 wire codec + reply model — the byte-level
+/// foundation of the in-tree, from-scratch Redis/Valkey client (no sockets
+/// here). See `redis/resp.zig` and `redis/reply.zig`.
+pub const redis = struct {
+    pub const resp = @import("redis/resp.zig");
+    pub const reply = @import("redis/reply.zig");
+};
+
 pub const ws = struct {
     pub const handshake = @import("ws/handshake.zig");
     pub const frame = @import("ws/frame.zig");
@@ -131,6 +139,8 @@ test {
     _ = tenancy;
     _ = stream;
     _ = queue;
+    _ = redis.resp;
+    _ = redis.reply;
     _ = crypto.ed25519;
     _ = crypto.multibase;
     _ = crypto.multicodec;
