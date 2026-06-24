@@ -259,7 +259,7 @@ fn loadStreamSinkIfConfigured(
             const url = if (std.c.getenv("REDIS_URL")) |p| std.mem.sliceTo(p, 0) else "127.0.0.1:6379";
             const ptr = try allocator.create(core.stream.redis_sink.RedisSink);
             errdefer allocator.destroy(ptr);
-            ptr.* = try core.stream.redis_sink.RedisSink.init(allocator, io, url);
+            ptr.* = try core.stream.redis_sink.RedisSink.init(allocator, url);
             holder.allocator = allocator;
             holder.redis = ptr;
             core.stream.setGlobal(ptr.sink());

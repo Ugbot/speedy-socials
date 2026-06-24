@@ -82,12 +82,9 @@ pub fn build(b: *std.Build) void {
     // ── third-party: streaming sink drivers (vendored submodules) ──
     // Pure-Zig (std.Io-based, no system libs), wired as plain modules +
     // imported into `core` UNCONDITIONALLY — no `-D` gate. They back the
-    // runtime-selected STREAM_BACKEND={kafka,redis,nats} options.
-    const redis_mod = b.addModule("redis", .{
-        .root_source_file = b.path("third_party/redis.zig/src/root.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
+    // runtime-selected STREAM_BACKEND={kafka,redis,nats} options. (Redis now
+    // uses the IN-TREE pure-Zig RESP client at src/core/redis/, not a vendored
+    // module — so there is no `redis` build module.)
     const nats_options = b.addOptions();
     nats_options.addOption(bool, "enable_debug", false);
     nats_options.addOption([]const u8, "io_backend", "threaded");
@@ -190,7 +187,6 @@ pub fn build(b: *std.Build) void {
             .{ .name = "tb_stdx", .module = tb_stdx_mod },
             .{ .name = "tls", .module = ianic_tls_mod },
             .{ .name = "build_options", .module = build_options_mod },
-            .{ .name = "redis", .module = redis_mod },
             .{ .name = "nats", .module = nats_mod },
             .{ .name = "kafka", .module = kafka_mod },
             .{ .name = "pg", .module = pg_mod },
