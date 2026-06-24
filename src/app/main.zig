@@ -634,43 +634,67 @@ pub fn main() !void {
     defer if (ms_provider_holder) |*p| p.deinit();
     {
         const sb = if (std.c.getenv("STORAGE_BACKEND")) |v| std.mem.sliceTo(v, 0) else "sqlite";
+        // FIXFALLBACK: a configured remote backend that cannot connect must
+        // fail fast — a silent SQLite fallback causes per-instance data
+        // incoherence in multi-instance deployments. The ONLY way to permit
+        // the dev fallback is to explicitly set STORAGE_FALLBACK_SQLITE=1.
+        const fallback_ok = if (std.c.getenv("STORAGE_FALLBACK_SQLITE")) |f|
+            std.mem.eql(u8, std.mem.sliceTo(f, 0), "1")
+        else
+            false;
+        // bootFatal: log the cause at ERROR and exit non-zero. Used when a
+        // non-sqlite STORAGE_BACKEND is configured but unreachable and the
+        // operator has NOT opted into the SQLite escape hatch.
+        const bootFatal = struct {
+            fn f(lg: *core.log.Log, backend: []const u8, cause: []const u8) noreturn {
+                lg.record(.err, "boot", "configured STORAGE_BACKEND could not connect — refusing to fall back to local sqlite (set STORAGE_FALLBACK_SQLITE=1 to allow dev fallback)", &.{
+                    .{ .k = "backend", .v = backend },
+                    .{ .k = "cause", .v = cause },
+                });
+                std.process.exit(1);
+            }
+        }.f;
         if (std.mem.eql(u8, sb, "postgres")) {
             const url = if (std.c.getenv("DATABASE_URL")) |u| std.mem.sliceTo(u, 0) else "";
             if (url.len == 0) {
-                log_ptr.warn("boot", "STORAGE_BACKEND=postgres but DATABASE_URL unset — using sqlite");
+                if (!fallback_ok) bootFatal(log_ptr, "postgres", "DATABASE_URL unset");
+                log_ptr.warn("boot", "STORAGE_BACKEND=postgres but DATABASE_URL unset — STORAGE_FALLBACK_SQLITE=1, using sqlite");
             } else if (core.storage.PostgresProvider.init(io, gpa_allocator, url)) |pp| {
                 pg_provider_holder = pp;
                 core.storage.setProvider(pg_provider_holder.?.dbProvider());
                 core.storage.backend.setGlobal(pg_provider_holder.?.pg_backend.backend());
                 log_ptr.info("boot", "storage provider: postgres (pure-Zig pg.zig)");
             } else |err| {
-                log_ptr.record(.warn, "boot", "postgres connect failed — using sqlite", &.{
+                if (!fallback_ok) bootFatal(log_ptr, "postgres", @errorName(err));
+                log_ptr.record(.warn, "boot", "postgres connect failed — STORAGE_FALLBACK_SQLITE=1, using sqlite", &.{
                     .{ .k = "err", .v = @errorName(err) },
                 });
             }
         } else if (std.mem.eql(u8, sb, "mysql")) {
             const url = if (std.c.getenv("DATABASE_URL")) |u| std.mem.sliceTo(u, 0) else "";
             if (url.len == 0) {
-                log_ptr.warn("boot", "STORAGE_BACKEND=mysql but DATABASE_URL unset — using sqlite");
+                if (!fallback_ok) bootFatal(log_ptr, "mysql", "DATABASE_URL unset");
+                log_ptr.warn("boot", "STORAGE_BACKEND=mysql but DATABASE_URL unset — STORAGE_FALLBACK_SQLITE=1, using sqlite");
             } else if (core.storage.MysqlProvider.init(gpa_allocator, url)) |mp| {
                 my_provider_holder = mp;
                 core.storage.setProvider(my_provider_holder.?.dbProvider());
                 core.storage.backend.setGlobal(my_provider_holder.?.my_backend.backend());
                 log_ptr.info("boot", "storage provider: mysql (pure-Zig wire driver)");
             } else |err| {
-                log_ptr.record(.warn, "boot", "mysql connect failed — using sqlite", &.{
+                if (!fallback_ok) bootFatal(log_ptr, "mysql", @errorName(err));
+                log_ptr.record(.warn, "boot", "mysql connect failed — STORAGE_FALLBACK_SQLITE=1, using sqlite", &.{
                     .{ .k = "err", .v = @errorName(err) },
                 });
             }
         } else if (std.mem.eql(u8, sb, "mssql")) {
             const url = if (std.c.getenv("DATABASE_URL")) |u| std.mem.sliceTo(u, 0) else "";
             if (url.len == 0) {
-                log_ptr.warn("boot", "STORAGE_BACKEND=mssql but DATABASE_URL unset — using sqlite");
+                if (!fallback_ok) bootFatal(log_ptr, "mssql", "DATABASE_URL unset");
+                log_ptr.warn("boot", "STORAGE_BACKEND=mssql but DATABASE_URL unset — STORAGE_FALLBACK_SQLITE=1, using sqlite");
             } else if (core.storage.MssqlProvider.init(url)) |mp| {
                 ms_provider_holder = mp;
                 // dbProvider() runs the deferred Pre-Login/TLS/LOGIN7 at the
-                // holder's stable address. Fall back to sqlite if it can't
-                // reach the server.
+                // holder's stable address.
                 const dbp = ms_provider_holder.?.dbProvider();
                 if (ms_provider_holder.?.isConnected()) {
                     core.storage.setProvider(dbp);
@@ -678,10 +702,12 @@ pub fn main() !void {
                     log_ptr.info("boot", "storage provider: mssql (pure-Zig TDS; live-pending)");
                 } else {
                     ms_provider_holder = null;
-                    log_ptr.warn("boot", "mssql connect failed — using sqlite");
+                    if (!fallback_ok) bootFatal(log_ptr, "mssql", "connect/login failed");
+                    log_ptr.warn("boot", "mssql connect failed — STORAGE_FALLBACK_SQLITE=1, using sqlite");
                 }
             } else |err| {
-                log_ptr.record(.warn, "boot", "mssql connect failed — using sqlite", &.{
+                if (!fallback_ok) bootFatal(log_ptr, "mssql", @errorName(err));
+                log_ptr.record(.warn, "boot", "mssql connect failed — STORAGE_FALLBACK_SQLITE=1, using sqlite", &.{
                     .{ .k = "err", .v = @errorName(err) },
                 });
             }
