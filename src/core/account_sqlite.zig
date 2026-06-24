@@ -511,7 +511,11 @@ test "SqliteBackend: create + lookup persists across reopen" {
     argon2id.configure(testing.allocator, acctTestIo());
     defer argon2id.resetForTests();
 
-    const db_path: [:0]const u8 = "./.acct_persist_test.db";
+    // Unique per process: `zig build test` runs test binaries concurrently
+    // and this file is compiled into more than one, so a shared path would
+    // race (another process's `create` resets the row mid-test).
+    var path_buf: [64]u8 = undefined;
+    const db_path = std.fmt.bufPrintZ(&path_buf, "./.acct_persist_test.{d}.db", .{std.c.getpid()}) catch unreachable;
     cleanupDb(db_path);
     defer cleanupDb(db_path);
 
@@ -575,7 +579,8 @@ test "SqliteBackend: duplicate id + handle rejected" {
 test "SqliteBackend: state transition persists across reopen" {
     argon2id.configure(testing.allocator, acctTestIo());
     defer argon2id.resetForTests();
-    const db_path: [:0]const u8 = "./.acct_state_test.db";
+    var path_buf: [64]u8 = undefined;
+    const db_path = std.fmt.bufPrintZ(&path_buf, "./.acct_state_test.{d}.db", .{std.c.getpid()}) catch unreachable;
     cleanupDb(db_path);
     defer cleanupDb(db_path);
 
