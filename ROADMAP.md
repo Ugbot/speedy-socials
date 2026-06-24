@@ -70,6 +70,30 @@ poll-tally serving** · **fixed the `firehose_consumer` SIGABRT** (shared-`:memo
 race — stop/join before the test reads) · **phase-8 retirement re-verified** (legacy already
 gone).
 
+## ✅ Shipped 2026-06-24 — Wave 5 + security hardening (on `main`, 1244 tests green)
+**Wave 5 (feature):** MySQL host driver auth completed — **`caching_sha2_password`** (fast
+path / RSA full-auth via OpenSSL OAEP / TLS-cleartext) + auth-switch, **live-validated
+against stock MySQL 8** (in addition to MariaDB) · MSSQL **TDS-wrapped TLS handshake**
+(ENCRYPT_ON Pre-Login + `std.crypto.tls.Client`) · **ops docs** (`docs/ops/`:
+storage-backends, multi-tenancy, relay-bridge, zorm-guide, env-reference) · **honest
+benchmarks** (`bench/firehose_bench.zig` rewritten to measure true direct-INSERT vs
+production append — firehose ~122× in ReleaseFast, MST 25×@500/104×@2000, zorm CRUD ~1.12×
+overhead).
+
+**Security hardening (4 fixes from a code-verified security review):**
+- **FIXSIG (CRITICAL)** — AP inbox HTTP-signature verification is now **mandatory by
+  default**; unsigned/forged/stale/digest-mismatched activities get **401** and are NOT
+  stored/fanned-out. Dev opt-out: `AP_ALLOW_UNSIGNED_INBOX=1` (logs an INSECURE warning).
+- **FIXTLS (HIGH)** — MySQL + MSSQL drivers now **verify TLS cert + hostname by default**
+  (`tls=require` → OS trust store, peer-cert demand, SNI/host binding, TLS 1.2 floor;
+  fail-closed). Opt-out: `tls=require-noverify`. Also: TDS packet-length upper bound
+  (`error.PacketTooLarge`) and RSA key-size ≥2048 floor (`error.WeakKey`).
+- **FIXNONCE (HIGH)** — DPoP nonce consume is now **atomic** (`DELETE … RETURNING`, SQLite
+  3.49) closing the SELECT-then-DELETE replay race; DPoP proof `typ` must be `dpop+jwt`.
+- **FIXFALLBACK (data-integrity)** — a configured non-sqlite `STORAGE_BACKEND` that can't
+  connect now **fails fast** (exit 1) instead of silently booting on local SQLite. Dev
+  opt-out: `STORAGE_FALLBACK_SQLITE=1`.
+
 ### Genuinely remaining (host/env-blocked or separate)
 - **MS SQL live round-trip** — needs a runnable SQL Server (not possible on this arm64 host
   via qemu; codec is unit-tested + ready).
