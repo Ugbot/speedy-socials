@@ -139,6 +139,14 @@ pub const Verifier = struct {
         var header_dec: [512]u8 = undefined;
         const hn = b64UrlDecode(proof_jwt[0..dot1], &header_dec) catch return error.Malformed;
         const header = header_dec[0..hn];
+
+        // FIXNONCE (RFC 9449 §4.2): the proof JWT header `typ` MUST be
+        // `dpop+jwt`. Without this check a non-DPoP JWT — e.g. a leaked
+        // access token, which also carries `alg` + a key — could be
+        // replayed as a proof. Reject a missing or mismatched `typ`.
+        const typ = extractString(header, "typ") catch return error.BadClaims;
+        if (!std.mem.eql(u8, typ, "dpop+jwt")) return error.BadClaims;
+
         const alg = extractString(header, "alg") catch return error.BadClaims;
 
         var jkt_raw: [32]u8 = undefined;
@@ -653,6 +661,97 @@ test "AT-1: verifyDpopHeader rejects htu mismatch" {
     var v = Verifier.init();
     var jkt_buf: [64]u8 = undefined;
     try testing.expectError(error.BadClaims, v.verifyDpopHeader(proof, "POST", "https://evil.test/oauth/token", 3005, &jkt_buf));
+}
+
+/// Test-only: sign a DPoP proof with a caller-supplied JWS header JSON so
+/// tests can forge headers with a wrong/absent `typ`. Mirrors `signProof`
+/// but takes the full header verbatim instead of building `dpop+jwt`.
+fn signProofWithHeaderForTest(
+    kp: keypair.Ed25519KeyPair,
+    header_json: []const u8,
+    htm: []const u8,
+    htu: []const u8,
+    iat: i64,
+    jti: []const u8,
+    out: []u8,
+) ![]const u8 {
+    var payload_buf: [512]u8 = undefined;
+    const payload_json = try std.fmt.bufPrint(
+        &payload_buf,
+        "{{\"htm\":\"{s}\",\"htu\":\"{s}\",\"iat\":{d},\"jti\":\"{s}\"}}",
+        .{ htm, htu, iat, jti },
+    );
+    var pos: usize = 0;
+    pos += b64UrlEncodeShim(header_json, out[pos..]);
+    out[pos] = '.';
+    pos += 1;
+    pos += b64UrlEncodeShim(payload_json, out[pos..]);
+    const sig = kp.sign(out[0..pos]);
+    out[pos] = '.';
+    pos += 1;
+    pos += b64UrlEncodeShim(&sig, out[pos..]);
+    return out[0..pos];
+}
+
+test "FIXNONCE: verifyDpopHeader rejects a proof with wrong typ" {
+    var seed: [32]u8 = undefined;
+    @memset(&seed, 0x41);
+    const kp = keypair.Ed25519KeyPair.fromSeed(seed);
+
+    var x_b64: [44]u8 = undefined;
+    const xn = b64UrlEncodeShim(&kp.public_key, &x_b64);
+    var hdr_buf: [256]u8 = undefined;
+    // A validly-signed JWT with a non-DPoP typ (e.g. a leaked access
+    // token replayed as a proof). Signature + alg + jwk are all good.
+    const bad_header = try std.fmt.bufPrint(
+        &hdr_buf,
+        "{{\"alg\":\"EdDSA\",\"typ\":\"JWT\",\"jwk\":{{\"crv\":\"Ed25519\",\"kty\":\"OKP\",\"x\":\"{s}\"}}}}",
+        .{x_b64[0..xn]},
+    );
+    var buf: [auth.max_jwt_bytes]u8 = undefined;
+    const proof = try signProofWithHeaderForTest(kp, bad_header, "POST", "https://pds.test/oauth/token", 5000, "typ-wrong", &buf);
+
+    var v = Verifier.init();
+    var jkt_buf: [64]u8 = undefined;
+    try testing.expectError(error.BadClaims, v.verifyDpopHeader(proof, "POST", "https://pds.test/oauth/token", 5005, &jkt_buf));
+}
+
+test "FIXNONCE: verifyDpopHeader rejects a proof with absent typ" {
+    var seed: [32]u8 = undefined;
+    @memset(&seed, 0x42);
+    const kp = keypair.Ed25519KeyPair.fromSeed(seed);
+
+    var x_b64: [44]u8 = undefined;
+    const xn = b64UrlEncodeShim(&kp.public_key, &x_b64);
+    var hdr_buf: [256]u8 = undefined;
+    const no_typ_header = try std.fmt.bufPrint(
+        &hdr_buf,
+        "{{\"alg\":\"EdDSA\",\"jwk\":{{\"crv\":\"Ed25519\",\"kty\":\"OKP\",\"x\":\"{s}\"}}}}",
+        .{x_b64[0..xn]},
+    );
+    var buf: [auth.max_jwt_bytes]u8 = undefined;
+    const proof = try signProofWithHeaderForTest(kp, no_typ_header, "POST", "https://pds.test/oauth/token", 5000, "typ-absent", &buf);
+
+    var v = Verifier.init();
+    var jkt_buf: [64]u8 = undefined;
+    try testing.expectError(error.BadClaims, v.verifyDpopHeader(proof, "POST", "https://pds.test/oauth/token", 5005, &jkt_buf));
+}
+
+test "FIXNONCE: verifyDpopHeader still accepts a correct dpop+jwt proof" {
+    var seed: [32]u8 = undefined;
+    @memset(&seed, 0x43);
+    const kp = keypair.Ed25519KeyPair.fromSeed(seed);
+    // signProof emits typ:"dpop+jwt"; verification must still succeed.
+    var buf: [auth.max_jwt_bytes]u8 = undefined;
+    const proof = try signProof(kp, "POST", "https://pds.test/oauth/token", 6000, "typ-ok", &buf);
+
+    var v = Verifier.init();
+    var jkt_buf: [64]u8 = undefined;
+    const jkt = try v.verifyDpopHeader(proof, "POST", "https://pds.test/oauth/token", 6005, &jkt_buf);
+    var expect_b64: [44]u8 = undefined;
+    const raw = jwkThumbprintEd25519(kp.public_key);
+    const en = b64UrlEncodeShim(&raw, &expect_b64);
+    try testing.expectEqualStrings(expect_b64[0..en], jkt);
 }
 
 test "dpop: jwk thumbprint stable for same key" {

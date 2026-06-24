@@ -76,28 +76,57 @@ fn issueDpopNonce(db: *c.sqlite3, st: *State.State, out: []u8) ?[]const u8 {
     return nonce;
 }
 
-/// AT-3: validate + consume a DPoP nonce. Returns true iff `nonce` is
-/// present in the store and not expired; on success the row is deleted
-/// so the nonce cannot be replayed.
+/// AT-3 (FIXNONCE): validate + consume a DPoP nonce atomically. RFC 9449
+/// §8 requires a server-issued nonce MUST NOT be accepted more than once;
+/// the previous SELECT-then-DELETE left a window where two concurrent
+/// requests carrying the SAME nonce could both pass the expiry check
+/// before either deleted, enabling replay.
+///
+/// This is now a single `DELETE … WHERE nonce = ? AND expires_at >= ?
+/// RETURNING nonce`. The delete + expiry test happen in one statement
+/// under SQLite's row-level write lock, so exactly one concurrent caller
+/// removes the row. The nonce is validly consumed ONLY when the statement
+/// yields a row (`SQLITE_ROW`): that proves *this* call performed the
+/// delete and the row was still live. An expired nonce fails the
+/// `expires_at >= ?` predicate, so it is rejected — and, because DELETE
+/// also removes any row matching only `nonce = ?`, we reap stale rows in a
+/// second pass when the live delete found nothing.
+///
+/// Requires SQLite ≥ 3.35 for DELETE…RETURNING; the bundled amalgamation
+/// is 3.49.2 (see `third_party/zig-sqlite` → sqlite-amalgamation-3490200),
+/// so RETURNING is available.
 fn consumeDpopNonce(db: *c.sqlite3, st: *State.State, nonce: []const u8) bool {
     if (nonce.len == 0 or nonce.len > 256) return false;
-    var sel: ?*c.sqlite3_stmt = null;
-    if (c.sqlite3_prepare_v2(db, "SELECT expires_at FROM atp_dpop_nonces WHERE nonce = ?", -1, &sel, null) != c.SQLITE_OK) {
+    const now = st.clock.wallUnix();
+
+    // Atomic consume: delete iff still live, returning the deleted nonce.
+    var del: ?*c.sqlite3_stmt = null;
+    if (c.sqlite3_prepare_v2(
+        db,
+        "DELETE FROM atp_dpop_nonces WHERE nonce = ? AND expires_at >= ? RETURNING nonce",
+        -1,
+        &del,
+        null,
+    ) != c.SQLITE_OK) {
         return false;
     }
-    defer _ = c.sqlite3_finalize(sel);
-    _ = c.sqlite3_bind_text(sel, 1, nonce.ptr, @intCast(nonce.len), c.sqliteTransientAsDestructor());
-    if (c.sqlite3_step(sel.?) != c.SQLITE_ROW) return false;
-    const exp = c.sqlite3_column_int64(sel, 0);
+    defer _ = c.sqlite3_finalize(del);
+    _ = c.sqlite3_bind_text(del, 1, nonce.ptr, @intCast(nonce.len), c.sqliteTransientAsDestructor());
+    _ = c.sqlite3_bind_int64(del, 2, now);
+    const consumed = c.sqlite3_step(del.?) == c.SQLITE_ROW;
+    if (consumed) return true;
 
-    // Delete regardless of expiry so stale rows are reaped on contact.
-    var del: ?*c.sqlite3_stmt = null;
-    if (c.sqlite3_prepare_v2(db, "DELETE FROM atp_dpop_nonces WHERE nonce = ?", -1, &del, null) == c.SQLITE_OK) {
-        _ = c.sqlite3_bind_text(del, 1, nonce.ptr, @intCast(nonce.len), c.sqliteTransientAsDestructor());
-        _ = c.sqlite3_step(del.?);
-        _ = c.sqlite3_finalize(del);
+    // Not consumed: either the nonce was unknown/already-consumed, or it
+    // was present but expired. In the expired case the live-delete above
+    // matched nothing (the `expires_at >= ?` guard failed), so reap the
+    // stale row now so it cannot linger. Rejection stands either way.
+    var reap: ?*c.sqlite3_stmt = null;
+    if (c.sqlite3_prepare_v2(db, "DELETE FROM atp_dpop_nonces WHERE nonce = ?", -1, &reap, null) == c.SQLITE_OK) {
+        _ = c.sqlite3_bind_text(reap, 1, nonce.ptr, @intCast(nonce.len), c.sqliteTransientAsDestructor());
+        _ = c.sqlite3_step(reap.?);
+        _ = c.sqlite3_finalize(reap);
     }
-    return exp >= st.clock.wallUnix();
+    return false;
 }
 
 /// AT-3: respond with a fresh `DPoP-Nonce` header and the RFC 9449
@@ -532,6 +561,64 @@ test "AT-3: dpop nonce issue -> consume -> reject reuse" {
     try testing.expect(!consumeDpopNonce(db, st, nonce));
     // Unknown nonce is rejected.
     try testing.expect(!consumeDpopNonce(db, st, "deadbeef"));
+}
+
+test "FIXNONCE: double consume of one nonce -> exactly one succeeds" {
+    const db = try setupOAuthDb();
+    defer core.storage.sqlite.closeDb(db);
+
+    State.reset();
+    var rng = core.rng.Rng.init(0xC0FFEE);
+    var sc = core.clock.SimClock.init(2_000);
+    State.init(sc.clock(), &rng, "pds.example");
+    defer State.reset();
+    const st = State.get();
+
+    var buf: [dpop_nonce_bytes * 2]u8 = undefined;
+    const nonce = issueDpopNonce(db, st, &buf) orelse return error.IssueFailed;
+
+    // Two requests presenting the SAME live nonce. The atomic
+    // DELETE…RETURNING means exactly one removes the row and succeeds;
+    // the other finds nothing to delete and is rejected — RFC 9449 §8
+    // "MUST NOT be accepted more than once".
+    const first = consumeDpopNonce(db, st, nonce);
+    const second = consumeDpopNonce(db, st, nonce);
+    var wins: u8 = 0;
+    if (first) wins += 1;
+    if (second) wins += 1;
+    try testing.expectEqual(@as(u8, 1), wins);
+    try testing.expect(first); // serial order: first wins, second loses
+    try testing.expect(!second);
+}
+
+test "FIXNONCE: expired nonce rejected AND atomically reaped" {
+    const db = try setupOAuthDb();
+    defer core.storage.sqlite.closeDb(db);
+
+    State.reset();
+    var rng = core.rng.Rng.init(0xDEAD);
+    var sc = core.clock.SimClock.init(7_000);
+    State.init(sc.clock(), &rng, "pds.example");
+    defer State.reset();
+    const st = State.get();
+
+    var buf: [dpop_nonce_bytes * 2]u8 = undefined;
+    const nonce = issueDpopNonce(db, st, &buf) orelse return error.IssueFailed;
+    var saved: [dpop_nonce_bytes * 2]u8 = undefined;
+    @memcpy(&saved, nonce);
+
+    // Advance past TTL: the row is present but stale.
+    sc.advance(@as(u64, @intCast(dpop_nonce_ttl_seconds + 1)) * std.time.ns_per_s);
+    // Rejected (expired)…
+    try testing.expect(!consumeDpopNonce(db, st, saved[0..]));
+
+    // …and reaped: the row is gone, so a direct count is zero.
+    var cnt: ?*c.sqlite3_stmt = null;
+    try testing.expectEqual(c.SQLITE_OK, c.sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM atp_dpop_nonces WHERE nonce = ?", -1, &cnt, null));
+    defer _ = c.sqlite3_finalize(cnt);
+    _ = c.sqlite3_bind_text(cnt, 1, saved[0..].ptr, @intCast(saved.len), c.sqliteTransientAsDestructor());
+    try testing.expectEqual(c.SQLITE_ROW, c.sqlite3_step(cnt.?));
+    try testing.expectEqual(@as(i64, 0), c.sqlite3_column_int64(cnt, 0));
 }
 
 test "AT-3: dpop nonce rejected once past its TTL window" {
