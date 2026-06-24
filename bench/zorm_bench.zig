@@ -121,19 +121,54 @@ pub fn main() !void {
     }
     const hand_find_ns = nowNs() - hf0;
 
+    // ── zorm.Sqlite cached path (built-in backend, prepared-stmt cache) ──
+    // Same zorm CRUD, but over zorm.Sqlite (which caches prepared statements)
+    // instead of the host backend (which re-prepares every op). Isolates the
+    // statement-cache win: identical marshalling, only the prepare differs.
+    var cdb = try zorm.Sqlite.openMemory();
+    defer cdb.close();
+    const cb = cdb.backend();
+    try cb.exec(zorm.createTable(ZAccount, .sqlite), &.{});
+    var crepo = zorm.Repository(ZAccount).init(cb);
+
+    const ci0 = nowNs();
+    i = 0;
+    while (i < N) : (i += 1) {
+        var a: ZAccount = .{ .state = @intCast(i % 4), .created_at = @intCast(i) };
+        a.id = zorm.Pk(64).from(keyFor(&kb, i));
+        a.handle = zorm.Text(64).from("user.bench.test");
+        a.email = zorm.Text(128).from("u@bench.test");
+        try crepo.insertNow(&a);
+    }
+    const cached_ins_ns = nowNs() - ci0;
+
+    const cf0 = nowNs();
+    var cfound: u64 = 0;
+    i = 0;
+    while (i < N) : (i += 1) {
+        var out: ZAccount = .{};
+        if (try crepo.findByPk(keyFor(&kb, i), &out)) cfound += 1;
+    }
+    const cached_find_ns = nowNs() - cf0;
+
     // ── Report ──
     const z_ins = @as(f64, @floatFromInt(zorm_ins_ns)) / @as(f64, N);
     const z_find = @as(f64, @floatFromInt(zorm_find_ns)) / @as(f64, N);
     const h_ins = @as(f64, @floatFromInt(hand_ins_ns)) / @as(f64, N);
     const h_find = @as(f64, @floatFromInt(hand_find_ns)) / @as(f64, N);
 
+    const c_ins = @as(f64, @floatFromInt(cached_ins_ns)) / @as(f64, N);
+    const c_find = @as(f64, @floatFromInt(cached_find_ns)) / @as(f64, N);
+
     std.debug.print("zorm-bench: N={d} (in-memory SQLite, same backend)\n", .{N});
     std.debug.print("  insert   : zorm={d:>8.1} ns/op  hand={d:>8.1} ns/op  overhead={d:.2}x\n", .{ z_ins, h_ins, z_ins / h_ins });
     std.debug.print("  findByPk : zorm={d:>8.1} ns/op  hand={d:>8.1} ns/op  overhead={d:.2}x\n", .{ z_find, h_find, z_find / h_find });
-    std.debug.print("  found: zorm={d} hand={d}\n", .{ zfound, hfound });
+    std.debug.print("  zorm.Sqlite (stmt cache): insert={d:>8.1} ns/op ({d:.2}x vs uncached zorm)  findByPk={d:>8.1} ns/op ({d:.2}x)\n", .{ c_ins, z_ins / c_ins, c_find, z_find / c_find });
+    std.debug.print("  found: zorm={d} hand={d} cached={d}\n", .{ zfound, hfound, cfound });
 
     if (zfound != N) return error.ZormFindMismatch;
     if (hfound != N) return error.HandFindMismatch;
+    if (cfound != N) return error.CachedFindMismatch;
     // zorm overhead must be a small constant, not an order of magnitude.
     // Loose ceiling: any single op within 5x of the hand path. Measured
     // numbers are printed above for the methodology doc.
