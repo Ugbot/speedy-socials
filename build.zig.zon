@@ -7,11 +7,19 @@
         .sqlite = .{
             .path = "third_party/zig-sqlite",
         },
+        // SQLite amalgamation for zorm's built-in `zorm.Sqlite` backend
+        // (its own cImport, compiled into the zorm module). Same source the
+        // zorm submodule declares in its own build.zig.zon.
+        .sqlite_amalgamation = .{
+            .url = "https://www.sqlite.org/2025/sqlite-amalgamation-3490200.zip",
+            .hash = "N-V-__8AAH-mpwB7g3MnqYU-ooUBF1t99RP27dZ9addtMVXD",
+        },
     },
     .paths = .{
         "build.zig",
         "build.zig.zon",
         "src",
+        "zorm",
         "third_party",
         "NOTICE",
         "LICENSE",

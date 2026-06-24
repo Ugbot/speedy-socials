@@ -155,15 +155,25 @@ pub fn build(b: *std.Build) void {
         },
     });
 
-    // ── zorm (standalone ORM + messaging library, git submodule) ───
-    // Vendored from github.com/Ugbot/zorm at `zorm/` (submodule).
-    // Dependency-free by design. `core` imports it + bridges its concrete
-    // backends via thin adapters (src/core/storage/zorm_adapter.zig).
+    // ── zorm (ORM + messaging library, git submodule) ─────────────
+    // Vendored from github.com/Ugbot/zorm at `zorm/` (submodule). `core`
+    // imports it + bridges its concrete backends via thin adapters
+    // (src/core/storage/zorm_adapter.zig). zorm ships a built-in SQLite
+    // backend (`zorm.Sqlite`) using its OWN cImport of a vendored sqlite3
+    // amalgamation — compiled here into the zorm module (mirroring zorm's
+    // own build.zig, since the root wires the module manually).
+    const zorm_amalg = b.dependency("sqlite_amalgamation", .{});
+    const zorm_c_flags = &[_][]const u8{ "-std=c99", "-DSQLITE_DQS=0" };
     const zorm_mod = b.addModule("zorm", .{
         .root_source_file = b.path("zorm/src/zorm.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
     });
+    zorm_mod.addIncludePath(zorm_amalg.path(".")); // sqlite3.h
+    zorm_mod.addIncludePath(b.path("zorm/src/sqlite/c")); // workaround.h
+    zorm_mod.addCSourceFile(.{ .file = zorm_amalg.path("sqlite3.c"), .flags = zorm_c_flags });
+    zorm_mod.addCSourceFile(.{ .file = b.path("zorm/src/sqlite/c/workaround.c"), .flags = zorm_c_flags });
 
     // ── core module ────────────────────────────────────────────────
     const core_mod = b.addModule("core", .{
