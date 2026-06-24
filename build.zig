@@ -155,9 +155,10 @@ pub fn build(b: *std.Build) void {
         },
     });
 
-    // ── zorm (in-tree, standalone ORM + messaging library) ─────────
-    // Dependency-free by design (extractable to its own repo). `core`
-    // imports it + bridges its concrete backends via thin adapters.
+    // ── zorm (standalone ORM + messaging library, git submodule) ───
+    // Vendored from github.com/Ugbot/zorm at `zorm/` (submodule).
+    // Dependency-free by design. `core` imports it + bridges its concrete
+    // backends via thin adapters (src/core/storage/zorm_adapter.zig).
     const zorm_mod = b.addModule("zorm", .{
         .root_source_file = b.path("zorm/src/zorm.zig"),
         .target = target,
