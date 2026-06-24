@@ -113,6 +113,11 @@ pub const Conn = struct {
     /// backend to classify. Mirrors mysql's `last_err`.
     last_err_buf: [256]u8 = undefined,
     last_err_len: usize = 0,
+    /// Buffered-read window into `recv_buf` for frame mode (Pub/Sub): unlike
+    /// `command` (strict one-request/one-reply), a subscriber receives many
+    /// frames, so leftover bytes are carried across `recvFrame` calls.
+    win_start: usize = 0,
+    win_end: usize = 0,
 
     pub fn connect(allocator: std.mem.Allocator, opts: Options) Error!*Conn {
         const fd = try dialBlocking(opts.host, opts.port, opts.timeout_ms);
@@ -357,6 +362,144 @@ pub const Conn = struct {
         const n = @min(text.len, self.last_err_buf.len);
         @memcpy(self.last_err_buf[0..n], text[0..n]);
         self.last_err_len = n;
+    }
+
+    // ── Pub/Sub ─────────────────────────────────────────────────────────
+
+    /// Max channels/patterns in one (P)SUBSCRIBE call (bounded).
+    pub const max_sub_channels = 32;
+
+    /// One delivered Pub/Sub message. `channel`/`payload` (and `pattern` for a
+    /// pattern subscription) are copied into the caller's buffers, so they
+    /// outlive the next `nextMessage` call (unlike borrowed reply slices).
+    pub const Message = struct {
+        channel: []const u8,
+        payload: []const u8,
+        pattern: ?[]const u8 = null,
+    };
+
+    /// `PUBLISH channel message` → number of subscribers that received it.
+    /// A normal command (issue it on a NON-subscriber connection).
+    pub fn publish(self: *Conn, channel: []const u8, message: []const u8) Error!i64 {
+        return self.execInteger(&.{ "PUBLISH", channel, message });
+    }
+
+    /// SUBSCRIBE to `channels`, consuming the one confirmation reply each.
+    /// After this, drive `nextMessage` to receive. The connection is now a
+    /// subscriber (don't issue normal commands on it).
+    pub fn subscribe(self: *Conn, channels: []const []const u8) Error!void {
+        return self.subCommand("SUBSCRIBE", channels);
+    }
+
+    /// PSUBSCRIBE to glob-style `patterns`; delivered messages carry `.pattern`.
+    pub fn psubscribe(self: *Conn, patterns: []const []const u8) Error!void {
+        return self.subCommand("PSUBSCRIBE", patterns);
+    }
+
+    fn subCommand(self: *Conn, verb: []const u8, names: []const []const u8) Error!void {
+        if (names.len == 0 or names.len > max_sub_channels) return error.ProtocolError;
+        var argv: [max_sub_channels + 1][]const u8 = undefined;
+        argv[0] = verb;
+        for (names, 0..) |c, i| argv[i + 1] = c;
+        const request = resp.encodeCommand(self.send_buf, argv[0 .. names.len + 1]) catch return error.ProtocolError;
+        try self.writeAll(request);
+        // One confirmation frame per channel: `[subscribe, <ch>, <count>]`.
+        var scratch: [4096]u8 = undefined;
+        for (names) |_| {
+            var fba = std.heap.FixedBufferAllocator.init(&scratch);
+            _ = try self.recvFrame(fba.allocator());
+        }
+    }
+
+    /// Block for the next delivered message, copying its channel + payload
+    /// into the caller's buffers. Subscribe/unsubscribe confirmation frames
+    /// are skipped. Blocks up to the socket read timeout (then `ReadFailed`).
+    pub fn nextMessage(self: *Conn, channel_out: []u8, payload_out: []u8) Error!Message {
+        var scratch: [4096]u8 = undefined;
+        while (true) {
+            var fba = std.heap.FixedBufferAllocator.init(&scratch);
+            const r = try self.recvFrame(fba.allocator());
+            const elems = elemsOf(r) orelse continue;
+            if (elems.len < 3) continue;
+            const kind = elems[0].asString() orelse continue;
+            if (std.mem.eql(u8, kind, "message")) {
+                return .{
+                    .channel = copyInto(channel_out, elems[1].asString() orelse ""),
+                    .payload = copyInto(payload_out, elems[2].asString() orelse ""),
+                };
+            }
+            if (std.mem.eql(u8, kind, "pmessage") and elems.len >= 4) {
+                return .{
+                    .pattern = elems[1].asString(),
+                    .channel = copyInto(channel_out, elems[2].asString() orelse ""),
+                    .payload = copyInto(payload_out, elems[3].asString() orelse ""),
+                };
+            }
+            // subscribe/unsubscribe/psubscribe confirmations → keep waiting.
+        }
+    }
+
+    fn copyInto(dst: []u8, src: []const u8) []const u8 {
+        const n = @min(dst.len, src.len);
+        @memcpy(dst[0..n], src[0..n]);
+        return dst[0..n];
+    }
+
+    /// Array (RESP2) or push (RESP3) element spine of a Pub/Sub frame.
+    fn elemsOf(r: Reply) ?[]const Reply {
+        return switch (r) {
+            .array => |a| a,
+            .push => |p| p,
+            else => null,
+        };
+    }
+
+    /// Read exactly one reply from the buffered window, carrying any leftover
+    /// bytes for the next call (frame mode — used only after subscribe).
+    fn recvFrame(self: *Conn, arena: std.mem.Allocator) Error!Reply {
+        if (!self.healthy) return error.ProtocolError;
+        while (true) {
+            if (self.win_end > self.win_start) {
+                const res = resp.parseReply(arena, self.recv_buf[self.win_start..self.win_end], .{}) catch {
+                    self.healthy = false;
+                    return error.ProtocolError;
+                };
+                switch (res) {
+                    .complete => |c| {
+                        self.win_start += c.consumed;
+                        if (self.win_start == self.win_end) {
+                            self.win_start = 0;
+                            self.win_end = 0;
+                        }
+                        return c.reply;
+                    },
+                    .incomplete => {},
+                }
+            }
+            // Compact the live window to the front, grow if full, then read.
+            if (self.win_start > 0) {
+                const live = self.win_end - self.win_start;
+                std.mem.copyForwards(u8, self.recv_buf[0..live], self.recv_buf[self.win_start..self.win_end]);
+                self.win_start = 0;
+                self.win_end = live;
+            }
+            if (self.win_end == self.recv_buf.len) {
+                if (self.recv_buf.len >= max_recv_buf) {
+                    self.healthy = false;
+                    return error.TooLarge;
+                }
+                const new_len = @min(self.recv_buf.len * 2, max_recv_buf);
+                self.recv_buf = self.allocator.realloc(self.recv_buf, new_len) catch {
+                    self.healthy = false;
+                    return error.SocketError;
+                };
+            }
+            const n = self.readSome(self.recv_buf[self.win_end..]) catch |e| {
+                self.healthy = false;
+                return e;
+            };
+            self.win_end += n;
+        }
     }
 
     // ── Socket I/O ──────────────────────────────────────────────────────
@@ -657,4 +800,28 @@ test "redis Conn unreachable broker yields a graceful error, never panics" {
     // Port 1 is reserved/unused → connect() must fail, not hang/panic.
     const r = Conn.connect(gpa, .{ .host = "127.0.0.1", .port = 1, .timeout_ms = 500 });
     try testing.expect(std.meta.isError(r));
+}
+
+test "redis Pub/Sub publish→subscribe→nextMessage round-trip (skips if no broker)" {
+    const gpa = testing.allocator;
+    var sub = Conn.connect(gpa, testOptions()) catch return error.SkipZigTest;
+    defer sub.deinit();
+    sub.ping() catch return error.SkipZigTest;
+    var pubc = Conn.connect(gpa, testOptions()) catch return error.SkipZigTest;
+    defer pubc.deinit();
+
+    var prng = std.Random.DefaultPrng.init(testing.random_seed);
+    var name_buf: [64]u8 = undefined;
+    const chan = std.fmt.bufPrint(&name_buf, "zorm:test:pubsub:{x}", .{prng.random().int(u32)}) catch unreachable;
+
+    // Subscribe (its confirmation is consumed synchronously, so the server
+    // has registered us before we publish).
+    try sub.subscribe(&.{chan});
+    try testing.expectEqual(@as(i64, 1), try pubc.publish(chan, "hello-pubsub"));
+
+    var ch_buf: [64]u8 = undefined;
+    var pl_buf: [64]u8 = undefined;
+    const msg = try sub.nextMessage(&ch_buf, &pl_buf);
+    try testing.expectEqualStrings(chan, msg.channel);
+    try testing.expectEqualStrings("hello-pubsub", msg.payload);
 }
