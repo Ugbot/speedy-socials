@@ -1,7 +1,12 @@
 //! Media plugin schema migrations.
 //!
-//! Migration ids live in the 4xxx namespace (core=0xxx, ap=1xxx,
-//! atproto=2xxx, relay=3xxx, media=4xxx).
+//! Migration ids live in the 5xxx namespace (core=0xxx, ap=1xxx,
+//! atproto=2xxx, relay=3xxx, mastodon=4xxx, media=5xxx). NOTE: media used
+//! to claim 4xxx, which collided with the mastodon plugin's 4001 — at boot
+//! `Schema.applyAll` skips an already-applied id, so `media_attachments`
+//! was silently never created (mastodon:apps registers first and claims
+//! 4001). Moving media to 5xxx fixes that; the table had never actually
+//! been applied via the registry under 4001, so raising the id is safe.
 //!
 //! The blob *bytes* live in `atp_blobs` (the AT Protocol plugin owns
 //! that table — see `protocols/atproto/schema.zig`). For blobs larger
@@ -19,7 +24,7 @@ const core = @import("core");
 const Migration = core.storage.Migration;
 
 pub const media_attachments_migration: Migration = .{
-    .id = 4001,
+    .id = 5001,
     .name = "media:attachments",
     .up =
     \\CREATE TABLE IF NOT EXISTS media_attachments (
@@ -43,8 +48,34 @@ pub const media_attachments_migration: Migration = .{
     \\CREATE INDEX IF NOT EXISTS media_attachments_owner_idx
     \\    ON media_attachments (owner_user_id, created_at DESC);
     ,
+    .up_pg =
+    \\CREATE TABLE IF NOT EXISTS media_attachments (
+    \\    id             BIGSERIAL PRIMARY KEY,
+    \\    owner_user_id  BIGINT NOT NULL,
+    \\    blob_cid       TEXT NOT NULL,
+    \\    kind           TEXT NOT NULL CHECK (kind IN ('image','video','gifv','audio','unknown')),
+    \\    description    TEXT,
+    \\    focus_x        DOUBLE PRECISION NOT NULL DEFAULT 0,
+    \\    focus_y        DOUBLE PRECISION NOT NULL DEFAULT 0,
+    \\    blurhash       TEXT,
+    \\    width          BIGINT,
+    \\    height         BIGINT,
+    \\    mime           TEXT NOT NULL,
+    \\    size           BIGINT NOT NULL,
+    \\    status_id      BIGINT,
+    \\    created_at     BIGINT NOT NULL
+    \\);
+    \\CREATE INDEX IF NOT EXISTS media_attachments_status_idx
+    \\    ON media_attachments (status_id);
+    \\CREATE INDEX IF NOT EXISTS media_attachments_owner_idx
+    \\    ON media_attachments (owner_user_id, created_at DESC);
+    ,
     .down = "DROP TABLE media_attachments;",
 };
+
+test "F7: every media migration carries a clean Postgres dialect variant" {
+    try core.storage.schema.assertPgDialectComplete(&all_migrations);
+}
 
 pub const all_migrations = [_]Migration{
     media_attachments_migration,

@@ -28,11 +28,39 @@ pub const Migration = struct {
     id: u32,
     /// Human-readable label, used in panic / log messages.
     name: []const u8,
-    /// SQL DDL to apply. Multiple statements separated by `;` are allowed.
+    /// SQL DDL to apply (SQLite dialect). Multiple statements separated by
+    /// `;` are allowed.
     up: []const u8,
     /// Optional inverse. Never applied by the runtime — recorded for ops.
     down: ?[]const u8 = null,
+    /// Postgres-dialect DDL, applied by `PostgresProvider` (F7) instead of
+    /// `up` when `STORAGE_BACKEND=postgres`. Null means "no PG variant" —
+    /// `PostgresProvider.migrate` treats a null as a hard error (every
+    /// registered migration must carry a PG variant for PG to be a complete
+    /// backend). The SQLite path ignores this field entirely.
+    up_pg: ?[]const u8 = null,
 };
+
+/// Test helper (F7): assert every migration in `set` carries a Postgres
+/// dialect variant (`up_pg`) and that variant contains no SQLite-only
+/// tokens. Plugins call this over their `all_migrations` so a future
+/// migration that forgets `up_pg` — or pastes SQLite DDL into it — fails
+/// the build instead of silently breaking the Postgres backend.
+pub fn assertPgDialectComplete(set: []const Migration) !void {
+    const banned = [_][]const u8{ " STRICT", "AUTOINCREMENT", " BLOB", " INTEGER", "PRAGMA ", "INSERT OR " };
+    for (set) |m| {
+        const pg = m.up_pg orelse {
+            std.debug.print("migration {d} ({s}) is missing up_pg\n", .{ m.id, m.name });
+            return error.MissingPgVariant;
+        };
+        for (banned) |tok| {
+            if (std.mem.indexOf(u8, pg, tok) != null) {
+                std.debug.print("migration {d} ({s}) up_pg contains SQLite-ism '{s}'\n", .{ m.id, m.name, tok });
+                return error.SqliteDialectInPgVariant;
+            }
+        }
+    }
+}
 
 pub const Schema = struct {
     migrations: [max_migrations]Migration = undefined,

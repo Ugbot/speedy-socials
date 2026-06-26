@@ -36,6 +36,19 @@ pub const users_migration: Migration = .{
     \\) STRICT;
     \\CREATE INDEX IF NOT EXISTS ap_users_username_idx ON ap_users (username);
     ,
+    .up_pg =
+    \\CREATE TABLE IF NOT EXISTS ap_users (
+    \\    id            BIGSERIAL PRIMARY KEY,
+    \\    username      TEXT NOT NULL UNIQUE,
+    \\    display_name  TEXT,
+    \\    bio           TEXT,
+    \\    is_locked     BIGINT NOT NULL DEFAULT 0,
+    \\    discoverable  BIGINT NOT NULL DEFAULT 1,
+    \\    indexable     BIGINT NOT NULL DEFAULT 1,
+    \\    created_at    BIGINT NOT NULL
+    \\);
+    \\CREATE INDEX IF NOT EXISTS ap_users_username_idx ON ap_users (username);
+    ,
     .down = "DROP TABLE ap_users;",
 };
 
@@ -50,6 +63,15 @@ pub const actor_keys_migration: Migration = .{
     \\    private_pem BLOB NOT NULL,
     \\    created_at  INTEGER NOT NULL
     \\) STRICT;
+    ,
+    .up_pg =
+    \\CREATE TABLE IF NOT EXISTS ap_actor_keys (
+    \\    actor_id    BIGINT PRIMARY KEY REFERENCES ap_users(id) ON DELETE CASCADE,
+    \\    key_type    TEXT NOT NULL,
+    \\    public_pem  TEXT NOT NULL,
+    \\    private_pem BYTEA NOT NULL,
+    \\    created_at  BIGINT NOT NULL
+    \\);
     ,
     .down = "DROP TABLE ap_actor_keys;",
 };
@@ -67,6 +89,18 @@ pub const remote_actors_migration: Migration = .{
     \\    key_id           TEXT NOT NULL UNIQUE,
     \\    updated_at       INTEGER NOT NULL
     \\) STRICT;
+    \\CREATE INDEX IF NOT EXISTS ap_remote_actors_key_idx ON ap_remote_actors (key_id);
+    ,
+    .up_pg =
+    \\CREATE TABLE IF NOT EXISTS ap_remote_actors (
+    \\    id               BIGSERIAL PRIMARY KEY,
+    \\    actor_url        TEXT NOT NULL UNIQUE,
+    \\    inbox_url        TEXT NOT NULL,
+    \\    shared_inbox_url TEXT,
+    \\    public_key_pem   TEXT,
+    \\    key_id           TEXT NOT NULL UNIQUE,
+    \\    updated_at       BIGINT NOT NULL
+    \\);
     \\CREATE INDEX IF NOT EXISTS ap_remote_actors_key_idx ON ap_remote_actors (key_id);
     ,
     .down = "DROP TABLE ap_remote_actors;",
@@ -90,6 +124,21 @@ pub const federation_outbox_migration: Migration = .{
     \\CREATE INDEX IF NOT EXISTS ap_federation_outbox_pending_idx
     \\    ON ap_federation_outbox (state, next_attempt_at);
     ,
+    .up_pg =
+    \\CREATE TABLE IF NOT EXISTS ap_federation_outbox (
+    \\    id              BIGSERIAL PRIMARY KEY,
+    \\    target_inbox    TEXT NOT NULL,
+    \\    shared_inbox    TEXT,
+    \\    payload         BYTEA NOT NULL,
+    \\    key_id          TEXT NOT NULL,
+    \\    attempts        BIGINT NOT NULL DEFAULT 0,
+    \\    next_attempt_at BIGINT NOT NULL,
+    \\    state           TEXT NOT NULL CHECK (state IN ('pending','in_flight','done','dead')),
+    \\    inserted_at     BIGINT NOT NULL
+    \\);
+    \\CREATE INDEX IF NOT EXISTS ap_federation_outbox_pending_idx
+    \\    ON ap_federation_outbox (state, next_attempt_at);
+    ,
     .down = "DROP TABLE ap_federation_outbox;",
 };
 
@@ -105,6 +154,16 @@ pub const federation_dead_migration: Migration = .{
     \\    attempts      INTEGER NOT NULL,
     \\    dropped_at    INTEGER NOT NULL
     \\) STRICT;
+    ,
+    .up_pg =
+    \\CREATE TABLE IF NOT EXISTS ap_federation_dead_letter (
+    \\    id            BIGSERIAL PRIMARY KEY,
+    \\    target_inbox  TEXT NOT NULL,
+    \\    payload       BYTEA NOT NULL,
+    \\    last_error    TEXT,
+    \\    attempts      BIGINT NOT NULL,
+    \\    dropped_at    BIGINT NOT NULL
+    \\);
     ,
     .down = "DROP TABLE ap_federation_dead_letter;",
 };
@@ -124,6 +183,18 @@ pub const activities_migration: Migration = .{
     \\) STRICT;
     \\CREATE INDEX IF NOT EXISTS ap_activities_actor_idx ON ap_activities (actor_id, published DESC);
     ,
+    .up_pg =
+    \\CREATE TABLE IF NOT EXISTS ap_activities (
+    \\    id         BIGSERIAL PRIMARY KEY,
+    \\    ap_id      TEXT NOT NULL UNIQUE,
+    \\    actor_id   BIGINT NOT NULL,
+    \\    "type"     TEXT NOT NULL,
+    \\    object_id  TEXT,
+    \\    published  BIGINT NOT NULL,
+    \\    raw        BYTEA NOT NULL
+    \\);
+    \\CREATE INDEX IF NOT EXISTS ap_activities_actor_idx ON ap_activities (actor_id, published DESC);
+    ,
     .down = "DROP TABLE ap_activities;",
 };
 
@@ -141,6 +212,17 @@ pub const follows_migration: Migration = .{
     \\) STRICT;
     \\CREATE INDEX IF NOT EXISTS ap_follows_followee_idx ON ap_follows (followee);
     ,
+    .up_pg =
+    \\CREATE TABLE IF NOT EXISTS ap_follows (
+    \\    id          BIGSERIAL PRIMARY KEY,
+    \\    follower    TEXT NOT NULL,
+    \\    followee    TEXT NOT NULL,
+    \\    state       TEXT NOT NULL CHECK (state IN ('pending','accepted','rejected')),
+    \\    accepted_at BIGINT,
+    \\    UNIQUE (follower, followee)
+    \\);
+    \\CREATE INDEX IF NOT EXISTS ap_follows_followee_idx ON ap_follows (followee);
+    ,
     .down = "DROP TABLE ap_follows;",
 };
 
@@ -152,6 +234,12 @@ pub const tombstones_migration: Migration = .{
     \\    uri        TEXT PRIMARY KEY,
     \\    deleted_at INTEGER NOT NULL
     \\) STRICT;
+    ,
+    .up_pg =
+    \\CREATE TABLE IF NOT EXISTS ap_tombstones (
+    \\    uri        TEXT PRIMARY KEY,
+    \\    deleted_at BIGINT NOT NULL
+    \\);
     ,
     .down = "DROP TABLE ap_tombstones;",
 };
@@ -166,6 +254,10 @@ pub const follows_iri_migration: Migration = .{
     \\ALTER TABLE ap_follows ADD COLUMN follow_iri TEXT;
     \\CREATE INDEX IF NOT EXISTS ap_follows_iri_idx ON ap_follows (follow_iri);
     ,
+    .up_pg =
+    \\ALTER TABLE ap_follows ADD COLUMN follow_iri TEXT;
+    \\CREATE INDEX IF NOT EXISTS ap_follows_iri_idx ON ap_follows (follow_iri);
+    ,
     .down = "DROP INDEX IF EXISTS ap_follows_iri_idx;",
 };
 
@@ -175,6 +267,7 @@ pub const tombstones_former_type_migration: Migration = .{
     .id = 1010,
     .name = "activitypub:tombstones-former-type",
     .up = "ALTER TABLE ap_tombstones ADD COLUMN former_type TEXT;",
+    .up_pg = "ALTER TABLE ap_tombstones ADD COLUMN former_type TEXT;",
     .down = "",
 };
 
@@ -190,6 +283,16 @@ pub const tags_migration: Migration = .{
     \\    href         TEXT,
     \\    PRIMARY KEY (activity_iri, kind, name)
     \\) STRICT;
+    \\CREATE INDEX IF NOT EXISTS ap_tags_kind_name_idx ON ap_tags (kind, name);
+    ,
+    .up_pg =
+    \\CREATE TABLE IF NOT EXISTS ap_tags (
+    \\    activity_iri TEXT NOT NULL,
+    \\    kind         TEXT NOT NULL,
+    \\    name         TEXT NOT NULL,
+    \\    href         TEXT,
+    \\    PRIMARY KEY (activity_iri, kind, name)
+    \\);
     \\CREATE INDEX IF NOT EXISTS ap_tags_kind_name_idx ON ap_tags (kind, name);
     ,
     .down = "DROP TABLE ap_tags;",
@@ -211,6 +314,16 @@ pub const blocks_migration: Migration = .{
     \\) STRICT;
     \\CREATE INDEX IF NOT EXISTS ap_blocks_target_idx ON ap_blocks (target);
     ,
+    .up_pg =
+    \\CREATE TABLE IF NOT EXISTS ap_blocks (
+    \\    actor       TEXT NOT NULL,
+    \\    target      TEXT NOT NULL,
+    \\    activity_id TEXT,
+    \\    created_at  BIGINT NOT NULL,
+    \\    PRIMARY KEY (actor, target)
+    \\);
+    \\CREATE INDEX IF NOT EXISTS ap_blocks_target_idx ON ap_blocks (target);
+    ,
     .down = "DROP TABLE ap_blocks;",
 };
 
@@ -225,6 +338,13 @@ pub const moves_migration: Migration = .{
     \\    new_actor  TEXT NOT NULL,
     \\    moved_at   INTEGER NOT NULL
     \\) STRICT;
+    ,
+    .up_pg =
+    \\CREATE TABLE IF NOT EXISTS ap_actor_moves (
+    \\    old_actor  TEXT PRIMARY KEY,
+    \\    new_actor  TEXT NOT NULL,
+    \\    moved_at   BIGINT NOT NULL
+    \\);
     ,
     .down = "DROP TABLE ap_actor_moves;",
 };
@@ -244,6 +364,16 @@ pub const multikey_migration: Migration = .{
     \\    created_at  INTEGER NOT NULL,
     \\    PRIMARY KEY (username, key_id)
     \\) STRICT;
+    ,
+    .up_pg =
+    \\CREATE TABLE IF NOT EXISTS ap_actor_extra_keys (
+    \\    username    TEXT NOT NULL,
+    \\    key_id      TEXT NOT NULL,
+    \\    key_type    TEXT NOT NULL,
+    \\    public_pem  TEXT NOT NULL,
+    \\    created_at  BIGINT NOT NULL,
+    \\    PRIMARY KEY (username, key_id)
+    \\);
     ,
     .down = "DROP TABLE ap_actor_extra_keys;",
 };
@@ -265,6 +395,16 @@ pub const collection_items_migration: Migration = .{
     \\) STRICT;
     \\CREATE INDEX IF NOT EXISTS ap_collection_items_collection_idx ON ap_collection_items (collection);
     ,
+    .up_pg =
+    \\CREATE TABLE IF NOT EXISTS ap_collection_items (
+    \\    collection TEXT NOT NULL,
+    \\    object_iri TEXT NOT NULL,
+    \\    actor      TEXT NOT NULL,
+    \\    added_at   BIGINT NOT NULL,
+    \\    PRIMARY KEY (collection, object_iri)
+    \\);
+    \\CREATE INDEX IF NOT EXISTS ap_collection_items_collection_idx ON ap_collection_items (collection);
+    ,
     .down = "DROP TABLE ap_collection_items;",
 };
 
@@ -273,6 +413,7 @@ pub const actor_type_migration: Migration = .{
     .id = 1016,
     .name = "activitypub:actor-type",
     .up = "ALTER TABLE ap_users ADD COLUMN actor_type TEXT NOT NULL DEFAULT 'Person';",
+    .up_pg = "ALTER TABLE ap_users ADD COLUMN actor_type TEXT NOT NULL DEFAULT 'Person';",
     .down = null,
 };
 
@@ -292,6 +433,17 @@ pub const poll_votes_migration: Migration = .{
     \\) STRICT;
     \\CREATE INDEX IF NOT EXISTS ap_poll_votes_q_idx ON ap_poll_votes (question_iri);
     ,
+    .up_pg =
+    \\CREATE TABLE IF NOT EXISTS ap_poll_votes (
+    \\    activity_iri TEXT NOT NULL,
+    \\    question_iri TEXT NOT NULL,
+    \\    actor        TEXT NOT NULL,
+    \\    option_name  TEXT NOT NULL,
+    \\    created_at   BIGINT NOT NULL,
+    \\    PRIMARY KEY (question_iri, actor, option_name)
+    \\);
+    \\CREATE INDEX IF NOT EXISTS ap_poll_votes_q_idx ON ap_poll_votes (question_iri);
+    ,
     .down = "DROP TABLE ap_poll_votes;",
 };
 
@@ -307,6 +459,16 @@ pub const attachments_migration: Migration = .{
     \\    name       TEXT NOT NULL DEFAULT '',
     \\    PRIMARY KEY (object_iri, url)
     \\) STRICT;
+    \\CREATE INDEX IF NOT EXISTS ap_attachments_obj_idx ON ap_attachments (object_iri);
+    ,
+    .up_pg =
+    \\CREATE TABLE IF NOT EXISTS ap_attachments (
+    \\    object_iri TEXT NOT NULL,
+    \\    url        TEXT NOT NULL,
+    \\    media_type TEXT NOT NULL DEFAULT '',
+    \\    name       TEXT NOT NULL DEFAULT '',
+    \\    PRIMARY KEY (object_iri, url)
+    \\);
     \\CREATE INDEX IF NOT EXISTS ap_attachments_obj_idx ON ap_attachments (object_iri);
     ,
     .down = "DROP TABLE ap_attachments;",
@@ -329,8 +491,22 @@ pub const reactions_migration: Migration = .{
     \\) STRICT;
     \\CREATE INDEX IF NOT EXISTS ap_reactions_obj_idx ON ap_reactions (object_iri);
     ,
+    .up_pg =
+    \\CREATE TABLE IF NOT EXISTS ap_reactions (
+    \\    actor      TEXT NOT NULL,
+    \\    object_iri TEXT NOT NULL,
+    \\    content    TEXT NOT NULL,
+    \\    created_at BIGINT NOT NULL,
+    \\    PRIMARY KEY (actor, object_iri, content)
+    \\);
+    \\CREATE INDEX IF NOT EXISTS ap_reactions_obj_idx ON ap_reactions (object_iri);
+    ,
     .down = "DROP TABLE ap_reactions;",
 };
+
+test "F7: every activitypub migration carries a clean Postgres dialect variant" {
+    try core.storage.schema.assertPgDialectComplete(&all_migrations);
+}
 
 pub const all_migrations = [_]Migration{
     users_migration,

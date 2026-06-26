@@ -45,6 +45,22 @@ pub const migration: schema.Migration = .{
     \\CREATE INDEX IF NOT EXISTS idx_core_queue_claim
     \\    ON core_queue (topic, state, not_before, id);
     ,
+    .up_pg =
+    \\CREATE TABLE IF NOT EXISTS core_queue (
+    \\    id          BIGSERIAL PRIMARY KEY,
+    \\    topic       TEXT NOT NULL,
+    \\    key         TEXT NOT NULL DEFAULT '',
+    \\    payload     BYTEA NOT NULL,
+    \\    meta        TEXT NOT NULL DEFAULT '',
+    \\    attempts    BIGINT NOT NULL DEFAULT 0,
+    \\    not_before  BIGINT NOT NULL DEFAULT 0,
+    \\    state       TEXT NOT NULL DEFAULT 'pending',
+    \\    dead_reason TEXT,
+    \\    created_at  BIGINT NOT NULL DEFAULT 0
+    \\);
+    \\CREATE INDEX IF NOT EXISTS idx_core_queue_claim
+    \\    ON core_queue (topic, state, not_before, id);
+    ,
     .down = null,
 };
 

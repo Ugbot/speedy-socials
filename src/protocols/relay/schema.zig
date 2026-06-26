@@ -38,6 +38,15 @@ pub const identity_map_migration: Migration = .{
     \\CREATE INDEX IF NOT EXISTS relay_identity_map_actor_idx
     \\    ON relay_identity_map (ap_actor_url);
     ,
+    .up_pg =
+    \\CREATE TABLE IF NOT EXISTS relay_identity_map (
+    \\    did          TEXT PRIMARY KEY,
+    \\    ap_actor_url TEXT NOT NULL UNIQUE,
+    \\    last_seen    BIGINT NOT NULL
+    \\);
+    \\CREATE INDEX IF NOT EXISTS relay_identity_map_actor_idx
+    \\    ON relay_identity_map (ap_actor_url);
+    ,
     .down = "DROP TABLE relay_identity_map;",
 };
 
@@ -55,6 +64,17 @@ pub const subscriptions_migration: Migration = .{
     \\    UNIQUE (kind, source)
     \\) STRICT;
     ,
+    .up_pg =
+    \\CREATE TABLE IF NOT EXISTS relay_subscriptions (
+    \\    id          BIGSERIAL PRIMARY KEY,
+    \\    kind        TEXT NOT NULL CHECK (kind IN ('atproto_firehose','activitypub_inbox')),
+    \\    source      TEXT NOT NULL,
+    \\    cursor      TEXT,
+    \\    state       TEXT NOT NULL CHECK (state IN ('active','paused','failed')),
+    \\    created_at  BIGINT NOT NULL,
+    \\    UNIQUE (kind, source)
+    \\);
+    ,
     .down = "DROP TABLE relay_subscriptions;",
 };
 
@@ -71,6 +91,21 @@ pub const translation_log_migration: Migration = .{
     \\    error_msg     TEXT,
     \\    ts            INTEGER NOT NULL
     \\) STRICT;
+    \\CREATE INDEX IF NOT EXISTS relay_translation_log_src_idx
+    \\    ON relay_translation_log (direction, source_id);
+    \\CREATE INDEX IF NOT EXISTS relay_translation_log_ts_idx
+    \\    ON relay_translation_log (ts DESC);
+    ,
+    .up_pg =
+    \\CREATE TABLE IF NOT EXISTS relay_translation_log (
+    \\    id            BIGSERIAL PRIMARY KEY,
+    \\    direction     TEXT NOT NULL CHECK (direction IN ('at_to_ap','ap_to_at')),
+    \\    source_id     TEXT NOT NULL,
+    \\    translated_id TEXT NOT NULL,
+    \\    success       BIGINT NOT NULL,
+    \\    error_msg     TEXT,
+    \\    ts            BIGINT NOT NULL
+    \\);
     \\CREATE INDEX IF NOT EXISTS relay_translation_log_src_idx
     \\    ON relay_translation_log (direction, source_id);
     \\CREATE INDEX IF NOT EXISTS relay_translation_log_ts_idx
@@ -101,8 +136,26 @@ pub const followers_migration: Migration = .{
     \\CREATE INDEX IF NOT EXISTS relay_followers_follow_iri_idx
     \\    ON relay_followers (follow_iri);
     ,
+    .up_pg =
+    \\CREATE TABLE IF NOT EXISTS relay_followers (
+    \\    actor_url      TEXT NOT NULL,
+    \\    follower_inbox TEXT NOT NULL,
+    \\    shared_inbox   TEXT,
+    \\    follow_iri     TEXT NOT NULL,
+    \\    created_at     BIGINT NOT NULL,
+    \\    PRIMARY KEY (actor_url, follower_inbox)
+    \\);
+    \\CREATE INDEX IF NOT EXISTS relay_followers_actor_idx
+    \\    ON relay_followers (actor_url);
+    \\CREATE INDEX IF NOT EXISTS relay_followers_follow_iri_idx
+    \\    ON relay_followers (follow_iri);
+    ,
     .down = "DROP TABLE relay_followers;",
 };
+
+test "F7: every relay migration carries a clean Postgres dialect variant" {
+    try core.storage.schema.assertPgDialectComplete(&all_migrations);
+}
 
 pub const all_migrations = [_]Migration{
     identity_map_migration,

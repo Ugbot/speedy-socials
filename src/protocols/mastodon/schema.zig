@@ -36,6 +36,20 @@ pub const apps_migration: Migration = .{
     \\) STRICT;
     \\CREATE INDEX IF NOT EXISTS mastodon_apps_client_idx ON mastodon_apps (client_id);
     ,
+    .up_pg =
+    \\CREATE TABLE IF NOT EXISTS mastodon_apps (
+    \\    id            BIGSERIAL PRIMARY KEY,
+    \\    client_id     TEXT NOT NULL UNIQUE,
+    \\    client_secret TEXT NOT NULL,
+    \\    name          TEXT NOT NULL,
+    \\    redirect_uri  TEXT NOT NULL,
+    \\    scopes        TEXT NOT NULL,
+    \\    website       TEXT,
+    \\    vapid_key     TEXT,
+    \\    created_at    BIGINT NOT NULL
+    \\);
+    \\CREATE INDEX IF NOT EXISTS mastodon_apps_client_idx ON mastodon_apps (client_id);
+    ,
     .down = "DROP TABLE mastodon_apps;",
 };
 
@@ -53,6 +67,19 @@ pub const tokens_migration: Migration = .{
     \\    revoked     INTEGER NOT NULL DEFAULT 0,
     \\    created_at  INTEGER NOT NULL
     \\) STRICT;
+    \\CREATE INDEX IF NOT EXISTS mastodon_tokens_jti_idx ON mastodon_tokens (jti);
+    ,
+    .up_pg =
+    \\CREATE TABLE IF NOT EXISTS mastodon_tokens (
+    \\    id          BIGSERIAL PRIMARY KEY,
+    \\    jti         TEXT NOT NULL UNIQUE,
+    \\    app_id      BIGINT NOT NULL,
+    \\    user_id     BIGINT,
+    \\    scopes      TEXT NOT NULL,
+    \\    expires_at  BIGINT NOT NULL,
+    \\    revoked     BIGINT NOT NULL DEFAULT 0,
+    \\    created_at  BIGINT NOT NULL
+    \\);
     \\CREATE INDEX IF NOT EXISTS mastodon_tokens_jti_idx ON mastodon_tokens (jti);
     ,
     .down = "DROP TABLE mastodon_tokens;",
@@ -73,6 +100,18 @@ pub const notifications_migration: Migration = .{
     \\) STRICT;
     \\CREATE INDEX IF NOT EXISTS mastodon_notifications_user_idx ON mastodon_notifications (user_id, read, created_at DESC);
     ,
+    .up_pg =
+    \\CREATE TABLE IF NOT EXISTS mastodon_notifications (
+    \\    id            BIGSERIAL PRIMARY KEY,
+    \\    user_id       BIGINT NOT NULL,
+    \\    type          TEXT NOT NULL CHECK (type IN ('mention','reblog','favourite','follow','poll','status')),
+    \\    from_account  TEXT NOT NULL,
+    \\    status_id     BIGINT,
+    \\    created_at    BIGINT NOT NULL,
+    \\    read          BIGINT NOT NULL DEFAULT 0
+    \\);
+    \\CREATE INDEX IF NOT EXISTS mastodon_notifications_user_idx ON mastodon_notifications (user_id, read, created_at DESC);
+    ,
     .down = "DROP TABLE mastodon_notifications;",
 };
 
@@ -89,6 +128,16 @@ pub const favourites_migration: Migration = .{
     \\) STRICT;
     \\CREATE INDEX IF NOT EXISTS mastodon_favourites_status_idx ON mastodon_favourites (status_id);
     ,
+    .up_pg =
+    \\CREATE TABLE IF NOT EXISTS mastodon_favourites (
+    \\    id          BIGSERIAL PRIMARY KEY,
+    \\    status_id   BIGINT NOT NULL,
+    \\    user_id     BIGINT NOT NULL,
+    \\    created_at  BIGINT NOT NULL,
+    \\    UNIQUE (status_id, user_id)
+    \\);
+    \\CREATE INDEX IF NOT EXISTS mastodon_favourites_status_idx ON mastodon_favourites (status_id);
+    ,
     .down = "DROP TABLE mastodon_favourites;",
 };
 
@@ -103,6 +152,16 @@ pub const reblogs_migration: Migration = .{
     \\    created_at  INTEGER NOT NULL,
     \\    UNIQUE (status_id, user_id)
     \\) STRICT;
+    \\CREATE INDEX IF NOT EXISTS mastodon_reblogs_status_idx ON mastodon_reblogs (status_id);
+    ,
+    .up_pg =
+    \\CREATE TABLE IF NOT EXISTS mastodon_reblogs (
+    \\    id          BIGSERIAL PRIMARY KEY,
+    \\    status_id   BIGINT NOT NULL,
+    \\    user_id     BIGINT NOT NULL,
+    \\    created_at  BIGINT NOT NULL,
+    \\    UNIQUE (status_id, user_id)
+    \\);
     \\CREATE INDEX IF NOT EXISTS mastodon_reblogs_status_idx ON mastodon_reblogs (status_id);
     ,
     .down = "DROP TABLE mastodon_reblogs;",
@@ -127,8 +186,21 @@ pub const users_migration: Migration = .{
     \\) STRICT;
     \\CREATE INDEX IF NOT EXISTS mastodon_users_handle_idx ON mastodon_users (handle);
     ,
+    .up_pg =
+    \\CREATE TABLE IF NOT EXISTS mastodon_users (
+    \\    id            BIGSERIAL PRIMARY KEY,
+    \\    handle        TEXT NOT NULL UNIQUE,
+    \\    password_hash BYTEA NOT NULL,
+    \\    created_at    BIGINT NOT NULL
+    \\);
+    \\CREATE INDEX IF NOT EXISTS mastodon_users_handle_idx ON mastodon_users (handle);
+    ,
     .down = "DROP TABLE mastodon_users;",
 };
+
+test "F7: every mastodon migration carries a clean Postgres dialect variant" {
+    try core.storage.schema.assertPgDialectComplete(&all_migrations);
+}
 
 pub const all_migrations = [_]Migration{
     apps_migration,

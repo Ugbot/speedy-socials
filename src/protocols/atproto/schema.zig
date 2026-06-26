@@ -20,6 +20,16 @@ pub const repos_migration: Migration = .{
     \\    created_at   INTEGER NOT NULL
     \\) STRICT;
     ,
+    .up_pg =
+    \\CREATE TABLE IF NOT EXISTS atp_repos (
+    \\    did          TEXT PRIMARY KEY,
+    \\    signing_key  TEXT NOT NULL,
+    \\    rotation_key TEXT,
+    \\    head_cid     TEXT,
+    \\    head_rev     TEXT,
+    \\    created_at   BIGINT NOT NULL
+    \\);
+    ,
     .down = "DROP TABLE atp_repos;",
 };
 
@@ -36,6 +46,19 @@ pub const commits_migration: Migration = .{
     \\    signature    BLOB NOT NULL,
     \\    committed_at INTEGER NOT NULL
     \\) STRICT;
+    \\CREATE INDEX IF NOT EXISTS atp_commits_did_rev_idx
+    \\    ON atp_commits (did, rev);
+    ,
+    .up_pg =
+    \\CREATE TABLE IF NOT EXISTS atp_commits (
+    \\    cid          TEXT PRIMARY KEY,
+    \\    did          TEXT NOT NULL,
+    \\    rev          TEXT NOT NULL,
+    \\    prev_cid     TEXT,
+    \\    data_cid     TEXT NOT NULL,
+    \\    signature    BYTEA NOT NULL,
+    \\    committed_at BIGINT NOT NULL
+    \\);
     \\CREATE INDEX IF NOT EXISTS atp_commits_did_rev_idx
     \\    ON atp_commits (did, rev);
     ,
@@ -58,6 +81,19 @@ pub const records_migration: Migration = .{
     \\CREATE INDEX IF NOT EXISTS atp_records_lookup_idx
     \\    ON atp_records (did, collection, rkey);
     ,
+    .up_pg =
+    \\CREATE TABLE IF NOT EXISTS atp_records (
+    \\    uri        TEXT PRIMARY KEY,
+    \\    did        TEXT NOT NULL,
+    \\    collection TEXT NOT NULL,
+    \\    rkey       TEXT NOT NULL,
+    \\    cid        TEXT NOT NULL,
+    \\    value      BYTEA NOT NULL,
+    \\    indexed_at BIGINT NOT NULL
+    \\);
+    \\CREATE INDEX IF NOT EXISTS atp_records_lookup_idx
+    \\    ON atp_records (did, collection, rkey);
+    ,
     .down = "DROP TABLE atp_records;",
 };
 
@@ -75,6 +111,17 @@ pub const blobs_migration: Migration = .{
     \\    created_at INTEGER NOT NULL
     \\) STRICT;
     ,
+    .up_pg =
+    \\CREATE TABLE IF NOT EXISTS atp_blobs (
+    \\    cid        TEXT PRIMARY KEY,
+    \\    did        TEXT NOT NULL,
+    \\    mime       TEXT,
+    \\    size       BIGINT NOT NULL,
+    \\    ref_count  BIGINT NOT NULL DEFAULT 0,
+    \\    data       BYTEA NOT NULL,
+    \\    created_at BIGINT NOT NULL
+    \\);
+    ,
     .down = "DROP TABLE atp_blobs;",
 };
 
@@ -87,6 +134,13 @@ pub const mst_blocks_migration: Migration = .{
     \\    did  TEXT NOT NULL,
     \\    data BLOB NOT NULL
     \\) STRICT;
+    ,
+    .up_pg =
+    \\CREATE TABLE IF NOT EXISTS atp_mst_blocks (
+    \\    cid  TEXT PRIMARY KEY,
+    \\    did  TEXT NOT NULL,
+    \\    data BYTEA NOT NULL
+    \\);
     ,
     .down = "DROP TABLE atp_mst_blocks;",
 };
@@ -101,6 +155,14 @@ pub const firehose_cursor_migration: Migration = .{
     \\    CHECK (id = 1)
     \\) STRICT;
     \\INSERT OR IGNORE INTO atp_firehose_cursor (id, seq) VALUES (1, 0);
+    ,
+    .up_pg =
+    \\CREATE TABLE IF NOT EXISTS atp_firehose_cursor (
+    \\    id  BIGINT PRIMARY KEY DEFAULT 1,
+    \\    seq BIGINT NOT NULL DEFAULT 0,
+    \\    CHECK (id = 1)
+    \\);
+    \\INSERT INTO atp_firehose_cursor (id, seq) VALUES (1, 0) ON CONFLICT DO NOTHING;
     ,
     .down = "DROP TABLE atp_firehose_cursor;",
 };
@@ -117,6 +179,15 @@ pub const firehose_events_migration: Migration = .{
     \\    ts         INTEGER NOT NULL
     \\) STRICT;
     ,
+    .up_pg =
+    \\CREATE TABLE IF NOT EXISTS atp_firehose_events (
+    \\    seq        BIGSERIAL PRIMARY KEY,
+    \\    did        TEXT NOT NULL,
+    \\    commit_cid TEXT NOT NULL,
+    \\    body       BYTEA NOT NULL,
+    \\    ts         BIGINT NOT NULL
+    \\);
+    ,
     .down = "DROP TABLE atp_firehose_events;",
 };
 
@@ -132,6 +203,17 @@ pub const sessions_migration: Migration = .{
     \\    created_at  INTEGER NOT NULL,
     \\    expires_at  INTEGER NOT NULL
     \\) STRICT;
+    \\CREATE INDEX IF NOT EXISTS atp_sessions_did_idx ON atp_sessions (did);
+    ,
+    .up_pg =
+    \\CREATE TABLE IF NOT EXISTS atp_sessions (
+    \\    id          BIGSERIAL PRIMARY KEY,
+    \\    did         TEXT NOT NULL,
+    \\    access_jti  TEXT UNIQUE,
+    \\    refresh_jti TEXT UNIQUE,
+    \\    created_at  BIGINT NOT NULL,
+    \\    expires_at  BIGINT NOT NULL
+    \\);
     \\CREATE INDEX IF NOT EXISTS atp_sessions_did_idx ON atp_sessions (did);
     ,
     .down = "DROP TABLE atp_sessions;",
@@ -151,6 +233,13 @@ pub const user_passwords_migration: Migration = .{
     \\    created_at    INTEGER NOT NULL
     \\) STRICT;
     ,
+    .up_pg =
+    \\CREATE TABLE IF NOT EXISTS atp_user_passwords (
+    \\    did           TEXT PRIMARY KEY,
+    \\    password_hash BYTEA NOT NULL,
+    \\    created_at    BIGINT NOT NULL
+    \\);
+    ,
     .down = "DROP TABLE atp_user_passwords;",
 };
 
@@ -162,6 +251,7 @@ pub const firehose_event_kind_migration: Migration = .{
     .id = 2010,
     .name = "atproto:firehose_event_kind",
     .up = "ALTER TABLE atp_firehose_events ADD COLUMN event_kind TEXT NOT NULL DEFAULT 'commit';",
+    .up_pg = "ALTER TABLE atp_firehose_events ADD COLUMN event_kind TEXT NOT NULL DEFAULT 'commit';",
     .down = "",
 };
 
@@ -182,6 +272,16 @@ pub const oauth_par_migration: Migration = .{
     \\    expires_at     INTEGER NOT NULL
     \\) STRICT;
     ,
+    .up_pg =
+    \\CREATE TABLE IF NOT EXISTS atp_oauth_par (
+    \\    request_uri    TEXT PRIMARY KEY,
+    \\    client_id      TEXT NOT NULL,
+    \\    redirect_uri   TEXT NOT NULL,
+    \\    code_challenge TEXT NOT NULL,
+    \\    scope          TEXT NOT NULL,
+    \\    expires_at     BIGINT NOT NULL
+    \\);
+    ,
     .down = "DROP TABLE atp_oauth_par;",
 };
 
@@ -196,6 +296,14 @@ pub const oauth_codes_migration: Migration = .{
     \\    request_uri TEXT NOT NULL,
     \\    expires_at  INTEGER NOT NULL
     \\) STRICT;
+    ,
+    .up_pg =
+    \\CREATE TABLE IF NOT EXISTS atp_oauth_codes (
+    \\    code        TEXT PRIMARY KEY,
+    \\    did         TEXT NOT NULL,
+    \\    request_uri TEXT NOT NULL,
+    \\    expires_at  BIGINT NOT NULL
+    \\);
     ,
     .down = "DROP TABLE atp_oauth_codes;",
 };
@@ -220,6 +328,20 @@ pub const labels_migration: Migration = .{
     \\CREATE INDEX IF NOT EXISTS atp_labels_uri_idx ON atp_labels (uri);
     \\CREATE INDEX IF NOT EXISTS atp_labels_src_idx ON atp_labels (src);
     ,
+    .up_pg =
+    \\CREATE TABLE IF NOT EXISTS atp_labels (
+    \\    seq        BIGSERIAL PRIMARY KEY,
+    \\    src        TEXT NOT NULL,
+    \\    uri        TEXT NOT NULL,
+    \\    cid        TEXT,
+    \\    val        TEXT NOT NULL,
+    \\    neg        BIGINT NOT NULL DEFAULT 0,
+    \\    created_at BIGINT NOT NULL,
+    \\    exp        BIGINT
+    \\);
+    \\CREATE INDEX IF NOT EXISTS atp_labels_uri_idx ON atp_labels (uri);
+    \\CREATE INDEX IF NOT EXISTS atp_labels_src_idx ON atp_labels (src);
+    ,
     .down = "DROP TABLE atp_labels;",
 };
 
@@ -236,6 +358,16 @@ pub const reports_migration: Migration = .{
     \\) STRICT;
     \\CREATE INDEX IF NOT EXISTS atp_reports_created_idx ON atp_reports (created_at DESC);
     ,
+    .up_pg =
+    \\CREATE TABLE IF NOT EXISTS atp_reports (
+    \\    id           BIGSERIAL PRIMARY KEY,
+    \\    reason_type  TEXT NOT NULL,
+    \\    reason_text  TEXT,
+    \\    subject_json BYTEA NOT NULL,
+    \\    created_at   BIGINT NOT NULL
+    \\);
+    \\CREATE INDEX IF NOT EXISTS atp_reports_created_idx ON atp_reports (created_at DESC);
+    ,
     .down = "DROP TABLE atp_reports;",
 };
 
@@ -247,6 +379,12 @@ pub const crawl_subscriptions_migration: Migration = .{
     \\    hostname    TEXT PRIMARY KEY,
     \\    requested_at INTEGER NOT NULL
     \\) STRICT;
+    ,
+    .up_pg =
+    \\CREATE TABLE IF NOT EXISTS atp_crawl_subscriptions (
+    \\    hostname    TEXT PRIMARY KEY,
+    \\    requested_at BIGINT NOT NULL
+    \\);
     ,
     .down = "DROP TABLE atp_crawl_subscriptions;",
 };
@@ -269,6 +407,14 @@ pub const revoked_sessions_migration: Migration = .{
     \\    expires_at INTEGER NOT NULL
     \\) STRICT;
     ,
+    .up_pg =
+    \\CREATE TABLE IF NOT EXISTS atp_revoked_sessions (
+    \\    jti        TEXT PRIMARY KEY,
+    \\    did        TEXT NOT NULL,
+    \\    revoked_at BIGINT NOT NULL,
+    \\    expires_at BIGINT NOT NULL
+    \\);
+    ,
     .down = "DROP TABLE atp_revoked_sessions;",
 };
 
@@ -290,8 +436,20 @@ pub const dpop_nonces_migration: Migration = .{
     \\) STRICT;
     \\CREATE INDEX IF NOT EXISTS atp_dpop_nonces_exp_idx ON atp_dpop_nonces (expires_at);
     ,
+    .up_pg =
+    \\CREATE TABLE IF NOT EXISTS atp_dpop_nonces (
+    \\    nonce      TEXT PRIMARY KEY,
+    \\    issued_at  BIGINT NOT NULL,
+    \\    expires_at BIGINT NOT NULL
+    \\);
+    \\CREATE INDEX IF NOT EXISTS atp_dpop_nonces_exp_idx ON atp_dpop_nonces (expires_at);
+    ,
     .down = "DROP TABLE atp_dpop_nonces;",
 };
+
+test "F7: every atproto migration carries a clean Postgres dialect variant" {
+    try core.storage.schema.assertPgDialectComplete(&all_migrations);
+}
 
 pub const all_migrations = [_]Migration{
     repos_migration,

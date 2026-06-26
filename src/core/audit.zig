@@ -36,6 +36,21 @@ pub const audit_migration: Migration = .{
     \\CREATE INDEX IF NOT EXISTS core_audit_log_actor_idx
     \\    ON core_audit_log (actor, ts DESC);
     ,
+    .up_pg =
+    \\CREATE TABLE IF NOT EXISTS core_audit_log (
+    \\    id           BIGSERIAL PRIMARY KEY,
+    \\    ts           BIGINT NOT NULL,
+    \\    actor        TEXT NOT NULL,
+    \\    action       TEXT NOT NULL,
+    \\    target       TEXT,
+    \\    detail_json  TEXT,
+    \\    success      BIGINT NOT NULL DEFAULT 1
+    \\);
+    \\CREATE INDEX IF NOT EXISTS core_audit_log_ts_idx
+    \\    ON core_audit_log (ts DESC);
+    \\CREATE INDEX IF NOT EXISTS core_audit_log_actor_idx
+    \\    ON core_audit_log (actor, ts DESC);
+    ,
     .down = "DROP TABLE core_audit_log;",
 };
 

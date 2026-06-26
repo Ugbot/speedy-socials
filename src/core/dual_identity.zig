@@ -65,6 +65,18 @@ pub const migration: storage.Migration = .{
     \\CREATE INDEX IF NOT EXISTS core_identity_map_at_idx ON core_identity_map (at_did);
     \\CREATE INDEX IF NOT EXISTS core_identity_map_tenant_idx ON core_identity_map (tenant);
     ,
+    .up_pg =
+    \\CREATE TABLE IF NOT EXISTS core_identity_map (
+    \\    account_id TEXT PRIMARY KEY,
+    \\    ap_actor   TEXT NOT NULL,
+    \\    at_did     TEXT NOT NULL,
+    \\    tenant     TEXT NOT NULL DEFAULT '',
+    \\    created_at BIGINT NOT NULL
+    \\);
+    \\CREATE INDEX IF NOT EXISTS core_identity_map_ap_idx ON core_identity_map (ap_actor);
+    \\CREATE INDEX IF NOT EXISTS core_identity_map_at_idx ON core_identity_map (at_did);
+    \\CREATE INDEX IF NOT EXISTS core_identity_map_tenant_idx ON core_identity_map (tenant);
+    ,
     .down = "DROP TABLE core_identity_map;",
 };
 

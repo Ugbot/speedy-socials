@@ -683,6 +683,17 @@ pub fn main() !void {
                 pg_provider_holder = pp;
                 core.storage.setProvider(pg_provider_holder.?.dbProvider());
                 core.storage.backend.setGlobal(pg_provider_holder.?.pg_backend.backend());
+                // F7: apply the Postgres-dialect migrations (each migration's
+                // up_pg) to the connected database. The SQLite default db was
+                // already migrated above; this brings Postgres to the same
+                // schema so dialect-neutral query sites run against a real,
+                // migrated PG database.
+                pg_provider_holder.?.dbProvider().migrate(&schema) catch |err| {
+                    if (!fallback_ok) bootFatal(log_ptr, "postgres", @errorName(err));
+                    log_ptr.record(.warn, "boot", "postgres migrate failed — STORAGE_FALLBACK_SQLITE=1, using sqlite", &.{
+                        .{ .k = "err", .v = @errorName(err) },
+                    });
+                };
                 log_ptr.info("boot", "storage provider: postgres (pure-Zig pg.zig)");
             } else |err| {
                 if (!fallback_ok) bootFatal(log_ptr, "postgres", @errorName(err));

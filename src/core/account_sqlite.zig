@@ -89,6 +89,42 @@ pub const sqlite_migration: storage.Migration = .{
     \\    created_at INTEGER NOT NULL
     \\) STRICT;
     ,
+    .up_pg =
+    \\CREATE TABLE IF NOT EXISTS atp_accounts (
+    \\    id              TEXT PRIMARY KEY,
+    \\    handle          TEXT NOT NULL UNIQUE,
+    \\    email           TEXT NOT NULL DEFAULT '',
+    \\    password_hash   TEXT NOT NULL,
+    \\    state           TEXT NOT NULL DEFAULT 'active',
+    \\    email_confirmed BIGINT NOT NULL DEFAULT 0,
+    \\    created_at      BIGINT NOT NULL,
+    \\    updated_at      BIGINT NOT NULL
+    \\);
+    \\CREATE INDEX IF NOT EXISTS atp_accounts_email_idx ON atp_accounts (email);
+    \\CREATE TABLE IF NOT EXISTS atp_email_tokens (
+    \\    token_hash TEXT PRIMARY KEY,
+    \\    account_id TEXT NOT NULL,
+    \\    kind       TEXT NOT NULL,
+    \\    expires_at BIGINT NOT NULL,
+    \\    consumed   BIGINT NOT NULL DEFAULT 0
+    \\);
+    \\CREATE INDEX IF NOT EXISTS atp_email_tokens_acct_idx ON atp_email_tokens (account_id);
+    \\CREATE TABLE IF NOT EXISTS atp_app_passwords (
+    \\    account_id    TEXT NOT NULL,
+    \\    label         TEXT NOT NULL,
+    \\    password_hash TEXT NOT NULL,
+    \\    created_at    BIGINT NOT NULL,
+    \\    PRIMARY KEY (account_id, label)
+    \\);
+    \\CREATE TABLE IF NOT EXISTS atp_invites (
+    \\    code       TEXT PRIMARY KEY,
+    \\    created_by TEXT NOT NULL DEFAULT '',
+    \\    max_uses   BIGINT NOT NULL DEFAULT 1,
+    \\    uses       BIGINT NOT NULL DEFAULT 0,
+    \\    disabled   BIGINT NOT NULL DEFAULT 0,
+    \\    created_at BIGINT NOT NULL
+    \\);
+    ,
     .down = "DROP TABLE atp_accounts; DROP TABLE atp_email_tokens; DROP TABLE atp_app_passwords; DROP TABLE atp_invites;",
 };
 

@@ -16,5 +16,12 @@ pub const migration: schema.Migration = .{
     \\    applied_at  INTEGER NOT NULL
     \\) STRICT;
     ,
+    .up_pg =
+    \\CREATE TABLE IF NOT EXISTS migrations (
+    \\    id          BIGINT PRIMARY KEY,
+    \\    name        TEXT NOT NULL,
+    \\    applied_at  BIGINT NOT NULL
+    \\);
+    ,
     .down = "DROP TABLE migrations;",
 };
