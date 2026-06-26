@@ -22,14 +22,22 @@
 const std = @import("std");
 const resp = @import("resp.zig");
 const reply = @import("reply.zig");
+const openssl = @import("../crypto/openssl.zig");
+const ossl = openssl.c;
 
 pub const Reply = reply.Reply;
+
+/// TLS mode for a connection. `rediss://` selects `.require`; a `?tls=noverify`
+/// query selects `.require_noverify` (self-signed/dev servers).
+pub const TlsMode = enum { disabled, require, require_noverify };
 
 pub const Error = error{
     /// getaddrinfo could not resolve the host.
     DnsFailed,
     /// socket()/connect() failed for every resolved address.
     ConnectFailed,
+    /// TLS handshake / context setup failed (rediss://).
+    TlsFailed,
     /// A generic socket-layer failure (alloc of the I/O buffers, etc.).
     SocketError,
     /// A blocking read/write timed out (SO_RCVTIMEO/SNDTIMEO fired) or the
@@ -73,6 +81,10 @@ pub const Options = struct {
     /// Attempt `HELLO 3` first to switch the connection to RESP3, falling
     /// back to RESP2 on an old server that rejects HELLO.
     prefer_resp3: bool = true,
+    /// TLS: `.disabled` (plaintext, default), `.require` (verify peer), or
+    /// `.require_noverify` (encrypt without cert verification). Set from the
+    /// URL scheme (`rediss://` → require; `?tls=noverify` → require_noverify).
+    tls: TlsMode = .disabled,
 };
 
 /// Initial recv-buffer size. Most replies (status/int/short bulk) fit here
@@ -118,6 +130,10 @@ pub const Conn = struct {
     /// frames, so leftover bytes are carried across `recvFrame` calls.
     win_start: usize = 0,
     win_end: usize = 0,
+    /// TLS state (rediss://). When `ssl` is set, byte I/O routes through
+    /// `SSL_read`/`SSL_write` instead of `std.c.read`/`write`.
+    ssl: ?*ossl.SSL = null,
+    ssl_ctx: ?*ossl.SSL_CTX = null,
 
     pub fn connect(allocator: std.mem.Allocator, opts: Options) Error!*Conn {
         const fd = try dialBlocking(opts.host, opts.port, opts.timeout_ms);
@@ -137,16 +153,55 @@ pub const Conn = struct {
             .send_buf = send,
         };
 
+        if (opts.tls != .disabled) try self.startTls(opts);
         try self.handshake(opts);
         std.debug.assert(self.healthy);
         return self;
     }
 
     pub fn deinit(self: *Conn) void {
+        if (self.ssl) |ssl| {
+            _ = ossl.SSL_shutdown(ssl);
+            ossl.SSL_free(ssl);
+        }
+        if (self.ssl_ctx) |ctx| ossl.SSL_CTX_free(ctx);
         _ = std.c.close(self.fd);
         self.allocator.free(self.recv_buf);
         self.allocator.free(self.send_buf);
         self.allocator.destroy(self);
+    }
+
+    /// Upgrade the freshly-connected socket to TLS (mirrors mysql/conn.zig).
+    /// `.require` verifies the peer against the OS trust store + hostname;
+    /// `.require_noverify` encrypts without verification (dev/self-signed).
+    fn startTls(self: *Conn, opts: Options) Error!void {
+        const verify = (opts.tls == .require);
+        openssl.ensureLibraryInit();
+        const ctx = ossl.SSL_CTX_new(ossl.TLS_client_method()) orelse return error.TlsFailed;
+        errdefer ossl.SSL_CTX_free(ctx);
+        _ = ossl.SSL_CTX_set_min_proto_version(ctx, 0x0303); // TLS 1.2 floor
+        if (verify) {
+            if (ossl.SSL_CTX_set_default_verify_paths(ctx) != 1) return error.TlsFailed;
+            ossl.SSL_CTX_set_verify(ctx, ossl.SSL_VERIFY_PEER, null);
+        } else {
+            ossl.SSL_CTX_set_verify(ctx, ossl.SSL_VERIFY_NONE, null);
+        }
+        const ssl = ossl.SSL_new(ctx) orelse return error.TlsFailed;
+        errdefer ossl.SSL_free(ssl);
+        if (ossl.SSL_set_fd(ssl, @intCast(self.fd)) != 1) return error.TlsFailed;
+
+        var host_z: [256]u8 = undefined;
+        if (opts.host.len >= host_z.len) return error.TlsFailed;
+        @memcpy(host_z[0..opts.host.len], opts.host);
+        host_z[opts.host.len] = 0;
+        _ = ossl.SSL_ctrl(ssl, ossl.SSL_CTRL_SET_TLSEXT_HOSTNAME, ossl.TLSEXT_NAMETYPE_host_name, @ptrCast(&host_z));
+        if (verify and ossl.SSL_set1_host(ssl, @ptrCast(&host_z)) != 1) return error.TlsFailed;
+
+        if (ossl.SSL_connect(ssl) != 1) return error.TlsFailed;
+        if (verify and ossl.SSL_get_verify_result(ssl) != ossl.X509_V_OK) return error.TlsFailed;
+
+        self.ssl = ssl;
+        self.ssl_ctx = ctx;
     }
 
     /// The server's last error reply text, valid until the next command.
@@ -510,6 +565,11 @@ pub const Conn = struct {
     /// fires). Returns the byte count (always ≥1 on success).
     fn readSome(self: *Conn, buf: []u8) Error!usize {
         std.debug.assert(buf.len > 0);
+        if (self.ssl) |ssl| {
+            const n = ossl.SSL_read(ssl, buf.ptr, @intCast(buf.len));
+            if (n <= 0) return error.ReadFailed;
+            return @intCast(n);
+        }
         const n = std.c.read(self.fd, buf.ptr, buf.len);
         if (n == 0) return error.ConnectionClosed;
         if (n < 0) {
@@ -525,7 +585,10 @@ pub const Conn = struct {
     fn writeAll(self: *Conn, buf: []const u8) Error!void {
         var off: usize = 0;
         while (off < buf.len) {
-            const n = std.c.write(self.fd, buf.ptr + off, buf.len - off);
+            const n = if (self.ssl) |ssl|
+                ossl.SSL_write(ssl, buf.ptr + off, @intCast(buf.len - off))
+            else
+                std.c.write(self.fd, buf.ptr + off, buf.len - off);
             if (n <= 0) {
                 self.healthy = false;
                 return error.WriteFailed;
@@ -591,13 +654,20 @@ fn applyTimeouts(fd: std.c.fd_t, timeout_ms: u32) void {
 /// recognised; TLS wired separately) into connection `Options`.
 pub fn parseOptions(url: []const u8) Options {
     var s = url;
-    inline for (.{ "redis://", "rediss://" }) |scheme| {
-        if (std.mem.startsWith(u8, s, scheme)) {
-            s = s[scheme.len..];
-            break;
-        }
-    }
     var opts = Options{};
+    if (std.mem.startsWith(u8, s, "rediss://")) {
+        opts.tls = .require;
+        s = s["rediss://".len..];
+    } else if (std.mem.startsWith(u8, s, "redis://")) {
+        s = s["redis://".len..];
+    }
+    // Optional `?tls=noverify` query (only meaningful with rediss://).
+    if (std.mem.indexOfScalar(u8, s, '?')) |q| {
+        if (std.mem.indexOf(u8, s[q..], "noverify") != null and opts.tls != .disabled) {
+            opts.tls = .require_noverify;
+        }
+        s = s[0..q];
+    }
     if (std.mem.indexOfScalar(u8, s, '@')) |at| {
         const userinfo = s[0..at];
         s = s[at + 1 ..];
