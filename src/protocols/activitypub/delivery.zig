@@ -23,6 +23,46 @@ const StorageError = core.errors.StorageError;
 const limits = core.limits;
 const assertLe = core.assert.assertLe;
 const Clock = core.clock.Clock;
+const queue = core.queue;
+const apoutbox = @import("apoutbox_queue.zig");
+
+// ──────────────────────────────────────────────────────────────────────
+// Pluggable delivery queue
+// ──────────────────────────────────────────────────────────────────────
+//
+// Federation delivery rides a `core.queue.QueueProvider`. The DEFAULT is
+// `ApOutboxQueue` over the existing `ap_federation_outbox` table, so the
+// historical path (schema, metrics, sims) is byte-for-byte unchanged. The
+// composition root may install an override — `core.queue.global()`
+// (DbQueue over `core_queue`) or a Redis/NATS-backed provider — to route
+// delivery onto a different store with no change to producers or the
+// worker. The producers (`enqueueDeliveries`, the AP routes, the relay
+// bridge) and the consumer (`outbox_worker`) all resolve the queue via
+// `deliveryQueue`, so a single install switches the whole data path.
+
+var delivery_queue_override: ?queue.QueueProvider = null;
+
+/// Install (or clear, with `null`) the process-global federation delivery
+/// queue. Call once at boot before the outbox worker starts. When unset,
+/// `deliveryQueue` returns a default `ApOutboxQueue` over the caller's db.
+pub fn setDeliveryQueue(p: ?queue.QueueProvider) void {
+    delivery_queue_override = p;
+}
+
+/// The installed override, if any (diagnostics / tests).
+pub fn deliveryQueueOverride() ?queue.QueueProvider {
+    return delivery_queue_override;
+}
+
+/// Resolve the active delivery queue. Returns the installed override if
+/// set, else a default `ApOutboxQueue` over `db` materialized into
+/// `storage` — which the caller must keep alive for as long as it uses
+/// the returned provider (the provider borrows `storage` by pointer).
+pub fn deliveryQueue(db: *c.sqlite3, clock: Clock, storage: *apoutbox.ApOutboxQueue) queue.QueueProvider {
+    if (delivery_queue_override) |p| return p;
+    storage.* = apoutbox.ApOutboxQueue.init(db, clock);
+    return storage.provider();
+}
 
 pub const max_recipients_per_activity: u32 = 64;
 pub const max_inbox_url_bytes: usize = 512;
@@ -315,6 +355,15 @@ pub fn resolveRecipients(
     return j;
 }
 
+/// Enqueue one delivery job per recipient onto the federation delivery
+/// queue (`core.queue.topic_ap_outbox`). Payload must already have had
+/// bto/bcc stripped; `key_id` identifies the local actor's signing key.
+/// Jobs are eligible immediately (`not_before = now`).
+///
+/// Routes through the pluggable `deliveryQueue` — by default an
+/// `ApOutboxQueue` over `ap_federation_outbox`, so the on-disk effect is
+/// identical to the historical direct INSERT (one pending row per
+/// recipient, `shared_inbox` is vestigial post-dedup and not carried).
 pub fn enqueueDeliveries(
     db: *c.sqlite3,
     clock: Clock,
@@ -324,40 +373,11 @@ pub fn enqueueDeliveries(
 ) FedError!u32 {
     if (recipients.len > max_recipients_per_activity) return error.OutboxFull;
     const now_s = clock.wallUnix();
-    var stmt: ?*c.sqlite3_stmt = null;
-    const sql =
-        \\INSERT INTO ap_federation_outbox
-        \\  (target_inbox, shared_inbox, payload, key_id, attempts, next_attempt_at, state, inserted_at)
-        \\VALUES (?, ?, ?, ?, 0, ?, 'pending', ?)
-    ;
-    if (c.sqlite3_prepare_v2(db, sql, -1, &stmt, null) != c.SQLITE_OK) {
-        if (stmt != null) _ = c.sqlite3_finalize(stmt);
-        return error.OutboxFull;
-    }
-    defer _ = c.sqlite3_finalize(stmt);
+    var storage: apoutbox.ApOutboxQueue = undefined;
+    const q = deliveryQueue(db, clock, &storage);
     var n: u32 = 0;
     for (recipients) |r| {
-        _ = c.sqlite3_reset(stmt);
-        _ = c.sqlite3_clear_bindings(stmt);
-        if (c.sqlite3_bind_text(stmt, 1, r.inbox.ptr, @intCast(r.inbox.len), c.sqliteTransientAsDestructor()) != c.SQLITE_OK) {
-            return error.OutboxFull;
-        }
-        if (r.shared_inbox.len > 0) {
-            if (c.sqlite3_bind_text(stmt, 2, r.shared_inbox.ptr, @intCast(r.shared_inbox.len), c.sqliteTransientAsDestructor()) != c.SQLITE_OK) {
-                return error.OutboxFull;
-            }
-        } else {
-            _ = c.sqlite3_bind_null(stmt, 2);
-        }
-        if (c.sqlite3_bind_blob(stmt, 3, payload.ptr, @intCast(payload.len), c.sqliteTransientAsDestructor()) != c.SQLITE_OK) {
-            return error.OutboxFull;
-        }
-        if (c.sqlite3_bind_text(stmt, 4, key_id.ptr, @intCast(key_id.len), c.sqliteTransientAsDestructor()) != c.SQLITE_OK) {
-            return error.OutboxFull;
-        }
-        if (c.sqlite3_bind_int64(stmt, 5, now_s) != c.SQLITE_OK) return error.OutboxFull;
-        if (c.sqlite3_bind_int64(stmt, 6, now_s) != c.SQLITE_OK) return error.OutboxFull;
-        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.OutboxFull;
+        q.enqueue(queue.topic_ap_outbox, r.inbox, payload, key_id, now_s) catch return error.OutboxFull;
         n += 1;
     }
     return n;

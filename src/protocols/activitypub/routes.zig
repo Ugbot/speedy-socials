@@ -40,6 +40,7 @@ const sig = @import("sig.zig");
 const keys = @import("keys.zig");
 const key_cache = @import("key_cache.zig");
 const delivery = @import("delivery.zig");
+const apoutbox = @import("apoutbox_queue.zig");
 
 const max_response_bytes: usize = 16 * 1024;
 
@@ -926,14 +927,10 @@ fn forwardToLocalFollowers(db: *c.sqlite3, st: *state_mod.State, collection_url:
     defer _ = c.sqlite3_finalize(stmt);
     _ = c.sqlite3_bind_text(stmt, 1, actor_uri.ptr, @intCast(actor_uri.len), c.sqliteTransientAsDestructor());
 
-    var enq: ?*c.sqlite3_stmt = null;
-    const enq_sql =
-        \\INSERT INTO ap_federation_outbox
-        \\  (target_inbox, shared_inbox, payload, key_id, attempts, next_attempt_at, state, inserted_at)
-        \\VALUES (?, NULL, ?, ?, 0, ?, 'pending', ?)
-    ;
-    if (c.sqlite3_prepare_v2(db, enq_sql, -1, &enq, null) != c.SQLITE_OK) return;
-    defer _ = c.sqlite3_finalize(enq);
+    // Enqueue each follower's inbox through the pluggable delivery queue
+    // (default `ApOutboxQueue` over `ap_federation_outbox`).
+    var storage: apoutbox.ApOutboxQueue = undefined;
+    const q = delivery.deliveryQueue(db, st.clock, &storage);
 
     const now = st.clock.wallUnix();
     // Build the local actor's keyId for signing the forwarded post.
@@ -950,15 +947,7 @@ fn forwardToLocalFollowers(db: *c.sqlite3, st: *state_mod.State, collection_url:
         const f_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 0));
         if (f_len == 0 or f_ptr == null) continue;
         const inbox_target = std.fmt.bufPrint(&inbox_buf, "{s}/inbox", .{f_ptr[0..f_len]}) catch continue;
-
-        _ = c.sqlite3_reset(enq);
-        _ = c.sqlite3_clear_bindings(enq);
-        _ = c.sqlite3_bind_text(enq, 1, inbox_target.ptr, @intCast(inbox_target.len), c.sqliteTransientAsDestructor());
-        _ = c.sqlite3_bind_blob(enq, 2, raw.ptr, @intCast(raw.len), c.sqliteTransientAsDestructor());
-        _ = c.sqlite3_bind_text(enq, 3, keyid.ptr, @intCast(keyid.len), c.sqliteTransientAsDestructor());
-        _ = c.sqlite3_bind_int64(enq, 4, now);
-        _ = c.sqlite3_bind_int64(enq, 5, now);
-        _ = c.sqlite3_step(enq);
+        q.enqueue(core.queue.topic_ap_outbox, inbox_target, raw, keyid, now) catch continue;
     }
 }
 

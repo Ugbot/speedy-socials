@@ -15,6 +15,7 @@ const std = @import("std");
 const core = @import("core");
 const c = @import("sqlite").c;
 const atproto = @import("protocol_atproto");
+const ap = @import("protocol_activitypub");
 const repo = atproto.repo;
 const dag_cbor = atproto.dag_cbor;
 
@@ -56,7 +57,7 @@ pub fn onChange(kind: repo.ChangeKind, did: []const u8, collection: []const u8, 
     const is_profile = std.mem.eql(u8, collection, profile_collection);
     if (is_profile and (kind == .create or kind == .update)) {
         const payload = renderProfileUpdate(db, did, actor, ap_id, clock.wallUnix()) catch return;
-        enqueueOutboxBestEffort(db, actor, payload, clock.wallUnix());
+        enqueueOutboxBestEffort(db, clock, actor, payload, clock.wallUnix());
         logTranslation(db, "at_to_ap", at_uri, ap_id, clock.wallUnix());
         return;
     }
@@ -69,7 +70,7 @@ pub fn onChange(kind: repo.ChangeKind, did: []const u8, collection: []const u8, 
         .update => {
             // AP Update: re-publishes the object body.
             const payload = renderUpdate(actor, ap_id, at_uri, clock.wallUnix()) catch return;
-            enqueueOutboxBestEffort(db, actor, payload, clock.wallUnix());
+            enqueueOutboxBestEffort(db, clock, actor, payload, clock.wallUnix());
             logTranslation(db, "at_to_ap", at_uri, ap_id, clock.wallUnix());
         },
         .delete => {
@@ -83,7 +84,7 @@ pub fn onChange(kind: repo.ChangeKind, did: []const u8, collection: []const u8, 
                 (renderDelete(actor, ap_id, at_uri, clock.wallUnix()) catch return)
             else
                 (renderUndo(actor, ap_id, at_uri, undo, clock.wallUnix()) catch return);
-            enqueueOutboxBestEffort(db, actor, payload, clock.wallUnix());
+            enqueueOutboxBestEffort(db, clock, actor, payload, clock.wallUnix());
             logTranslation(db, "at_to_ap", at_uri, ap_id, clock.wallUnix());
         },
     }
@@ -323,7 +324,7 @@ fn jsonEscape(out: []u8, s: []const u8) []const u8 {
     return out[0..w];
 }
 
-fn enqueueOutboxBestEffort(db: *c.sqlite3, actor: []const u8, payload: []const u8, now: i64) void {
+fn enqueueOutboxBestEffort(db: *c.sqlite3, clock: core.clock.Clock, actor: []const u8, payload: []const u8, now: i64) void {
     // Look up follower inboxes and enqueue one row per follower.
     // (Production also has the env-bootstrapped bridge_target_inbox,
     // but the hook fires for changes — the follower table is the
@@ -336,27 +337,19 @@ fn enqueueOutboxBestEffort(db: *c.sqlite3, actor: []const u8, payload: []const u
     var keyid_buf: [320]u8 = undefined;
     const keyid = std.fmt.bufPrint(&keyid_buf, "{s}#main-key", .{actor}) catch return;
 
+    // Route through the pluggable delivery queue (default `ApOutboxQueue`
+    // over `ap_federation_outbox`; a boot override routes onto core.queue
+    // / Redis with no change here).
+    var storage: ap.apoutbox_queue.ApOutboxQueue = undefined;
+    const q = ap.delivery.deliveryQueue(db, clock, &storage);
+
     while (true) {
         const rc = c.sqlite3_step(stmt.?);
         if (rc != c.SQLITE_ROW) break;
         const inbox_ptr = c.sqlite3_column_text(stmt, 0);
         const inbox_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 0));
         if (inbox_len == 0) continue;
-
-        var enq: ?*c.sqlite3_stmt = null;
-        const sql =
-            \\INSERT INTO ap_federation_outbox
-            \\  (target_inbox, shared_inbox, payload, key_id, attempts, next_attempt_at, state, inserted_at)
-            \\VALUES (?, NULL, ?, ?, 0, ?, 'pending', ?)
-        ;
-        if (c.sqlite3_prepare_v2(db, sql, -1, &enq, null) != c.SQLITE_OK) continue;
-        defer _ = c.sqlite3_finalize(enq);
-        _ = c.sqlite3_bind_text(enq, 1, inbox_ptr, @intCast(inbox_len), c.sqliteTransientAsDestructor());
-        _ = c.sqlite3_bind_blob(enq, 2, payload.ptr, @intCast(payload.len), c.sqliteTransientAsDestructor());
-        _ = c.sqlite3_bind_text(enq, 3, keyid.ptr, @intCast(keyid.len), c.sqliteTransientAsDestructor());
-        _ = c.sqlite3_bind_int64(enq, 4, now);
-        _ = c.sqlite3_bind_int64(enq, 5, now);
-        _ = c.sqlite3_step(enq.?);
+        q.enqueue(core.queue.topic_ap_outbox, inbox_ptr[0..inbox_len], payload, keyid, now) catch continue;
     }
 }
 

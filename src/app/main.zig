@@ -606,6 +606,26 @@ pub fn main() !void {
     core.queue.setGlobal(db_queue.provider());
     defer core.queue.resetGlobal();
 
+    // F8: route AP federation delivery onto core.queue when requested.
+    // Default (unset) keeps the dedicated `ap_federation_outbox` table via
+    // ApOutboxQueue — per-handle, so each request's tenant db gets its own
+    // outbox. `AP_DELIVERY_QUEUE=core` instead routes every producer
+    // (enqueueDeliveries, the AP routes, the relay bridge) AND the outbox
+    // worker onto the process-global queue above (DbQueue today; Redis/
+    // NATS/Kafka once QUEUE_BACKEND grows one), giving a single shared
+    // delivery queue — the relay/bridge single-instance model. Note: the
+    // ap_outbox health/flush probes still inspect `ap_federation_outbox`,
+    // so under this route observe backlog via the core.queue metrics.
+    if (std.c.getenv("AP_DELIVERY_QUEUE")) |q_c| {
+        if (std.mem.eql(u8, std.mem.sliceTo(q_c, 0), "core")) {
+            if (core.queue.global()) |gp| {
+                activitypub.delivery.setDeliveryQueue(gp);
+                log_ptr.info("boot", "AP delivery routed onto core.queue.global() (AP_DELIVERY_QUEUE=core)");
+            }
+        }
+    }
+    defer activitypub.delivery.setDeliveryQueue(null);
+
     // ── prepared statements + writer thread ────────────────────────
     try stmt_table.prepareAll(db);
     try writer.start();

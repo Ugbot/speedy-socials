@@ -46,6 +46,7 @@ pub const webfinger = @import("webfinger.zig");
 pub const actor = @import("actor.zig");
 pub const key_cache = @import("key_cache.zig");
 pub const delivery = @import("delivery.zig");
+pub const apoutbox_queue = @import("apoutbox_queue.zig");
 pub const outbox_worker = @import("outbox_worker.zig");
 pub const key_fetcher_http = @import("key_fetcher_http.zig");
 pub const http_delivery = @import("http_delivery.zig");

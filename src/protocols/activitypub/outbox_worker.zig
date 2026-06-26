@@ -32,6 +32,9 @@ const Clock = core.clock.Clock;
 const limits = core.limits;
 const assert = core.assert.assert;
 const assertLe = core.assert.assertLe;
+const queue = core.queue;
+const apoutbox = @import("apoutbox_queue.zig");
+const delivery = @import("delivery.zig");
 
 pub const max_payload_inline_bytes: usize = 8 * 1024;
 pub const max_inbox_bytes: usize = 512;
@@ -201,53 +204,34 @@ pub const Worker = struct {
         const hook = deliver_hook orelse defaultDeliver;
         const now = self.clock.wallUnix();
 
-        // Select a batch of due rows.
-        var stmt: ?*c.sqlite3_stmt = null;
-        const sel =
-            \\SELECT id, target_inbox, payload, key_id, attempts
-            \\FROM ap_federation_outbox
-            \\WHERE state = 'pending' AND next_attempt_at <= ?
-            \\ORDER BY next_attempt_at ASC
-            \\LIMIT ?
-        ;
-        if (c.sqlite3_prepare_v2(db, sel, -1, &stmt, null) != c.SQLITE_OK) {
-            if (stmt != null) _ = c.sqlite3_finalize(stmt);
-            return 0;
-        }
-        defer _ = c.sqlite3_finalize(stmt);
-        _ = c.sqlite3_bind_int64(stmt, 1, now);
-        _ = c.sqlite3_bind_int(stmt, 2, @intCast(limits.max_inflight_deliveries));
+        // Resolve the delivery queue. Default is an `ApOutboxQueue` over
+        // our own db handle (the historical `ap_federation_outbox` path);
+        // a boot-time override routes claims/acks onto `core.queue.global()`
+        // (DbQueue) or a Redis/NATS-backed provider with no change here.
+        var storage: apoutbox.ApOutboxQueue = undefined;
+        const q = delivery.deliveryQueue(db, self.clock, &storage);
 
-        var processed: u32 = 0;
-        var rows_buf: [limits.max_inflight_deliveries]Row = undefined;
-        var deliveries: [limits.max_inflight_deliveries]Delivery = undefined;
-        var n_rows: u32 = 0;
-        while (n_rows < limits.max_inflight_deliveries) {
-            const rc = c.sqlite3_step(stmt);
-            if (rc == c.SQLITE_DONE) break;
-            if (rc != c.SQLITE_ROW) break;
-            rows_buf[n_rows] = readRow(stmt.?);
-            deliveries[n_rows] = .{
-                .id = rows_buf[n_rows].id,
-                .attempts = rows_buf[n_rows].attempts,
-            };
-            n_rows += 1;
-        }
+        // Claim a batch of due jobs (oldest-first, bounded).
+        var jobs: [limits.max_inflight_deliveries]queue.Job = undefined;
+        const n_rows = q.dequeueBatch(queue.topic_ap_outbox, now, jobs[0..limits.max_inflight_deliveries]) catch return 0;
 
-        // Run the hook for each row, threading the Delivery through the
+        // Run the hook for each job, threading the Delivery through the
         // named in-flight Queue so a stuck worker is inspectable from
         // diagnostics. Push *before* the hook (so the queue reflects
         // reality even if the hook blocks), remove on completion.
-        var i: u32 = 0;
+        var deliveries: [limits.max_inflight_deliveries]Delivery = undefined;
+        var processed: u32 = 0;
+        var i: usize = 0;
         while (i < n_rows) : (i += 1) {
-            const r = &rows_buf[i];
+            const job = &jobs[i];
+            deliveries[i] = .{ .id = job.id, .attempts = job.attempts };
             const d = &deliveries[i];
 
             self.inflight.push(d);
             const cur: u32 = @intCast(self.inflight.count());
             if (cur > self.peak_inflight) self.peak_inflight = cur;
 
-            const result = hook(r.inboxSlice(), r.payloadSlice(), r.keyIdSlice());
+            const result = hook(job.key(), job.payload(), job.meta());
 
             // Always remove from the in-flight queue before mutating
             // state — Tiger Style: bounded ownership transitions.
@@ -255,17 +239,19 @@ pub const Worker = struct {
 
             switch (result) {
                 .success => {
-                    self.markDone(r.id) catch {};
+                    q.ack(queue.topic_ap_outbox, job) catch {};
                     _ = self.delivered.fetchAdd(1, .release);
                 },
                 .transient_failure, .permanent_failure => {
-                    const new_attempts = r.attempts + 1;
+                    const new_attempts = job.attempts + 1;
                     if (new_attempts >= limits.max_delivery_attempts or result == .permanent_failure) {
-                        self.moveToDeadLetter(r, "delivery_failed") catch {};
+                        q.deadLetter(queue.topic_ap_outbox, job, "delivery_failed") catch {};
                         _ = self.dead_lettered.fetchAdd(1, .release);
                     } else {
+                        // `nack` records one more attempt; pass the backoff
+                        // computed for that next attempt count.
                         const delay = computeBackoffSec(new_attempts, self.rng);
-                        self.markRetry(r.id, new_attempts, now + delay) catch {};
+                        q.nack(queue.topic_ap_outbox, job, now + delay) catch {};
                         _ = self.failed.fetchAdd(1, .release);
                     }
                 },
@@ -277,114 +263,7 @@ pub const Worker = struct {
         assert(self.inflight.empty());
         return processed;
     }
-
-    fn markDone(self: *Worker, id: i64) !void {
-        const db = self.db orelse return;
-        var stmt: ?*c.sqlite3_stmt = null;
-        const sql = "UPDATE ap_federation_outbox SET state='done' WHERE id=?";
-        if (c.sqlite3_prepare_v2(db, sql, -1, &stmt, null) != c.SQLITE_OK) {
-            if (stmt != null) _ = c.sqlite3_finalize(stmt);
-            return;
-        }
-        defer _ = c.sqlite3_finalize(stmt);
-        _ = c.sqlite3_bind_int64(stmt, 1, id);
-        _ = c.sqlite3_step(stmt);
-    }
-
-    fn markRetry(self: *Worker, id: i64, attempts: u32, next_at: i64) !void {
-        const db = self.db orelse return;
-        var stmt: ?*c.sqlite3_stmt = null;
-        const sql = "UPDATE ap_federation_outbox SET attempts=?, next_attempt_at=?, state='pending' WHERE id=?";
-        if (c.sqlite3_prepare_v2(db, sql, -1, &stmt, null) != c.SQLITE_OK) {
-            if (stmt != null) _ = c.sqlite3_finalize(stmt);
-            return;
-        }
-        defer _ = c.sqlite3_finalize(stmt);
-        _ = c.sqlite3_bind_int(stmt, 1, @intCast(attempts));
-        _ = c.sqlite3_bind_int64(stmt, 2, next_at);
-        _ = c.sqlite3_bind_int64(stmt, 3, id);
-        _ = c.sqlite3_step(stmt);
-    }
-
-    fn moveToDeadLetter(self: *Worker, r: *const Row, last_err: []const u8) !void {
-        const db = self.db orelse return;
-        // Insert.
-        var ins: ?*c.sqlite3_stmt = null;
-        const insql = "INSERT INTO ap_federation_dead_letter(target_inbox,payload,last_error,attempts,dropped_at) VALUES (?,?,?,?,?)";
-        if (c.sqlite3_prepare_v2(db, insql, -1, &ins, null) != c.SQLITE_OK) {
-            if (ins != null) _ = c.sqlite3_finalize(ins);
-            return;
-        }
-        defer _ = c.sqlite3_finalize(ins);
-        const target = r.inboxSlice();
-        const payload = r.payloadSlice();
-        _ = c.sqlite3_bind_text(ins, 1, target.ptr, @intCast(target.len), c.sqliteTransientAsDestructor());
-        _ = c.sqlite3_bind_blob(ins, 2, payload.ptr, @intCast(payload.len), c.sqliteTransientAsDestructor());
-        _ = c.sqlite3_bind_text(ins, 3, last_err.ptr, @intCast(last_err.len), c.sqliteTransientAsDestructor());
-        _ = c.sqlite3_bind_int(ins, 4, @intCast(r.attempts + 1));
-        _ = c.sqlite3_bind_int64(ins, 5, self.clock.wallUnix());
-        _ = c.sqlite3_step(ins);
-        // Update.
-        var upd: ?*c.sqlite3_stmt = null;
-        const upsql = "UPDATE ap_federation_outbox SET state='dead' WHERE id=?";
-        if (c.sqlite3_prepare_v2(db, upsql, -1, &upd, null) != c.SQLITE_OK) {
-            if (upd != null) _ = c.sqlite3_finalize(upd);
-            return;
-        }
-        defer _ = c.sqlite3_finalize(upd);
-        _ = c.sqlite3_bind_int64(upd, 1, r.id);
-        _ = c.sqlite3_step(upd);
-    }
 };
-
-const Row = struct {
-    id: i64,
-    inbox: [max_inbox_bytes]u8 = undefined,
-    inbox_len: usize = 0,
-    payload: [max_payload_inline_bytes]u8 = undefined,
-    payload_len: usize = 0,
-    key_id: [max_key_id_bytes]u8 = undefined,
-    key_id_len: usize = 0,
-    attempts: u32 = 0,
-
-    fn inboxSlice(self: *const Row) []const u8 {
-        return self.inbox[0..self.inbox_len];
-    }
-    fn payloadSlice(self: *const Row) []const u8 {
-        return self.payload[0..self.payload_len];
-    }
-    fn keyIdSlice(self: *const Row) []const u8 {
-        return self.key_id[0..self.key_id_len];
-    }
-};
-
-fn readRow(stmt: *c.sqlite3_stmt) Row {
-    var r: Row = .{ .id = c.sqlite3_column_int64(stmt, 0) };
-    // target_inbox (text)
-    const tb_ptr = c.sqlite3_column_text(stmt, 1);
-    const tb_n: usize = @intCast(c.sqlite3_column_bytes(stmt, 1));
-    const tb_copy: usize = @min(tb_n, r.inbox.len);
-    if (tb_ptr != null and tb_copy > 0) @memcpy(r.inbox[0..tb_copy], tb_ptr[0..tb_copy]);
-    r.inbox_len = tb_copy;
-    // payload (blob)
-    const p_ptr = c.sqlite3_column_blob(stmt, 2);
-    const p_n: usize = @intCast(c.sqlite3_column_bytes(stmt, 2));
-    const p_copy: usize = @min(p_n, r.payload.len);
-    if (p_ptr != null and p_copy > 0) {
-        const pp: [*]const u8 = @ptrCast(p_ptr);
-        @memcpy(r.payload[0..p_copy], pp[0..p_copy]);
-    }
-    r.payload_len = p_copy;
-    // key_id (text)
-    const k_ptr = c.sqlite3_column_text(stmt, 3);
-    const k_n: usize = @intCast(c.sqlite3_column_bytes(stmt, 3));
-    const k_copy: usize = @min(k_n, r.key_id.len);
-    if (k_ptr != null and k_copy > 0) @memcpy(r.key_id[0..k_copy], k_ptr[0..k_copy]);
-    r.key_id_len = k_copy;
-    // attempts
-    r.attempts = @intCast(c.sqlite3_column_int64(stmt, 4));
-    return r;
-}
 
 fn sleepNs(ns: u64) void {
     var req: std.c.timespec = .{
@@ -400,7 +279,6 @@ fn sleepNs(ns: u64) void {
 
 const testing = std.testing;
 const schema = @import("schema.zig");
-const delivery = @import("delivery.zig");
 
 test "computeBackoffSec grows exponentially" {
     try testing.expect(computeBackoffSec(0, null) == 1);
@@ -497,6 +375,66 @@ test "tickOnce drains pending rows on success" {
     defer _ = c.sqlite3_finalize(st);
     try testing.expect(c.sqlite3_step(st) == c.SQLITE_ROW);
     try testing.expectEqual(@as(i64, 0), c.sqlite3_column_int64(st, 0));
+}
+
+test "F8: a delivery-queue override routes producer + consumer off ap_federation_outbox" {
+    // Prove the pluggability seam: installing a DbQueue (core_queue) as
+    // the delivery queue makes enqueueDeliveries write there and the
+    // worker claim/ack there — the historical ap_federation_outbox table
+    // is never touched. Default (no override) keeps the AP table path,
+    // exercised by every other test here.
+    const sqlite_mod = core.storage.sqlite;
+    const db = try sqlite_mod.openWriter(":memory:");
+    defer sqlite_mod.closeDb(db);
+    try schema.applyAllForTests(db);
+    // The generic queue table the override writes to.
+    {
+        const up_z = try testing.allocator.dupeZ(u8, queue.db_queue_migration.up);
+        defer testing.allocator.free(up_z);
+        var em: [*c]u8 = null;
+        try testing.expectEqual(c.SQLITE_OK, c.sqlite3_exec(db, up_z.ptr, null, null, &em));
+        if (em != null) c.sqlite3_free(em);
+    }
+
+    var dbq = queue.DbQueue.init(db);
+    delivery.setDeliveryQueue(dbq.provider());
+    defer delivery.setDeliveryQueue(null);
+
+    var sc = core.clock.SimClock.init(100);
+    var rng = Rng.init(7);
+    const recipients = [_]delivery.Recipient{
+        .{ .inbox = "https://a/inbox" },
+        .{ .inbox = "https://b/inbox" },
+    };
+    const n_enq = try delivery.enqueueDeliveries(db, sc.clock(), &recipients, "{\"id\":\"q\"}", "kid1");
+    try testing.expectEqual(@as(u32, 2), n_enq);
+
+    // Routed to core_queue, NOT ap_federation_outbox.
+    try testing.expectEqual(@as(i64, 0), countRows(db, "SELECT COUNT(*) FROM ap_federation_outbox"));
+    try testing.expectEqual(@as(i64, 2), countRows(db, "SELECT COUNT(*) FROM core_queue WHERE topic='ap_outbox' AND state='pending'"));
+
+    TestDeliver.ok_count = 0;
+    TestDeliver.force_result = .success;
+    setDeliverHook(TestDeliver.run);
+    defer setDeliverHook(null);
+
+    var w = Worker{};
+    w.db = db;
+    w.clock = sc.clock();
+    w.rng = &rng;
+    const n = try w.tickOnce();
+    try testing.expectEqual(@as(u32, 2), n);
+    try testing.expectEqual(@as(u64, 2), w.delivered.load(.acquire));
+    // DbQueue.ack deletes; nothing left to claim.
+    try testing.expectEqual(@as(i64, 0), countRows(db, "SELECT COUNT(*) FROM core_queue WHERE state='pending'"));
+}
+
+fn countRows(db: *c.sqlite3, sql: [*:0]const u8) i64 {
+    var st: ?*c.sqlite3_stmt = null;
+    if (c.sqlite3_prepare_v2(db, sql, -1, &st, null) != c.SQLITE_OK) return -1;
+    defer _ = c.sqlite3_finalize(st);
+    if (c.sqlite3_step(st) != c.SQLITE_ROW) return -1;
+    return c.sqlite3_column_int64(st, 0);
 }
 
 test "tickOnce retries on transient failure with backoff" {
